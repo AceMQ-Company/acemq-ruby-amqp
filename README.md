@@ -179,6 +179,49 @@ retry against an unconfigured connection dead-letters immediately. That is a
 great deal easier to explain than a message going round the broker as fast as it
 can be handed back.
 
+## Patterns
+
+The things everybody writes on top of a message queue, written once. Required
+separately, because none of it is protocol and the core stays the contract and
+the transport:
+
+```ruby
+require "acemq/amqp/patterns"
+```
+
+A pattern here wraps a handler and hands back a handler. It goes to `consume`
+unchanged, so the retry policy, the dead-lettering and the envelope are all
+still whatever you configured — a pattern that took over the consumer would have
+to reimplement them, and then there would be two retry engines to keep in step.
+
+### Idempotency
+
+```ruby
+store = Patterns::InMemoryIdempotencyStore.new(window: 6 * 3600)
+
+mq.consume("orders.new", &Patterns.idempotent(store) do |message|
+  warehouse.reserve(message.payload)
+  Ack.accept
+end)
+```
+
+A duplicate is **accepted**, not rejected: the work was done, so the message has
+been handled, and dead-lettering it would raise an alarm about something that
+went right. A handler that does not accept has its key forgotten, so its retry
+can actually run.
+
+`key:` takes the key from the payload instead of the message id, for when two
+different messages carry the same order and doing the order twice is the thing
+to prevent.
+
+A store is anything answering `first_time?(key)` and `forget(key)`, and
+`first_time?` has to be atomic. `InMemoryIdempotencyStore` is right behind one
+worker and wrong the moment there are two — each has its own memory, so both are
+told they are first. The store worth having is your own database, written in the
+same transaction as the work; that is also the only arrangement that closes the
+gap between the handler finishing and the acknowledgement reaching the broker,
+which is why this is a guard against duplicates rather than exactly-once.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
