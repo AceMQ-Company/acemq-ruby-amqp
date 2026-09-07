@@ -19,4 +19,8 @@ group :development, :test do
   gem "rspec", "~> 3.13"
   gem "rubocop", "~> 1.66"
   gem "rubocop-rspec", "~> 3.0"
+  # The documentation site's API reference is generated from the comments in
+  # lib/. Here rather than in the gemspec because nobody installing this gem
+  # needs a documentation tool to use it.
+  gem "yard", "~> 0.9"
 end

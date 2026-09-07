@@ -7,4 +7,10 @@ Gemfile.lock
 pkg/
 *.gem
 
+# The documentation site, built by .github/scripts/build-docs-site.sh and
+# published from the workflow rather than from the repository.
+site/
+.yardoc/
+doc/
+
 .rspec_status

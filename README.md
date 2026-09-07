@@ -856,6 +856,41 @@ The fixtures under `spec/fixtures/` are produced by the Java implementation and
 shared with Go, .NET and Python. They are the definition of "the same wire
 contract", and they are checked here rather than assumed.
 
+### The documentation site
+
+```bash
+bundle exec bash .github/scripts/build-docs-site.sh   # needs pandoc
+open site/index.html
+```
+
+The README rendered as the front page plus a YARD reference under `site/api/`,
+built from the comments in `lib/`. `docs.yml` publishes it to GitHub Pages on
+every push to `main` that touches the README, `lib/` or `docs/`. The script
+checks that every internal link resolves, because a published page pointing at a
+404 is a failure this site family has had before and nothing noticed.
+
+### Releasing
+
+`release.yml` runs on a `v*` tag: it checks the tag is a `0.1.x` version and that
+`AceMQ::AMQP::VERSION` agrees with it, runs the specs and RuboCop, builds the
+gem, checks the built gem carries what the gemspec's glob was supposed to
+include, installs it into a clean `GEM_HOME` and requires it there — which is the
+one thing the specs cannot catch, since they satisfy every `require` from this
+repository's own Gemfile. It then runs the integration specs against a broker and
+only afterwards pushes to RubyGems.
+
+The push uses **RubyGems trusted publishing**: the runner exchanges a GitHub
+identity token for an API key that lives for minutes, so there is no long-lived
+secret in this repository to leak, rotate or forget. It needs a trusted publisher
+registered on rubygems.org once — repository `AceMQ-Company/acemq-ruby-amqp`,
+workflow `release.yml`, environment `rubygems` — and rubygems.org will register a
+*pending* one for a gem that has never been pushed, which is what this gem needs,
+since `v0.1.0` was tagged before there was any way to publish and is not
+installable by anybody.
+
+A manual `workflow_dispatch` runs every check and stops short of publishing, so
+the workflow can be tried out without spending a version number.
+
 ## Licence
 
 Apache-2.0. RabbitMQ is a trademark of Broadcom Inc.; this project is not

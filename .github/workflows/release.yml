@@ -1,0 +1,241 @@
+# Verify a tag, build the gem, and push it to RubyGems.
+#
+# Until this existed there was no way to publish at all, so v0.1.0 is a tag
+# nobody can install: `gem install acemq-amqp` finds nothing, because nothing
+# was ever pushed. This is what makes a tag into a release.
+#
+# A pushed gem version is permanent. RubyGems allows a yank, which removes it
+# from the index but does not free the version number and does not un-install it
+# from anybody who already has it, so the checks that matter run before the push
+# rather than after — a release that fails its own checks cannot be corrected in
+# place, only spent.
+#
+# # Publishing credentials
+#
+# This uses RubyGems trusted publishing (OIDC): the runner exchanges a GitHub
+# identity token for a short-lived RubyGems API key, so there is no long-lived
+# secret in this repository to leak, rotate or forget. Nothing here reads
+# RUBYGEMS_API_KEY and nothing should — a stored key is a key that outlives
+# whoever added it.
+#
+# It needs one piece of setup on rubygems.org, done once, before the first tag:
+#
+#   1. Sign in as a gem owner, and go to the gem's page, or — because
+#      acemq-amqp does not exist yet — to Profile → Trusted publishers → Add,
+#      which creates a *pending* publisher for a gem that has never been pushed.
+#   2. Give it: repository owner AceMQ-Company, repository acemq-ruby-amqp,
+#      workflow filename release.yml, environment rubygems (the name below).
+#
+# Until that exists the publish job fails at the push with a 401 and nothing
+# else happens, which is the right way round: no gem is worse than the wrong
+# gem. The verify and integration jobs do not depend on it and prove a tag is
+# sound either way.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          # The floor this gem promises, not the newest. Releasing something
+          # that only works on a newer Ruby would break the promise in the
+          # gemspec.
+          ruby-version: '3.1'
+          bundler-cache: true
+
+      - name: Check the tag is a 0.1.x version
+        # The line stays on 0.1.x until that is deliberately changed. Without
+        # this a mistyped tag becomes a version number that cannot be reused.
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          case "$version" in
+            0.1.*) echo "releasing $version" ;;
+            *)
+              echo "::error::this library releases 0.1.x only; '$version' needs the guard in release.yml lifted first"
+              exit 1
+              ;;
+          esac
+
+      - name: Check the version constant matches the tag
+        # A gem whose VERSION disagrees with its tag is a gem nobody can trace
+        # back to a commit, and `gem install acemq-amqp -v 0.1.1` would install
+        # something calling itself something else.
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          declared=$(ruby -Ilib -racemq/amqp/version -e 'print AceMQ::AMQP::VERSION')
+          if [ "$declared" != "$version" ]; then
+            echo "::error::the tag is $version but AceMQ::AMQP::VERSION is $declared"
+            exit 1
+          fi
+          echo "AceMQ::AMQP::VERSION is $declared"
+
+      - name: Test and lint
+        run: |
+          bundle exec rspec
+          bundle exec rubocop
+
+      - name: Build the gem
+        run: gem build acemq-amqp.gemspec
+
+      - name: Check the gem carries what it says it does
+        # gemspec.files is a Dir glob, so a new directory under lib/ is included
+        # by luck rather than by decision. A gem missing half its library
+        # installs perfectly and fails at require time in somebody else's
+        # process.
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          contents=$(tar -xOf "acemq-amqp-$version.gem" data.tar.gz | tar -tzf -)
+          echo "$contents"
+          for required in LICENSE README.md lib/acemq/amqp.rb lib/acemq/amqp/connection.rb \
+                          lib/acemq/amqp/interceptors.rb lib/acemq/amqp/telemetry.rb \
+                          lib/acemq/amqp/health.rb lib/acemq/amqp/retry_ladder.rb; do
+            if ! printf '%s\n' "$contents" | grep -qx "$required"; then
+              echo "::error::the built gem does not contain $required"
+              exit 1
+            fi
+          done
+
+      - name: Check it installs and loads on its own
+        # Installed into a clean prefix with no development gems anywhere near
+        # it, because the one thing a unit test cannot catch is a require this
+        # repository satisfies from its own Gemfile.
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          GEM_HOME="$RUNNER_TEMP/clean" gem install --no-document "acemq-amqp-$version.gem"
+          GEM_HOME="$RUNNER_TEMP/clean" ruby -e '
+            gem "acemq-amqp"
+            require "acemq/amqp"
+            require "acemq/amqp/patterns"
+            abort "the gem reports the wrong version" unless AceMQ::AMQP::VERSION.is_a?(String)
+            AceMQ::AMQP::Topology.new.queue("orders.new", dead_letter: true).plan
+            puts "acemq-amqp #{AceMQ::AMQP::VERSION} loads with no development gems present"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem
+          path: '*.gem'
+          if-no-files-found: error
+
+  integration:
+    name: against a real broker
+    runs-on: ubuntu-latest
+    services:
+      broker:
+        image: rabbitmq:4-alpine
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Test against the broker
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672
+        run: |
+          set -o pipefail
+          bundle exec rspec --tag integration --format documentation \
+            2>&1 | tee "$RUNNER_TEMP/broker-specs.log"
+
+      - name: Check nothing skipped
+        # spec_helper skips every integration example when ACEMQ_TEST_BROKER is
+        # unset, and an unset variable looks exactly like a passing run. A
+        # release that silently tested nothing against a broker is the failure
+        # worth spending five lines on.
+        run: |
+          log="$RUNNER_TEMP/broker-specs.log"
+          if grep -qE '^[0-9]+ examples, 0 failures, [0-9]+ pending' "$log"; then
+            echo "::warning::some examples were pending"
+          fi
+          examples=$(grep -oE '^[0-9]+ examples' "$log" | grep -oE '[0-9]+' | tail -1)
+          if [ -z "$examples" ] || [ "$examples" -lt 15 ]; then
+            echo "::error::only ${examples:-0} integration examples ran; expected at least 15"
+            exit 1
+          fi
+          echo "$examples integration examples ran"
+
+  publish:
+    needs: [verify, integration]
+    # Tags only. A manual dispatch runs the checks against a branch and stops
+    # short of publishing, which is what makes this workflow safe to try out.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: rubygems
+      url: https://rubygems.org/gems/acemq-amqp
+    permissions:
+      # id-token is what makes trusted publishing work: the runner mints a
+      # short-lived GitHub identity token and RubyGems exchanges it for an API
+      # key that expires in minutes. contents: write lets the release action
+      # attach the built gem to the GitHub release.
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+          bundler-cache: true
+
+      - name: Build and push to RubyGems
+        # The action builds from the gemspec and pushes over OIDC. It is
+        # RubyGems' own, and it is preferred to a hand-written `gem push`
+        # because the token exchange is the part worth not writing twice.
+        uses: rubygems/release-gem@v1
+
+  notify:
+    needs: [verify, integration, publish]
+    if: always()
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: >-
+        ${{ (needs.publish.result == 'success') && 'success' || 'failure' }}
+      title: >-
+        ${{ (needs.publish.result == 'success')
+            && format('AceMQ for Ruby {0} released', github.ref_name)
+            || format('AceMQ for Ruby {0} was not published', github.ref_name) }}
+      message: >-
+        ${{ (needs.publish.result == 'success')
+            && 'The gem is on rubygems.org. Consumers need nothing but gem install acemq-amqp.'
+            || 'The tag exists but nothing was pushed to rubygems.org, so this version is not installable. Nothing has to be withdrawn — fix the cause and tag again.' }}
+      # A red dot rather than roadworks, and the wording says the same thing.
+      # Unlike Go, nothing is published by the tag alone here: a failed release
+      # leaves no artifact anywhere, so there is nothing half-finished to warn
+      # about, only something absent.
+      icon: >-
+        ${{ (needs.publish.result == 'success') && ':white_check_mark:' || ':x:' }}
+      url: https://rubygems.org/gems/acemq-amqp
+    secrets:
+      # Explicit, not `inherit`. A reusable workflow in another repository does
+      # not receive inherited secrets, and the shared workflow treats a missing
+      # webhook as "nothing to notify" and succeeds — so `inherit` here would be
+      # a green job that announced nothing.
+      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}
