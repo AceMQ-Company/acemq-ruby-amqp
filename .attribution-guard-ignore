@@ -1,0 +1,6 @@
+# One grep -E pattern per line; # for comments.
+#
+# Vendored gems hold other people's documentation, which is theirs to word.
+# Scanning it says nothing about what this repository wrote.
+^\./vendor/
+^\./\.bundle/

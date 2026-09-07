@@ -1,0 +1,10 @@
+# Bundler's business, not the repository's.
+.bundle/
+vendor/bundle/
+Gemfile.lock
+
+# Build output.
+pkg/
+*.gem
+
+.rspec_status

@@ -1,0 +1,35 @@
+AllCops:
+  TargetRubyVersion: 3.1
+  NewCops: enable
+  Exclude:
+    - vendor/**/*
+    - .bundle/**/*
+
+# The house style everywhere else in AceMQ: comments explain why, and a
+# paragraph that earns its place is worth more than a line under 80 columns.
+Layout/LineLength:
+  Max: 96
+
+Metrics/BlockLength:
+  Exclude:
+    - spec/**/*
+    - "*.gemspec"
+
+# An envelope has ten fields because the contract has ten headers. Splitting
+# the constructor to satisfy a counter would hide that rather than simplify it.
+Metrics/ParameterLists:
+  Enabled: false
+Metrics/MethodLength:
+  Max: 30
+Metrics/AbcSize:
+  Max: 30
+Metrics/ClassLength:
+  Max: 200
+
+# The specs name the fixtures at the top level on purpose: they are the
+# contract, and reading them should not require unpicking a let block.
+Lint/ConstantDefinitionInBlock:
+  Enabled: false
+Naming/FileName:
+  Exclude:
+    - lib/acemq-amqp.rb
