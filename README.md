@@ -18,7 +18,8 @@ produces pin that rather than leaving it to be discovered in production.
 > the shared fixtures and against a real broker, and so are the [patterns
 > above it](#patterns): idempotency, the outbox, request and reply, replay,
 > ordering, consumer groups, routing slips, pipelines, schemas and streams.
-> Nothing is published to RubyGems yet.
+> [TLS and credentials](#tls-and-credentials) are in, including a private
+> certificate authority and mutual TLS. Nothing is published to RubyGems yet.
 
 ## What is here today
 
@@ -180,6 +181,102 @@ Without a policy, `Connection` uses `RetryPolicy.none` — one delivery — so a
 retry against an unconfigured connection dead-letters immediately. That is a
 great deal easier to explain than a message going round the broker as fast as it
 can be handed back.
+
+## TLS and credentials
+
+An `amqps://` URL is encrypted and the broker is verified against the machine's
+trust store. That is the whole configuration for a broker whose certificate came
+from a public authority:
+
+```ruby
+mq = Connection.open("amqps://broker.example.com:5671",
+                     credentials: Credentials.from_env)
+```
+
+`Credentials` exists so the password does not have to be in the URL. A URL is the
+one piece of configuration that gets printed — into error messages, structured
+logs, `ps` output, whatever the deployment tool echoes back — and a password that
+has been through any of those has to be rotated. Passed separately it never takes
+the trip, and the object itself renders as `username="app" secret=[REDACTED]`
+through `inspect`, `to_s` and `%p` alike, so dumping the object that holds it
+produces nothing worth stealing.
+
+```ruby
+Credentials.of(username: "app", password: ENV.fetch("MQ_PASSWORD"))
+Credentials.from_env(username_variable: "MQ_USER", password_variable: "MQ_PASSWORD")
+Credentials.from_file("/run/secrets/mq")     # a mounted Kubernetes or Docker secret
+Credentials.token(oauth_access_token)        # RabbitMQ's OAuth 2 mechanism
+
+# A block is called at connection time rather than at start-up, which is what a
+# secret rotated underneath a running process needs.
+Connection.open(url, credentials: -> { Credentials.from_file("/run/secrets/mq") })
+```
+
+A broker with its own certificate authority — which is most brokers that are not
+on the public internet — is described by a `Security`:
+
+```ruby
+mq = Connection.open("amqps://broker.internal:5671",
+                     security: Security.verified(certificate_authority: "certs/ca.pem"),
+                     credentials: Credentials.from_env)
+```
+
+Naming an authority narrows trust to that authority alone; the system store is
+then not consulted at all. That is the point. A certificate from a public
+authority is not evidence that the thing answering is *your* broker, and the
+hundreds of authorities a machine trusts by default are hundreds of ways to be
+wrong.
+
+For a broker that authenticates clients by certificate rather than by password —
+RabbitMQ's `EXTERNAL` mechanism, or any listener configured with `verify_peer`
+and `fail_if_no_peer_cert` — add the client's own pair. They go together, and one
+without the other is refused where it is configured rather than at the handshake,
+because a handshake failure names neither file:
+
+```ruby
+Security.verified(certificate_authority: "certs/ca.pem",
+                  certificate: "certs/client.crt", key: "certs/client.key")
+```
+
+There is one more constructor and it is deliberately awkward to reach:
+
+```ruby
+Security.without_verifying_the_broker(because: "the CI broker's certificate is thrown away nightly")
+```
+
+It encrypts and then accepts any certificate at all, which means the traffic
+cannot be read by somebody watching the network and nothing stops that somebody
+from *being* the broker: they present whatever certificate they like, the
+connection opens, and it hands over the login and every message afterwards —
+encrypted the whole way, to them. There is no symptom. The long name is so it
+cannot be typed by accident or skimmed past in a review, and `because:` is
+required so the circumstance ends up in the code rather than in somebody's memory
+of a conversation. Prefer `certificate_authority:`, which is about four seconds
+more work and is correct.
+
+`Security.disabled` is plaintext, which is what `amqp://` already means and what
+a broker on the same machine can reasonably have.
+
+### Why this is a class and not three keyword arguments
+
+bunny does not verify the broker's certificate when it is given a URL. Not
+"verifies weakly" — does not verify. A URL string is parsed by `AMQ::Settings`,
+which merges in its own defaults, and one of those defaults is `verify: false`;
+bunny reads that as an explicit instruction and sets `VERIFY_NONE`. So
+`Bunny.new("amqps://broker:5671")` encrypts the traffic, accepts a certificate
+the connecting process could have made up thirty seconds ago, and reports itself
+as `tls?` throughout. Nothing warns, because from bunny's side somebody asked for
+this.
+
+Every mode here therefore states `verify_peer` outright rather than leaving it
+unsaid, and the integration spec proves the difference the only way it can be
+proved: by connecting to a broker whose certificate does not check out and
+requiring that the connection *fail*. bunny on its own opens it.
+
+The same reach fixes a quieter one. bunny pins its TLS context's minimum and
+maximum version to the same constant, defaulting both to TLS 1.2, so a broker and
+a client that could have agreed on 1.3 settle for 1.2; `Security#configure` lifts
+the ceiling before the session starts.
 
 ## Patterns
 
@@ -558,6 +655,23 @@ bundle exec rubocop
 # Anything that needs a broker is tagged :integration and skipped unless this
 # is set, so a laptop with no Docker still runs everything else.
 ACEMQ_TEST_BROKER=amqp://guest:guest@localhost:5672 bundle exec rspec
+```
+
+The TLS examples need a broker with a TLS listener and the authority that signed
+its certificate, and skip when they have neither. They are worth running before
+touching anything in `security.rb`, because they are the only place that proves a
+connection which should fail does:
+
+```bash
+ACEMQ_TEST_BROKER_TLS=amqps://guest:guest@localhost:5671 \
+ACEMQ_TEST_BROKER_CA=certs/ca.crt \
+bundle exec rspec --tag integration
+
+# When the broker is configured with verify_peer and fail_if_no_peer_cert, add
+# the client's pair and the mutual-TLS examples run too.
+ACEMQ_TEST_BROKER_CLIENT_CERT=certs/client.crt \
+ACEMQ_TEST_BROKER_CLIENT_KEY=certs/client.key \
+...
 ```
 
 The fixtures under `spec/fixtures/` are produced by the Java implementation and

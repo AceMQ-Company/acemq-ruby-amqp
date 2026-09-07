@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require_relative "credentials"
+require_relative "security"
+
 module AceMQ
   module AMQP
     # The broker, or the network, rather than the message.
@@ -86,21 +89,39 @@ module AceMQ
 
       # Opens a connection.
       #
+      # The URL decides how the connection is protected unless a {Security} says
+      # otherwise: +amqps://+ is encrypted and the broker is verified against
+      # the machine's trust store, +amqp://+ is plaintext. Pass +security:+ for
+      # a private certificate authority, a client certificate, or the deliberate
+      # absence of verification; pass +credentials:+ to keep the password out of
+      # the URL, and so out of the error message two lines below this one.
+      #
+      # The security options are merged over anything in +options+ rather than
+      # under it. A caller who reaches past {Security} to bunny's own TLS keys
+      # is describing the same thing twice, and of the two answers the one that
+      # went through the checks in this library is the one to honour.
+      #
       # @param url [String] amqp:// or amqps://
       # @param heartbeat [Integer, Symbol] seconds, or :server to take the
       #   broker's suggestion
       # @param connection_timeout [Numeric] seconds to wait for the handshake
+      # @param security [Security, nil] how to protect the connection
+      # @param credentials [Credentials, #call, nil] the broker login
       # @param options [Hash] anything else bunny understands
       # @return [Transport]
       # @raise [DependencyMissing] when bunny is not installed
+      # @raise [ConfigurationError] when the security settings cannot be honoured
       # @raise [TransportError] when the broker cannot be reached
-      def self.open(url, heartbeat: :server, connection_timeout: 10, **options)
+      def self.open(url, heartbeat: :server, connection_timeout: 10, security: nil,
+                    credentials: nil, **options)
         load_driver!
+        security = Security.for_connection(url, security: security, credentials: credentials)
         session = Bunny.new(url, heartbeat: heartbeat, connection_timeout: connection_timeout,
-                                 **options)
+                                 **options, **security.to_transport_options)
+        security.configure(session)
         session.start
         new(session)
-      rescue DependencyMissing
+      rescue DependencyMissing, ConfigurationError
         raise
       rescue StandardError => e
         raise TransportError, "cannot reach the broker at #{redact(url)}: #{e.message}"

@@ -77,7 +77,11 @@ module AceMQ
       # @param retry_threshold [Numeric] seconds; a retry delayed this long or
       #   longer waits in the broker rather than in the consumer
       #   through
-      # @param transport_options [Hash] passed to {Transport.open}
+      # @param transport_options [Hash] passed to {Transport.open}, which is
+      #   where +security:+ and +credentials:+ go: an +amqps://+ URL is
+      #   verified against the system trust store on its own, and a broker
+      #   with its own certificate authority, or a password that must not be
+      #   in the URL, is described by a {Security} and a {Credentials}
       # @return [Connection]
       def self.open(url, codec: JSONCodec.new, origin: nil, retry_policy: RetryPolicy.none,
                     prefetch: DEFAULT_PREFETCH,
