@@ -288,6 +288,67 @@ same rule the patterns follow and the only way to know a seam is wide enough.
 An interceptor is called on whatever thread is publishing or handling, so one
 that keeps state has to be safe to call from several at once.
 
+## Telemetry and health
+
+```ruby
+metrics = Telemetry::Registry.new
+mq = Connection.open(url, telemetry: metrics)
+
+# whatever already answers HTTP in this process
+get("/acemq-metrics") { metrics.to_prometheus }
+get("/acemq-health")  { report = mq.health; [report.up? ? 200 : 503, report.to_h.to_json] }
+```
+
+The metric names are shared with Java, Go, .NET and Python, so a dashboard or an
+alert written for one service reads the same against the next:
+
+| | |
+|---|---|
+| `acemq.messages.published` | by `exchange` |
+| `acemq.messages.publish.failed` | including a publish an interceptor refused |
+| `acemq.messages.consumed` | by `queue`, counted on the way in |
+| `acemq.messages.accepted` / `.retried` / `.rejected` | what handlers decided |
+| `acemq.messages.dead.lettered` | out of attempts, too old, or refused fatally |
+| `acemq.messages.parked` | nothing could decode it |
+| `acemq.handler.duration` | seconds, handler and interceptors together |
+| `acemq.messages.in.flight` | a gauge, per queue |
+| `acemq.retry.rung.missing` | see below |
+
+**No dependency on a metrics gem.** An observer is anything answering `count`,
+`observe` and `gauge`; depending on one would put every service using this
+library on the same one, and that choice belongs to the application.
+`Telemetry::Registry` is a working in-memory implementation with a
+`to_prometheus` renderer for when the numbers themselves are what is wanted. It
+is a string and not a Rack app on purpose — this library has no web framework
+and should not choose one. Serve it on a port the ingress does not publish: what
+a service publishes and how long its handlers take is more than an anonymous
+caller should be able to learn.
+
+Anything an observer raises is swallowed and reported once per metric on stderr.
+A metrics backend that is down is not a reason to stop delivering messages.
+
+**`acemq.retry.rung.missing` is worth an alert.** A retry long enough to be
+handed to the broker checks that its rung queue is really there before
+publishing into it — a publish into a queue nobody declared is dropped without a
+word, and a retry that simply stops existing is the one failure nothing else
+here would show. When the rung is missing the wait happens in the consumer
+instead, so nothing is lost; what is lost is the reason the rung exists, since a
+restart mid-wait now turns a five-minute backoff into none. The check is one
+round trip per rung for the life of a consumer, and only on the retry path.
+
+`mq.health` returns a report: `:up`, `:degraded` or `:down`, with `parts`
+carrying how many consumers there are, how many are still running, and how long
+the broker took to answer. The broker is checked by declaring a queue and
+deleting it again, because that is the cheapest thing AMQP offers that actually
+proves the round trip — an open socket answers the same as a healthy broker
+right up until something is asked of it. A **consumer that has stopped under a
+live connection is `:degraded`**, not `:down`: the process can still publish and
+its other consumers still work, so failing the probe would take out something
+doing most of its job, but a queue with nothing reading it is a real fault and
+has to be visible. `Health.aggregate` combines the connection's check with the
+application's own — anything answering `name` and `check` — runs them on
+threads, and takes the worst answer.
+
 ## TLS and credentials
 
 An `amqps://` URL is encrypted and the broker is verified against the machine's

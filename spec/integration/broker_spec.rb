@@ -551,6 +551,80 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "health" do
+    let(:queue) { queue_named("health") }
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after { scrub(queue) }
+
+    it "proves the round trip and leaves nothing on the broker" do
+      # The half only a broker can show. The probe queue is exclusive and
+      # auto-deleting, and the channel it was declared on is closed straight
+      # away, so a readiness probe running every five seconds for a week does
+      # not leave ten thousand queues behind it. The name is pinned here only so
+      # that this can go and look for it afterwards.
+      allow(SecureRandom).to receive(:uuid).and_return("rbit-probe")
+      report = mq.health
+
+      expect(report).to be_up
+      expect(report.parts["round_trip_ms"]).to be >= 0
+      expect(mq.queue_exists?("acemq-health-rbit-probe")).to be(false)
+    end
+
+    it "is degraded while a consumer is stopped, and up again without one" do
+      consumer = mq.consume(queue) { AceMQ::AMQP::Ack.accept }
+      expect(mq.health).to be_up
+
+      consumer.cancel
+      degraded = mq.health
+      expect(degraded).to be_degraded
+      expect(degraded.detail).to eq("1 of 1 consumers has stopped")
+    end
+
+    it "is down once the connection is closed" do
+      # Its own connection, because closing the one this example group shares
+      # would leave the tidying up with nothing to tidy up with.
+      other = AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit")
+      other.close
+
+      expect(other.health).to be_down
+    end
+  end
+
+  describe "telemetry" do
+    let(:queue) { queue_named("telemetry") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:mq) do
+      AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", telemetry: metrics)
+    end
+
+    before do
+      scrub(queue, dlq)
+      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+    end
+
+    after { scrub(queue, dlq) }
+
+    it "counts a real round trip through a real broker" do
+      mq.consume(queue, retry_policy: AceMQ::AMQP::RetryPolicy.fixed(2, 0)) do |_message|
+        AceMQ::AMQP::Ack.retry("the warehouse is down")
+      end
+      mq.publish({ "order_id" => "A-10" }, to: queue)
+
+      expect(wait_for { metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED, queue: queue] == 1 })
+        .to be(true)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISHED, exchange: ""]).to be >= 1
+      expect(metrics[AceMQ::AMQP::Telemetry::CONSUMED, queue: queue]).to eq(2)
+      expect(metrics[AceMQ::AMQP::Telemetry::RETRIED, queue: queue]).to eq(2)
+      expect(metrics.to_prometheus).to include("acemq_messages_dead_lettered")
+    end
+  end
+
   describe "publishing" do
     let(:queue) { queue_named("confirms") }
 

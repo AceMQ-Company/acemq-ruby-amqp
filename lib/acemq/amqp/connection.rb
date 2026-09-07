@@ -19,10 +19,12 @@ require "socket"
 require_relative "ack"
 require_relative "codec"
 require_relative "envelope"
+require_relative "health"
 require_relative "interceptors"
 require_relative "naming"
 require_relative "retry_ladder"
 require_relative "retry_policy"
+require_relative "telemetry"
 require_relative "transport"
 
 module AceMQ
@@ -65,7 +67,7 @@ module AceMQ
       DEFAULT_PREFETCH = 20
 
       attr_reader :transport, :codec, :origin, :retry_policy, :prefetch,
-                  :retry_threshold, :interceptors
+                  :retry_threshold, :interceptors, :telemetry
 
       # Opens a connection to a broker.
       #
@@ -85,10 +87,11 @@ module AceMQ
       #   in the URL, is described by a {Security} and a {Credentials}
       # @return [Connection]
       def self.open(url, codec: JSONCodec.new, origin: nil, retry_policy: RetryPolicy.none,
-                    prefetch: DEFAULT_PREFETCH,
+                    prefetch: DEFAULT_PREFETCH, telemetry: nil,
                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD, **transport_options)
         new(transport: Transport.open(url, **transport_options), codec: codec, origin: origin,
-            retry_policy: retry_policy, prefetch: prefetch, retry_threshold: retry_threshold)
+            retry_policy: retry_policy, prefetch: prefetch, retry_threshold: retry_threshold,
+            telemetry: telemetry)
       end
 
       # Wraps a transport that is already open.
@@ -98,7 +101,8 @@ module AceMQ
       # the retry arithmetic below testable without a broker in the room.
       def initialize(transport:, codec: JSONCodec.new, origin: nil,
                      retry_policy: RetryPolicy.none, prefetch: DEFAULT_PREFETCH,
-                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
+                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD, telemetry: nil)
+        @telemetry = Telemetry::Reporter.for(telemetry)
         @transport = transport
         @codec = Codec.check!(codec)
         @origin = origin.nil? || origin.to_s.empty? ? self.class.default_origin : origin.to_s
@@ -190,6 +194,10 @@ module AceMQ
                                      envelope: envelope, payload: payload)
         send_intercepted(context, codec, persistent)
       rescue StandardError => e
+        # Counted before the interceptors are told, so a publish refused by an
+        # interceptor is counted too. It did not reach the broker, which is the
+        # thing this metric is about.
+        @telemetry.count(Telemetry::PUBLISH_FAILED, 1, exchange: exchange)
         @interceptors.on_publish_error(context, e) if context
         raise
       end
@@ -228,7 +236,7 @@ module AceMQ
           codec: codec.nil? ? @codec : Codec.check!(codec),
           retry_policy: retry_policy || @retry_policy,
           retry_threshold: retry_threshold || @retry_threshold,
-          interceptors: @interceptors
+          interceptors: @interceptors, telemetry: @telemetry
         )
         consumer.start(prefetch: prefetch || @prefetch, concurrency: concurrency, tag: tag,
                        arguments: arguments)
@@ -241,6 +249,22 @@ module AceMQ
       # @param topology [Topology]
       # @return [Topology]
       def apply(topology) = topology.apply(self)
+
+      # Whether this process can still do what it is running to do.
+      #
+      # Costs a round trip to the broker, so it belongs on a readiness probe
+      # rather than in a request. See {Health} for what the statuses mean and
+      # why a stopped consumer is degraded rather than down.
+      #
+      # @return [Health::Report]
+      def health = Health.of(self)
+
+      # The consumers started on this connection, as they stand.
+      #
+      # A copy, taken under the lock. Handing back the list itself would let a
+      # caller iterate it while a consumer is being added on another thread,
+      # which is the sort of bug that only appears under load.
+      def consumers = @lock.synchronize { @consumers.dup }
 
       def declare_exchange(name, **options) = @transport.declare_exchange(name, **options)
       def declare_queue(name, **options) = @transport.declare_queue(name, **options)
@@ -296,6 +320,7 @@ module AceMQ
                            content_type: codec.content_type, message_id: context.envelope.id,
                            headers: context.envelope.to_headers(context.routing_key),
                            persistent: persistent)
+        @telemetry.count(Telemetry::PUBLISHED, 1, exchange: context.exchange)
         @interceptors.after_confirm(context)
         context.envelope
       end
@@ -316,19 +341,30 @@ module AceMQ
 
       def initialize(transport:, queue:, handler:, codec:, retry_policy:,
                      retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
-                     interceptors: Interceptors.new)
+                     interceptors: Interceptors.new, telemetry: nil)
         @transport = transport
         @queue = queue
         @handler = handler
         @codec = codec
         @interceptors = interceptors
+        @telemetry = Telemetry::Reporter.for(telemetry)
         @retry_policy = retry_policy
         @ladder = RetryLadder.for(queue, retry_policy, threshold: retry_threshold)
         @dead_letter_queue = Naming.dead_letter_queue(queue)
         @parked_queue = Naming.parked_queue(queue)
         @lock = Mutex.new
         @in_flight = 0
+        @rungs_seen = {}
       end
+
+      # Whether the broker is still sending this consumer messages.
+      #
+      # Asked of the subscription rather than remembered here, because the two
+      # can disagree: a channel closed by the broker, or taken down by an error
+      # on it, stops delivery without anything in this process being told. A
+      # flag set in {#cancel} would say "running" for a consumer that had been
+      # deaf for an hour.
+      def running? = !!@subscription&.open?
 
       # @api private
       def start(prefetch:, concurrency:, tag:, arguments:)
@@ -351,7 +387,9 @@ module AceMQ
         enter
         envelope = envelope_for(delivery)
         context = context_for(delivery, envelope, decode(delivery))
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         ack = invoke(context, delivery)
+        observe(ack, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
         # After the handler and before the delivery is settled, so an
         # interceptor can still see how it went and still undo whatever it set
         # up on the way in. The envelope read back off the context is the one an
@@ -409,6 +447,21 @@ module AceMQ
         else
           @codec.decode(delivery.body, delivery.content_type)
         end
+      end
+
+      # What one delivery cost, and what was decided about it.
+      #
+      # The duration is the handler's and the interceptors' together, which is
+      # the number worth having: it is how long a message occupied one of this
+      # consumer's prefetch slots, and an interceptor that is slow costs exactly
+      # as much as a handler that is.
+      def observe(ack, seconds)
+        @telemetry.observe(Telemetry::HANDLER_DURATION, seconds, queue: @queue)
+        outcome = if ack.accept? then Telemetry::ACCEPTED
+                  elsif ack.reject? then Telemetry::REJECTED
+                  else Telemetry::RETRIED
+                  end
+        @telemetry.count(outcome, 1, queue: @queue)
       end
 
       # What an interceptor sees, and what the handler is built from.
@@ -485,10 +538,43 @@ module AceMQ
         # trade is that the message goes to the back of its queue rather than
         # the front.
         next_attempt = envelope.with(attempt: envelope.attempt + 1)
-        rung = @ladder.rung_for(delay)
+        rung = rung_for(delay)
         return wait_in_broker(rung, delivery, next_attempt) if rung
 
         wait_here(delay, delivery, next_attempt)
+      end
+
+      # The rung to publish into, or nil when this process does the waiting.
+      #
+      # Nil below the threshold is the design working. Nil at or above it is
+      # not: a delay long enough that losing it to a restart matters has nowhere
+      # on the broker to wait, so it waits here instead and the missing rung is
+      # counted. Nothing is lost — the retry still happens and so does the wait
+      # — but the reason the rung exists is, and a topology that was never
+      # applied looks exactly like one that was until this happens.
+      def rung_for(delay)
+        rung = @ladder.rung_for(delay)
+        return nil if rung.nil? && delay < @ladder.threshold
+        return rung if rung && declared?(rung)
+
+        @telemetry.count(Telemetry::RUNG_MISSING, 1, queue: @queue)
+        nil
+      end
+
+      # Whether a rung is really on the broker.
+      #
+      # Asked rather than assumed, because publishing into a queue nobody
+      # declared is dropped by the broker without a word, and a retry that
+      # simply stops existing is the one failure here nothing else would show.
+      # One round trip per rung, remembered afterwards: a rung that exists does
+      # not stop existing. A missing one is asked about again, so a topology
+      # applied while this is running starts being used.
+      def declared?(rung)
+        return true if @lock.synchronize { @rungs_seen[rung] }
+
+        there = @transport.queue_exists?(rung)
+        @lock.synchronize { @rungs_seen[rung] = true } if there
+        there
       end
 
       # A short delay, waited by this process.
@@ -539,11 +625,13 @@ module AceMQ
       # +x-acemq-error+ onto it, which is the one thing whoever finds it in the
       # dead-letter queue actually needs.
       def dead_letter(delivery, envelope, reason)
+        @telemetry.count(Telemetry::DEAD_LETTERED, 1, queue: @queue)
         republish(@dead_letter_queue, delivery, envelope.with(error: reason))
         delivery.ack
       end
 
       def park(delivery, envelope, reason)
+        @telemetry.count(Telemetry::PARKED, 1, queue: @queue)
         envelope ||= Envelope.from_headers(delivery.headers, delivery.routing_key)
         republish(@parked_queue, delivery, envelope.with(error: reason))
         delivery.ack
@@ -563,8 +651,20 @@ module AceMQ
         "#{error.class}: #{message}"
       end
 
-      def enter = @lock.synchronize { @in_flight += 1 }
-      def leave = @lock.synchronize { @in_flight -= 1 }
+      # Counted on the way in rather than on the way out, so a handler that
+      # never returns is still a message this consumer was given — which is the
+      # difference between a queue nothing is reading and a queue one thing is
+      # stuck on.
+      def enter
+        @telemetry.count(Telemetry::CONSUMED, 1, queue: @queue)
+        @telemetry.gauge(Telemetry::IN_FLIGHT, @lock.synchronize { @in_flight += 1 },
+                         queue: @queue)
+      end
+
+      def leave
+        @telemetry.gauge(Telemetry::IN_FLIGHT, @lock.synchronize { @in_flight -= 1 },
+                         queue: @queue)
+      end
 
       # Polled rather than signalled. A condition variable would be tidier and
       # would also mean holding a lock across a handler that may be waiting on

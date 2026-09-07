@@ -88,6 +88,7 @@ class LoopbackTransport
   def queue_exists?(name) = @lock.synchronize { @waiting.key?(name) }
   def delete_queue(name) = @lock.synchronize { @waiting.delete(name) }
   def closed? = @closed
+  def open? = !@closed
   def close = @closed = true
 
   def published_to(queue)
@@ -103,10 +104,17 @@ class LoopbackTransport
       @transport = transport
       @queue = queue
       @handler = handler
+      @open = true
     end
 
-    def stop = @transport.unsubscribe(@queue, @handler)
-    def close = nil
+    def open? = @open
+
+    def stop
+      @open = false
+      @transport.unsubscribe(@queue, @handler)
+    end
+
+    def close = @open = false
     def cancel = stop
   end
 

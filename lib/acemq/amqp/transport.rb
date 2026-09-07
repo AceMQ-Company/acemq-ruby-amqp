@@ -336,6 +336,15 @@ module AceMQ
           @consumer = consumer
         end
 
+        # Whether the broker can still deliver down this subscription.
+        #
+        # The channel's own answer rather than a flag kept here. The two can
+        # disagree: a channel closed by the broker, or taken down by an error on
+        # it, stops delivery without anything in this process being told, and a
+        # health check reading a local flag would report a consumer that had
+        # been deaf for an hour as running.
+        def open? = @channel.open?
+
         # Tells the broker to send no more. Deliveries already handed over are
         # unaffected.
         #

@@ -19,6 +19,7 @@ class FakeTransport
     @declared_queues = []
     @declared_exchanges = []
     @bindings = []
+    @missing = []
     @closed = false
   end
 
@@ -51,10 +52,15 @@ class FakeTransport
   end
 
   def message_count(_queue) = 0
-  def queue_exists?(_name) = true
+  def queue_exists?(name) = !@missing.include?(name)
   def delete_queue(_name) = nil
   def closed? = @closed
+  def open? = !@closed
   def close = @closed = true
+
+  # Pretends a queue was never declared, which is how the consumer's
+  # missing-rung path is reached without taking a broker away from it.
+  def missing!(*names) = @missing.concat(names)
 
   # What was published to a queue through the default exchange, which is how
   # both dead-lettering and parking get there.
@@ -63,9 +69,11 @@ class FakeTransport
   end
 
   class Subscription
-    def stop = nil
-    def close = nil
-    def cancel = nil
+    def initialize = @open = true
+    def open? = @open
+    def stop = @open = false
+    def close = @open = false
+    def cancel = @open = false
   end
 end
 
