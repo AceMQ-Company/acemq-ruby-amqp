@@ -72,6 +72,16 @@ class LoopbackTransport
     @lock.synchronize { @subscribers[queue].delete(handler) }
   end
 
+  # Takes one message off without subscribing, unacknowledged, the way a replay
+  # reads a dead-letter queue. A message returned with requeue goes back to the
+  # head, which is exactly the behaviour a replay has to work around.
+  def pull(queue)
+    message = @lock.synchronize { @waiting[queue].shift }
+    return nil if message.nil?
+
+    delivery_for(queue, message)
+  end
+
   def message_count(queue) = @lock.synchronize { @waiting[queue].size }
   def queue_exists?(name) = @lock.synchronize { @waiting.key?(name) }
   def delete_queue(name) = @lock.synchronize { @waiting.delete(name) }

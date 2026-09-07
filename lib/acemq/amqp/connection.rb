@@ -205,6 +205,7 @@ module AceMQ
       def declare_exchange(name, **options) = @transport.declare_exchange(name, **options)
       def declare_queue(name, **options) = @transport.declare_queue(name, **options)
       def bind(**options) = @transport.bind(**options)
+      def pull(queue) = @transport.pull(queue)
       def message_count(queue) = @transport.message_count(queue)
       def queue_exists?(name) = @transport.queue_exists?(name)
       def delete_queue(name) = @transport.delete_queue(name)

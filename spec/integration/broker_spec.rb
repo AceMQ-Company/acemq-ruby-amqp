@@ -352,6 +352,44 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "replaying a dead-letter queue" do
+    let(:queue) { queue_named("replay") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+
+    before do
+      scrub(queue, dlq)
+      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+    end
+
+    after { scrub(queue, dlq) }
+
+    it "reaches the whole queue even though a declined message goes back to its head" do
+      # The one thing only a broker can show. RabbitMQ returns a rejected
+      # message to the head of the queue, so a replay that put a declined
+      # message straight back would be handed the same one for ever and never
+      # see what was behind it. Holding declined messages unacknowledged for the
+      # length of the pass is what gets past that, and it is the reason this
+      # test exists rather than a unit one.
+      mq.publish({ "order_id" => "keep" }, to: dlq, error: "no such customer")
+      mq.publish({ "order_id" => "move" }, to: dlq, error: "connection timeout")
+      expect(wait_for { mq.message_count(dlq) == 2 }).to be(true)
+
+      result = AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: queue) do |envelope, _|
+        envelope.error.include?("timeout")
+      end
+
+      expect(result.moved).to eq(1)
+      expect(result.skipped).to eq(1)
+      expect(result.reason).to eq(:drained)
+
+      properties, body = take_one(queue)
+      expect(body).to eq('{"order_id":"move"}')
+      expect(properties[:headers][AceMQ::AMQP::Patterns::REPLAYED_FROM_HEADER]).to eq(dlq)
+      # The declined one went back rather than being lost.
+      expect(wait_for { mq.message_count(dlq) == 1 }).to be(true)
+    end
+  end
+
   describe "publishing" do
     let(:queue) { queue_named("confirms") }
 

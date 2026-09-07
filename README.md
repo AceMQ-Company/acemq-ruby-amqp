@@ -300,6 +300,41 @@ headers on purpose: the `x-acemq-` namespace belongs to the engine and is kept
 away from what a handler sees, so a responder could never read them if they
 lived there.
 
+### Replay
+
+```ruby
+result = Patterns.replay(mq, from: "orders.new.dlq", exchange: "orders-events",
+                         limit: 500) do |envelope, _body|
+  envelope.error.include?("timeout")
+end
+
+result.to_s   # => "moved 37, skipped 463 (drained)"
+```
+
+The thing somebody actually does at three in the morning: a dead-letter queue
+has two thousand messages in it, the fix is deployed, and they need to go back
+through — but not all of them, and not silently. The block decides which go, so
+a replay can be done in stages; `reason` is `:drained`, `:limit` or `:deadline`,
+because "moved 500" means something quite different when the limit was 500.
+
+Messages the block declines are **held unacknowledged** for the length of the
+pass rather than returned one at a time. Returning one immediately does not
+work: the broker puts it back at the head of the queue, so the next read hands
+over the same message and everything behind it is never seen. The broker still
+has the held ones, so a tool that dies half way through returns them rather than
+losing them.
+
+Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
+and `acemq-replay-count`, so a consumer that needs to treat them differently
+can and one that does not is unaffected. A message is acknowledged only after
+the broker has confirmed the new copy: a crash in that gap replays it twice,
+which is the right way round for a dead-letter queue.
+
+Replaying a queue through the default exchange with no routing key is refused
+rather than allowed to loop. A dead letter's routing key is the dead-letter
+queue, so it would publish every message straight back onto the queue it was
+read from, for ever, and the only sign would be a queue that never empties.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

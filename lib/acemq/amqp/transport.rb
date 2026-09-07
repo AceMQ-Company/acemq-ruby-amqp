@@ -119,6 +119,11 @@ module AceMQ
       def initialize(session)
         @session = session
         @lock = Mutex.new
+        # A lock of its own, because a pull holds messages unacknowledged across
+        # a whole pass and settling one has to reach the channel it came down.
+        # Sharing the publish lock would mean a replay's own republish waiting
+        # on the channel it is about to acknowledge from.
+        @pull_lock = Mutex.new
         @subscriptions = []
       end
 
@@ -205,6 +210,32 @@ module AceMQ
         raise TransportError, "cannot consume from #{queue.inspect}: #{e.message}"
       end
 
+      # Takes one message off a queue, without subscribing to it.
+      #
+      # A subscription is a standing arrangement; this is a single read, which
+      # is what a pass over a queue with a beginning and an end needs. Draining
+      # a dead-letter queue with a consumer means writing the code that decides
+      # when to stop, and getting it wrong means a tool that never exits.
+      #
+      # The delivery is unacknowledged, and settling it is the caller's job.
+      # That is deliberate: a message left unacknowledged is held by the broker
+      # rather than lost, so a tool that dies half way through a pass returns
+      # everything it was holding.
+      #
+      # @param queue [String]
+      # @return [Delivery, nil] nil when the queue has nothing waiting
+      def pull(queue)
+        @pull_lock.synchronize do
+          channel = pull_channel
+          info, properties, body = channel.basic_get(queue, manual_ack: true)
+          next nil if info.nil?
+
+          delivery_from(channel, info, properties, body, lock: @pull_lock)
+        end
+      rescue StandardError => e
+        raise TransportError, "cannot read a message from #{queue.inspect}: #{e.message}"
+      end
+
       # How many messages are waiting on a queue.
       #
       # A number for a dashboard or a test, not a decision to make in a
@@ -258,6 +289,13 @@ module AceMQ
         @lock.synchronize do
           @publish_channel.close if @publish_channel&.open?
           @publish_channel = nil
+        end
+        # Anything a pass was still holding goes back to its queue when this
+        # closes, which is the whole reason a declined message is held rather
+        # than returned one at a time.
+        @pull_lock.synchronize do
+          @pull_channel.close if @pull_channel&.open?
+          @pull_channel = nil
         end
         @session.close
         nil
@@ -353,8 +391,15 @@ module AceMQ
         subscription
       end
 
-      def delivery_from(channel, info, properties, body)
+      # +lock+ is given for a pulled delivery, which is settled by whoever is
+      # running the pass rather than on the thread it arrived on, and may be
+      # settled long after. A subscribed delivery needs none: it is settled on
+      # the consumer thread that owns its channel.
+      def delivery_from(channel, info, properties, body, lock: nil)
         tag = info.delivery_tag
+        settle = lambda do |&action|
+          lock ? lock.synchronize { action.call } : action.call
+        end
         Delivery.new(
           body: body,
           content_type: properties[:content_type].to_s,
@@ -362,9 +407,19 @@ module AceMQ
           message_id: properties[:message_id].to_s,
           headers: properties[:headers] || {},
           redelivered: info.redelivered,
-          on_ack: -> { channel.ack(tag, false) },
-          on_nack: ->(requeue) { channel.nack(tag, false, requeue) }
+          on_ack: -> { settle.call { channel.ack(tag, false) } },
+          on_nack: ->(requeue) { settle.call { channel.nack(tag, false, requeue) } }
         )
+      end
+
+      # The channel every pull goes down, opened once.
+      #
+      # One channel, because the messages a pass declines are held
+      # unacknowledged on it until the pass ends, and a channel per pull would
+      # release them the moment it closed.
+      def pull_channel
+        @pull_channel = @session.create_channel if @pull_channel.nil? || !@pull_channel.open?
+        @pull_channel
       end
 
       # Header and argument names go to the broker as strings, whatever they
