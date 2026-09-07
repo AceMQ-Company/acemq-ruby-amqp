@@ -262,6 +262,44 @@ without waiting for a tick. A store is anything answering `add`, `pending` and
 transaction — a store that opens its own connection has the gap back, in a
 place that looks like it has been dealt with.
 
+### Request and reply
+
+```ruby
+Patterns.serve(mq, "price.requests") do |message|
+  { "price" => catalogue.price(message.payload["sku"]) }   # the answer, not an Ack
+end
+
+prices = Patterns::Requester.new(mq, to: "price.requests", timeout: 5)
+prices.call({ "sku" => "X-1" })   # => { "price" => 1299 }
+prices.close
+```
+
+Messaging is asynchronous and this is a synchronous shape drawn on top of it,
+which is a real cost rather than a free convenience: a caller blocked on a reply
+holds a thread, a connection and a deadline, and a queue that backs up turns
+into a service that stops responding. Reach for it where a caller genuinely
+cannot go on without the answer, and publish an event otherwise.
+
+A requester is meant to be kept and reused — it holds a queue and a consumer,
+so one per request means a queue per request. Without `reply_to:` it generates
+an exclusive, transient, auto-deleting queue that goes away with the process; a
+reply queue that outlived its requester would collect answers nobody is waiting
+for.
+
+The responder's block returns the answer rather than an `Ack`, and raising sends
+the failure back to the caller: somebody blocked on a reply should learn that it
+failed rather than wait out the timeout. Having answered, the request is settled
+rather than retried, because replying and then retrying would answer twice.
+
+A timeout says an answer did not arrive. It says nothing about whether the work
+was done, which is why a request that changes anything wants an idempotent
+responder.
+
+Two headers carry this, `acemq-reply-to` and `acemq-error`. They are application
+headers on purpose: the `x-acemq-` namespace belongs to the engine and is kept
+away from what a handler sees, so a responder could never read them if they
+lived there.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

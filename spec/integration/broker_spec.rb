@@ -316,6 +316,42 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "a request and its reply" do
+    let(:queue) { queue_named("requests") }
+    let(:replies) { queue_named("replies") }
+
+    before do
+      scrub(queue, replies)
+      AceMQ::AMQP::Topology.new.queue(queue).queue(replies).apply(mq)
+    end
+
+    after { scrub(queue, replies) }
+
+    it "answers a caller waiting on another thread" do
+      # The unit specs deliver synchronously, which is what makes them fast and
+      # also what they cannot prove: here the reply genuinely arrives on the
+      # consumer's thread while this one is blocked on a condition variable.
+      AceMQ::AMQP::Patterns.serve(mq, queue) do |message|
+        { "price" => message.payload["sku"].length * 100 }
+      end
+      requester = AceMQ::AMQP::Patterns::Requester.new(mq, to: queue, reply_to: replies,
+                                                           timeout: 10)
+
+      expect(requester.call({ "sku" => "X-12" })).to eq({ "price" => 400 })
+      requester.close
+    end
+
+    it "brings a responder's failure back rather than making the caller wait it out" do
+      AceMQ::AMQP::Patterns.serve(mq, queue) { |_message| raise "the catalogue is down" }
+      requester = AceMQ::AMQP::Patterns::Requester.new(mq, to: queue, reply_to: replies,
+                                                           timeout: 10)
+
+      expect { requester.call({ "sku" => "X" }) }
+        .to raise_error(AceMQ::AMQP::Patterns::ResponderFailed, /the catalogue is down/)
+      requester.close
+    end
+  end
+
   describe "publishing" do
     let(:queue) { queue_named("confirms") }
 
