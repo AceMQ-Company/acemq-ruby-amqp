@@ -335,6 +335,38 @@ rather than allowed to loop. A dead letter's routing key is the dead-letter
 queue, so it would publish every message straight back onto the queue it was
 read from, for ever, and the only sign would be a queue that never empties.
 
+### Ordering
+
+```ruby
+mq.consume("orders.new", concurrency: 16,
+           &Patterns.ordered("x-order-id") { |message| apply(message.payload) })
+```
+
+A queue delivers in order and a consumer with concurrency above one stops
+honouring that. Usually the right trade; the wrong one where a later message
+about the same thing must not overtake an earlier one — an "order cancelled"
+arriving before the "order placed" it cancels. This buys ordering per key while
+keeping concurrency across keys.
+
+The key is a header name, or anything callable for a key that lives in the
+payload; `Patterns.by_correlation` keeps one business action's messages in
+sequence. A message whose key comes out empty is handled with no ordering,
+because there is nothing to order it against.
+
+**What it does not do**: it orders the handling of messages already delivered.
+It cannot reorder ones the broker delivered out of order, and with several
+consumers on one queue it orders only within each process. Ordering across
+processes is a routing decision — a consistent hash exchange, or a queue per
+partition:
+
+```ruby
+Patterns.partitioned_routing_key("orders", order_id, 8)   # => "orders.3"
+```
+
+`Patterns.partition` is FNV-1a rather than Ruby's own `hash`, and that is the
+point: Ruby randomises string hashes per process, so two workers would disagree
+about where a key belongs, and so would a Go publisher and a Ruby consumer.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

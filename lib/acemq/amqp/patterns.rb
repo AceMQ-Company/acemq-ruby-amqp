@@ -19,6 +19,7 @@ require_relative "patterns/idempotency"
 require_relative "patterns/outbox"
 require_relative "patterns/request_reply"
 require_relative "patterns/replay"
+require_relative "patterns/ordered"
 
 module AceMQ
   module AMQP
