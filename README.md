@@ -15,8 +15,10 @@ produces pin that rather than leaving it to be discovered in production.
 
 > **Status: in build.** The contract layer and the AMQP transport — connect,
 > publish, consume, retry, dead-letter — are implemented and tested, against
-> the shared fixtures and against a real broker. Nothing is published to
-> RubyGems yet.
+> the shared fixtures and against a real broker, and so are the [patterns
+> above it](#patterns): idempotency, the outbox, request and reply, replay,
+> ordering, consumer groups, routing slips, pipelines, schemas and streams.
+> Nothing is published to RubyGems yet.
 
 ## What is here today
 
@@ -189,10 +191,23 @@ the transport:
 require "acemq/amqp/patterns"
 ```
 
-A pattern here wraps a handler and hands back a handler. It goes to `consume`
+Most of them wrap a handler and hand back a handler. That goes to `consume`
 unchanged, so the retry policy, the dead-lettering and the envelope are all
 still whatever you configured — a pattern that took over the consumer would have
 to reimplement them, and then there would be two retry engines to keep in step.
+
+| | |
+|---|---|
+| [Idempotency](#idempotency) | do a message's work once, however often it arrives |
+| [Outbox](#outbox) | decide to send and send, with no gap in between |
+| [Request and reply](#request-and-reply) | ask a question and wait for the answer |
+| [Replay](#replay) | put dead letters back, once the fix is out |
+| [Ordering](#ordering) | keep some messages in order without serialising all of them |
+| [Consumer groups](#consumer-groups) | start a set of workers together, and stop them together |
+| [Routing slips](#routing-slips) | let the message carry its own itinerary |
+| [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
+| [Schemas](#schemas) | remember what a message used to look like |
+| [Streams](#streams) | a queue that keeps what it has delivered |
 
 ### Idempotency
 
