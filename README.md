@@ -118,11 +118,47 @@ been paused — a message can be on attempt one and four days old.
 
 ### What the consumer actually does
 
-`Ack.retry` returns the message to the broker after waiting the policy's delay.
-The attempt is counted **by the consumer**, from the broker's redelivery flag,
-not read off `x-acemq-attempt`: a broker requeues the bytes it was given, so the
-header still reads whatever the publisher wrote however many times the message
-has come round.
+`Ack.retry` returns the message to the broker with `x-acemq-attempt` advanced.
+The count travels **on the message**, because a requeue hands the broker back
+the bytes it was given: counting in the consumer instead is wrong the moment a
+second one exists, since a message that moves between them is for ever on
+attempt one, and a restart forgets everything anyway. The trade is that a
+retried message goes to the back of its queue rather than the front.
+
+**Where the delay is waited depends on how long it is.** Under 30 seconds by
+default, the consumer waits, holding one prefetch slot. At or above that, the
+message is published into a rung queue — `{queue}.retry.{delay}` — whose
+`x-message-ttl` is the delay and whose dead-letter target is the queue it came
+from, so the broker returns it when the time is up with nothing running:
+
+```ruby
+policy = RetryPolicy.exponential(6, 10, 300)   # 10s, 20s, 40s, 80s, 160s
+
+Topology.new
+        .queue("orders.new", dead_letter: true, retry_policy: policy)
+        .apply(mq)                             # declares .retry.40s, .retry.80s, .retry.160s
+
+mq.consume("orders.new", retry_policy: policy) { |message| ... }
+```
+
+The rungs *are* `policy.schedule`, a finite list known before anything is
+published, which is why the topology can declare them up front rather than a
+consumer discovering them one failure at a time. Hand `queue` the policy and it
+works them out; `retry_threshold:` moves the line, on both the topology and the
+consumer, and the two have to agree.
+
+A consumer that sleeps through a five-minute backoff loses the whole wait when
+it restarts — the broker redelivers at once — which is a correctness bug rather
+than a throughput one. Below the threshold, a lost wait costs seconds and a
+queue per rung is not worth it. Jitter applies only below the threshold; above
+it the spread comes free, because each message's time-to-live starts when it
+enters the rung, so a fleet that failed over ten seconds is released over ten
+seconds.
+
+Per-message TTL is never used, and it is worth saying why, because it looks like
+the flexible answer: RabbitMQ expires messages only from the head of a queue, so
+one long wait sitting at the front holds back every shorter one behind it, and
+the delays that come out bear no relation to the ones that went in.
 
 When the policy has no attempt left — or the message is older than the policy
 allows, or the handler marked the reason `FatalError` — the message is

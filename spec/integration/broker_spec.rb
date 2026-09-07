@@ -160,6 +160,57 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "a retry too long to wait for" do
+    # Two seconds, and a threshold of one, so the example runs in about the time
+    # it takes to read it. Thirty is the default and the arithmetic either side
+    # of it is the same.
+    let(:queue) { queue_named("rung") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+    let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
+    let(:retry_exchange) { queue_named("retry") }
+    let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
+
+    before do
+      scrub(queue, dlq, rung)
+      AceMQ::AMQP::Topology.new(retry_exchange: retry_exchange)
+                           .queue(queue, retry_policy: policy, retry_threshold: 1)
+                           .queue(dlq)
+                           .apply(mq)
+    end
+
+    after do
+      scrub(queue, dlq, rung)
+      mq.transport.delete_exchange(retry_exchange)
+    end
+
+    it "waits in the broker, and the broker brings it back with the attempt advanced" do
+      attempts = []
+      mq.consume(queue, retry_policy: policy, retry_threshold: 1,
+                        retry_exchange: retry_exchange) do |message|
+        attempts << message.attempt
+        message.attempt == 1 ? AceMQ::AMQP::Ack.retry("the warehouse is down") : AceMQ::AMQP::Ack.accept
+      end
+
+      published = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      mq.publish({ "order_id" => "A-5" }, to: queue, type: "order.placed.v2")
+
+      # The message is in the rung and nothing is consuming it. This is the
+      # difference the whole design turns on: were the consumer sleeping on an
+      # unacknowledged message instead, restarting this process would have the
+      # broker redeliver at once and the two-second backoff would be nothing.
+      expect(wait_for { mq.message_count(rung) == 1 }).to be(true)
+      expect(attempts).to eq([1])
+      expect(mq.message_count(queue)).to eq(0)
+
+      # Nobody woke it up. The queue's time-to-live expired and its dead-letter
+      # target is the queue it came from.
+      expect(wait_for(seconds: 15) { attempts.size >= 2 }).to be(true)
+      expect(attempts).to eq([1, 2])
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - published).to be >= 2
+      expect(wait_for { mq.message_count(rung).zero? }).to be(true)
+    end
+  end
+
   describe "a body nothing can read" do
     let(:queue) { queue_named("undecodable") }
     let(:parked) { AceMQ::AMQP::Naming.parked_queue(queue) }

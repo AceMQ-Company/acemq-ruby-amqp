@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require_relative "naming"
+require_relative "retry_ladder"
 
 module AceMQ
   module AMQP
@@ -59,14 +60,18 @@ module AceMQ
         def to_s = "#{exchange} -> #{queue} (#{routing_key})"
       end
 
-      attr_reader :exchanges, :queues, :bindings, :dead_letter_exchange
+      attr_reader :exchanges, :queues, :bindings, :dead_letter_exchange, :retry_exchange
 
       # @param dead_letter_exchange [String] where dead letters are routed
       #   through. The shared name by default, which is what makes a broker
       #   legible; nameable because a shared vhost with one team per prefix has
       #   no business declaring an exchange outside its own.
-      def initialize(dead_letter_exchange: DEAD_LETTER_EXCHANGE)
+      # @param retry_exchange [String] where a rung's expired messages are
+      #   routed back through, nameable for the same reason
+      def initialize(dead_letter_exchange: DEAD_LETTER_EXCHANGE,
+                     retry_exchange: RetryLadder::RETRY_EXCHANGE)
         @dead_letter_exchange = dead_letter_exchange
+        @retry_exchange = retry_exchange
         @exchanges = []
         @queues = []
         @bindings = []
@@ -91,17 +96,63 @@ module AceMQ
       # the shared exchange and the binding between them, so a caller does not
       # have to remember three declarations to get one behaviour right.
       #
+      # +retry_policy+ adds the rungs that policy needs: the queues a retry
+      # waits in when its delay is long enough that waiting in the consumer
+      # would lose it to a restart. A policy is the right thing to hand a
+      # topology because the rungs *are* {RetryPolicy#schedule} — a finite list
+      # of delays, known before anything is published — so they can be declared
+      # once, here, and appear in a plan somebody reviews, rather than being
+      # discovered one failure at a time. Passing the policy rather than a list
+      # of delays is what keeps the two from drifting: a queue whose consumer
+      # runs a policy this was never told about has rungs that do not match its
+      # waits, and the symptom of that is a retry which quietly never comes
+      # back.
+      #
       # @param name [String]
       # @param dead_letter [Boolean] whether to wire up +{name}.dlq+
+      # @param retry_policy [RetryPolicy, nil] whose rungs to declare
+      # @param retry_threshold [Numeric] seconds; delays at or above it get a
+      #   rung, and must match what the consumer of this queue is configured
+      #   with
       # @return [Topology] self
       def queue(name, durable: true, auto_delete: false, exclusive: false, arguments: {},
-                dead_letter: false)
+                dead_letter: false, retry_policy: nil,
+                retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
         name = name.to_s
         arguments = dead_letter_arguments(name, arguments) if dead_letter
         @queues << Queue.new(name: name, durable: durable, auto_delete: auto_delete,
                              exclusive: exclusive, arguments: arguments)
         dead_letter_queue(name) if dead_letter
+        retry_ladder(name, retry_policy, threshold: retry_threshold) if retry_policy
         self
+      end
+
+      # Adds the retry rungs a policy needs for a queue, and the exchange that
+      # brings their expired messages home.
+      #
+      # Called for you by +queue(..., retry_policy: policy)+. Public for the
+      # same reason {#dead_letter_queue} is: a deployment that only creates the
+      # broker's shape, and never consumes, still has to create these.
+      #
+      # Nothing binds a consumer to a rung, and nothing should: a rung is only
+      # ever published into, and a consumer on one would take the message
+      # before its time-to-live had expired, which is the entire wait.
+      #
+      # @param source [String] the queue whose retries these are
+      # @param policy [RetryPolicy]
+      # @param threshold [Numeric] seconds
+      # @return [Topology] self
+      def retry_ladder(source, policy, threshold: RetryLadder::DEFAULT_THRESHOLD)
+        ladder = RetryLadder.for(source, policy, threshold: threshold,
+                                                 exchange: @retry_exchange)
+        return self if ladder.empty?
+
+        exchange(@retry_exchange, :direct) unless declared_exchange?(@retry_exchange)
+        ladder.rungs.each do |rung|
+          @queues << Queue.new(name: rung.queue, durable: true, auto_delete: false,
+                               exclusive: false, arguments: rung.arguments)
+        end
+        binding(ladder.source, @retry_exchange, ladder.source)
       end
 
       # Routes messages matching a key from an exchange to a queue.

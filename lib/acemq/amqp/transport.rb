@@ -34,11 +34,12 @@ module AceMQ
 
     # One message, as it arrived, before any codec has looked at it.
     #
-    # +redelivered+ is the broker saying it has handed these bytes over before,
-    # and it is the only signal that a delivery is a retry. The attempt header
-    # cannot serve: a broker requeues the bytes it was given, so the header
-    # still reads whatever the publisher wrote however many times the message
-    # has come round.
+    # +redelivered+ is the broker saying it has handed these bytes over before —
+    # a nack that requeued, or a consumer that died holding the message. It is
+    # not how a retry is counted: a requeue hands the broker back the bytes it
+    # was given, so the flag says a delivery happened twice and nothing about
+    # which attempt this is. That lives in +x-acemq-attempt+, which the retry
+    # engine advances by republishing rather than requeueing.
     #
     # Settling travels with the delivery as +on_ack+ and +on_nack+ rather than
     # as a delivery tag the consumer would have to hand back to the right

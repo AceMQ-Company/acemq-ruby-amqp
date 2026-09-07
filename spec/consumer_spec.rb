@@ -28,9 +28,9 @@ RSpec.describe AceMQ::AMQP::Consumer do
   # how long to wait, when to give up and what reason gets written onto the
   # dead letter, and none of that is the broker's arithmetic.
   def consumer(policy: AceMQ::AMQP::RetryPolicy.none, codec: AceMQ::AMQP::JSONCodec.new,
-               &handler)
+               threshold: AceMQ::AMQP::RetryLadder::DEFAULT_THRESHOLD, &handler)
     described_class.new(transport: transport, queue: "orders.new", handler: handler,
-                        codec: codec, retry_policy: policy)
+                        codec: codec, retry_policy: policy, retry_threshold: threshold)
   end
 
   def headers_for(id: "msg-1", attempt: 1, **extra)
@@ -187,6 +187,79 @@ RSpec.describe AceMQ::AMQP::Consumer do
       consumer { Ack.retry("try again") }.handle(delivery)
 
       expect(transport.published_to("orders.new.dlq").size).to eq(1)
+    end
+  end
+
+  describe "a delay long enough to be worth the broker's while" do
+    # Half a second, so the examples stay fast; thirty is the default and the
+    # arithmetic is the same either side of it.
+    let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 1) }
+
+    it "puts the message in the rung queue instead of sleeping on it" do
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      consumer(policy: policy, threshold: 0.5) { Ack.retry("the warehouse is down") }
+        .handle(delivery)
+
+      # The wait is the queue's time-to-live now, so this call does not wait at
+      # all. That is the whole point: an unacknowledged message held for a long
+      # backoff is a message the broker redelivers the moment this process
+      # restarts, which turns the backoff into nothing.
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 0.5
+      expect(transport.published_to("orders.new")).to be_empty
+      expect(transport.published_to("orders.new.retry.1s").size).to eq(1)
+      expect(recorder.acked?).to be(true)
+      expect(recorder.requeued?).to be(false)
+    end
+
+    it "advances the attempt on the way into the rung, as an immediate retry does" do
+      # A rung is where the message waits, not a different kind of retry: the
+      # count on the wire has to move whichever way the wait happened, or the
+      # policy never runs out.
+      delivery, = FakeDelivery.build(headers: headers_for(attempt: 2))
+      consumer(policy: policy, threshold: 0.5) { Ack.retry("no") }.handle(delivery)
+
+      waiting = transport.published_to("orders.new.retry.1s").first
+      expect(waiting.headers[Headers::ATTEMPT]).to eq(3)
+      expect(waiting.headers[Headers::ID]).to eq("msg-1")
+    end
+
+    it "sets no expiration on the message itself" do
+      # Per-message TTL expires only from the head of a queue, so one long wait
+      # at the front holds back every shorter one behind it. The delay lives on
+      # the rung queue and nowhere else.
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(policy: policy, threshold: 0.5) { Ack.retry("no") }.handle(delivery)
+
+      headers = transport.published_to("orders.new.retry.1s").first.headers
+      expect(headers.keys).not_to include("expiration", "x-message-ttl")
+    end
+
+    it "still dead-letters rather than laddering when the attempts run out" do
+      delivery, = FakeDelivery.build(headers: headers_for(attempt: 3))
+      consumer(policy: policy, threshold: 0.5) { Ack.retry("the warehouse is down") }
+        .handle(delivery)
+
+      expect(transport.published_to("orders.new.retry.1s")).to be_empty
+      expect(transport.published_to("orders.new.dlq").first.headers[Headers::ERROR])
+        .to eq("gave up after 3 attempts: the warehouse is down")
+    end
+
+    it "picks the rung from the schedule, not from the jittered delay" do
+      # Jitter is random by definition and a rung queue is named after a fixed
+      # delay, so a jittered number could name a queue nothing declared. Above
+      # the threshold the spread comes free anyway: each message's time-to-live
+      # starts when it enters the rung.
+      jittery = AceMQ::AMQP::RetryPolicy.fixed(5, 60).with_jitter(0.5)
+      subject = consumer(policy: jittery, threshold: 30) { Ack.retry("no") }
+
+      20.times do
+        delivery, = FakeDelivery.build(headers: headers_for)
+        subject.handle(delivery)
+      end
+
+      expect(transport.published_to("orders.new.retry.1m").size).to eq(20)
+      expect(transport.published.map(&:routing_key).uniq).to eq(["orders.new.retry.1m"])
     end
   end
 

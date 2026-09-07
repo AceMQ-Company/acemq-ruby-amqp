@@ -60,6 +60,52 @@ RSpec.describe AceMQ::AMQP::Topology do
                                                "orders.new.parked"])
   end
 
+  it "declares the rungs a retry policy needs, and nothing for the delays it does not" do
+    # The rungs are the policy's schedule, which is a finite list known before
+    # anything is published — which is exactly why the topology can declare
+    # them rather than a consumer discovering them one failure at a time.
+    policy = AceMQ::AMQP::RetryPolicy.new(max_attempts: 4, initial_delay: 30, multiplier: 2)
+    topology = described_class.new.queue("orders.new", dead_letter: true,
+                                                       retry_policy: policy)
+
+    expect(topology.queues.map(&:name)).to eq(["orders.new", "orders.new.dlq",
+                                               "orders.new.retry.30s", "orders.new.retry.1m",
+                                               "orders.new.retry.2m"])
+    expect(topology.queues[2].arguments).to eq(
+      "x-message-ttl" => 30_000,
+      "x-dead-letter-exchange" => "acemq.retry",
+      "x-dead-letter-routing-key" => "orders.new"
+    )
+  end
+
+  it "binds the source queue to the retry exchange so an expired rung comes home" do
+    policy = AceMQ::AMQP::RetryPolicy.fixed(3, 60)
+    topology = described_class.new.queue("orders.new", retry_policy: policy)
+
+    expect(topology.exchanges.map(&:name)).to eq(["acemq.retry"])
+    expect(topology.bindings.map(&:to_s)).to eq(["acemq.retry -> orders.new (orders.new)"])
+    expect(topology.problems).to be_empty
+  end
+
+  it "declares no rungs for a policy whose delays all fit in the consumer" do
+    # The common case. A schedule that runs in seconds costs the broker nothing.
+    seconds = AceMQ::AMQP::RetryPolicy.exponential(5, 1, 8)
+    topology = described_class.new.queue("orders.new", retry_policy: seconds)
+
+    expect(topology.queues.map(&:name)).to eq(["orders.new"])
+    expect(topology.exchanges).to be_empty
+  end
+
+  it "takes a threshold, so a rung can be declared for whatever the consumer was told" do
+    # The two have to agree: a consumer laddering at half a second against a
+    # topology that laddered at thirty publishes into a queue nobody declared.
+    topology = described_class.new.queue("orders.new",
+                                         retry_policy: AceMQ::AMQP::RetryPolicy.fixed(3, 1),
+                                         retry_threshold: 0.5)
+
+    expect(topology.queues.map(&:name)).to eq(["orders.new", "orders.new.retry.1s"])
+  end
+
   it "catches a binding to a queue nothing declares" do
     # The broker would accept it if the queue happened to exist already, and
     # the service would then depend on something no deployment creates.

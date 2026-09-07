@@ -83,14 +83,22 @@ module AceMQ
 
       # How long to wait before the next attempt, or nil to give up.
       #
+      # +jitter: false+ gives the delay the schedule says, which is what to ask
+      # for when the number has to line up with something: a retry that waits in
+      # the broker waits in a queue named after its delay, and a jittered number
+      # names no queue. The retry engine asks for it that way, decides where the
+      # wait happens, and only jitters the waits it performs itself.
+      #
       # @param attempt [Integer] the attempt that has just failed, from 1
       # @param message_age [Float] how old the message is, in seconds
+      # @param jitter [Boolean] whether to spread the delay
       # @return [Float, nil] the delay in seconds, or nil for no further attempt
-      def next_delay(attempt, message_age = 0.0)
+      def next_delay(attempt, message_age = 0.0, jitter: true)
         return nil if attempt >= max_attempts
         return nil if max_message_age.positive? && message_age >= max_message_age
 
-        [jittered(backoff(attempt)), 0.0].max
+        delay = backoff(attempt)
+        [jitter ? jittered(delay) : delay, 0.0].max
       end
 
       # The delays this policy would use, without jitter.
@@ -110,6 +118,25 @@ module AceMQ
         delays
       end
 
+      # The same delay, moved either side by the jitter factor.
+      #
+      # Both directions, so a fleet of consumers that failed together does not
+      # come back together. One-sided jitter only ever delays, which turns a
+      # thundering herd into a slower thundering herd.
+      #
+      # Public because the retry engine applies it separately from working the
+      # delay out: a wait that happens in the broker needs no jitter at all,
+      # since each message's time-to-live starts when it enters the rung, so a
+      # fleet that failed over ten seconds is released over ten seconds.
+      #
+      # @param delay [Float] seconds
+      # @return [Float]
+      def jittered(delay)
+        return delay unless jitter_factor.positive? && delay.positive?
+
+        delay * (1 + (((Kernel.rand * 2) - 1) * jitter_factor))
+      end
+
       private
 
       # The delay this attempt has backed off to, capped.
@@ -124,17 +151,6 @@ module AceMQ
           break delay = max_delay if max_delay.positive? && delay > max_delay
         end
         max_delay.positive? && delay > max_delay ? max_delay : delay
-      end
-
-      # The same delay, moved either side by the jitter factor.
-      #
-      # Both directions, so a fleet of consumers that failed together does not
-      # come back together. One-sided jitter only ever delays, which turns a
-      # thundering herd into a slower thundering herd.
-      def jittered(delay)
-        return delay unless jitter_factor.positive? && delay.positive?
-
-        delay * (1 + (((Kernel.rand * 2) - 1) * jitter_factor))
       end
 
       def copy(**changes)
