@@ -20,6 +20,8 @@ require_relative "amqp/envelope"
 require_relative "amqp/retry_policy"
 require_relative "amqp/naming"
 require_relative "amqp/ack"
+require_relative "amqp/codec"
+require_relative "amqp/topology"
 
 # AceMQ for Ruby.
 #
@@ -31,3 +33,4 @@ require_relative "amqp/ack"
 #
 # The API shape is Ruby's, deliberately. The contract is portable; the
 # ergonomics are native.
+
