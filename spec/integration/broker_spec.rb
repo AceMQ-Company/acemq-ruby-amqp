@@ -434,8 +434,8 @@ RSpec.describe "against a real broker", :integration do
       # see what was behind it. Holding declined messages unacknowledged for the
       # length of the pass is what gets past that, and it is the reason this
       # test exists rather than a unit one.
-      mq.publish({ "order_id" => "keep" }, to: dlq, error: "no such customer")
-      mq.publish({ "order_id" => "move" }, to: dlq, error: "connection timeout")
+      mq.publish({ "order_id" => "keep" }, to: dlq, error: "no such customer", attempt: 5)
+      mq.publish({ "order_id" => "move" }, to: dlq, error: "connection timeout", attempt: 5)
       expect(wait_for { mq.message_count(dlq) == 2 }).to be(true)
 
       result = AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: queue) do |envelope, _|
@@ -449,6 +449,11 @@ RSpec.describe "against a real broker", :integration do
       properties, body = take_one(queue)
       expect(body).to eq('{"order_id":"move"}')
       expect(properties[:headers][AceMQ::AMQP::Patterns::REPLAYED_FROM_HEADER]).to eq(dlq)
+      # Back on attempt one, and through RabbitMQ's field table rather than a
+      # Hash in this process: a message that came back on attempt five would be
+      # dead-lettered again before any handler saw it.
+      expect(properties[:headers][AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
+      expect(properties[:headers]).not_to have_key(AceMQ::AMQP::Headers::ERROR)
       # The declined one went back rather than being lost.
       expect(wait_for { mq.message_count(dlq) == 1 }).to be(true)
     end

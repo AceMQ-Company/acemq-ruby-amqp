@@ -142,7 +142,7 @@ RSpec.describe "replaying a dead-letter queue" do
     expect(headers[AceMQ::AMQP::Patterns::REPLAYED_FROM_HEADER]).to eq("staging")
   end
 
-  it "keeps the envelope the message arrived with, reason included" do
+  it "keeps the identity the message arrived with" do
     # Whoever is watching a replay go past needs to know what these messages
     # were, and the identity has to survive or nothing keyed on it agrees.
     dead_letter(1)
@@ -151,9 +151,43 @@ RSpec.describe "replaying a dead-letter queue" do
 
     replayed = transport.published_to("orders.new").first.headers
     expect(replayed[AceMQ::AMQP::Headers::ID]).to eq(original.headers[AceMQ::AMQP::Headers::ID])
+    expect(replayed[AceMQ::AMQP::Headers::CORRELATION])
+      .to eq(original.headers[AceMQ::AMQP::Headers::CORRELATION])
+    expect(replayed[AceMQ::AMQP::Headers::FIRST_SEEN])
+      .to eq(original.headers[AceMQ::AMQP::Headers::FIRST_SEEN])
     expect(replayed[AceMQ::AMQP::Headers::TYPE]).to eq("order.placed.v2")
-    expect(replayed[AceMQ::AMQP::Headers::ERROR]).to eq("the warehouse is down")
     expect(replayed["n"]).to eq(0)
+  end
+
+  it "puts a message back on attempt one, with the reason that killed it cleared" do
+    # Without this a replay does nothing that can be seen from outside. A
+    # message dead-lettered on the last attempt of a five-attempt policy comes
+    # back on attempt five, so the consumer gives up on it before the handler
+    # is ever called, and two thousand messages move from the dead-letter queue
+    # to the dead-letter queue.
+    mq.publish({ "order_id" => "A-9" }, to: dlq, type: "order.placed.v2",
+                                        attempt: 5, error: "the warehouse is down")
+
+    AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "orders.new")
+
+    replayed = transport.published_to("orders.new").first.headers
+    expect(replayed[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
+    # Absent rather than empty: an envelope writes no header for a field it has
+    # nothing to say about.
+    expect(replayed).not_to have_key(AceMQ::AMQP::Headers::ERROR)
+  end
+
+  it "puts back exactly what was there when asked to" do
+    # For an audit, or for a queue read by something that counts attempts for
+    # itself, where a replay that quietly rewrote the count would be the bug.
+    mq.publish({ "order_id" => "A-9" }, to: dlq, type: "order.placed.v2",
+                                        attempt: 5, error: "the warehouse is down")
+
+    AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "orders.new", restart: false)
+
+    replayed = transport.published_to("orders.new").first.headers
+    expect(replayed[AceMQ::AMQP::Headers::ATTEMPT]).to eq(5)
+    expect(replayed[AceMQ::AMQP::Headers::ERROR]).to eq("the warehouse is down")
   end
 
   it "puts a message back rather than losing it when the broker refuses" do

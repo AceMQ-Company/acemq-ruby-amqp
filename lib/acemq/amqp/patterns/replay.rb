@@ -71,6 +71,15 @@ module AceMQ
       # A consumer that needs to treat them differently can, and one that does
       # not is unaffected.
       #
+      # A replayed message goes back on attempt one, with the reason that
+      # dead-lettered it cleared. Anything else does not work: a message
+      # dead-lettered on the last attempt of a five-attempt policy arrives back
+      # on attempt five, and the consumer gives up on it before the handler ever
+      # sees it — so an operator who has just fixed the bug moves two thousand
+      # messages from the dead-letter queue to the dead-letter queue. Pass
+      # +restart: false+ to put back exactly what was there, which is what an
+      # audit wants, or a queue read by something that counts attempts itself.
+      #
       # @param connection [Connection]
       # @param from [String] the queue the messages are on now
       # @param exchange [String] where they go back to; empty publishes to a
@@ -80,15 +89,18 @@ module AceMQ
       # @param limit [Integer] stop after this many; zero for no limit, which
       #   against a queue somebody is still writing to may mean never stopping
       # @param deadline [Numeric] stop after this many seconds; zero for none
+      # @param restart [Boolean] give each message a fresh set of attempts,
+      #   clearing +x-acemq-attempt+ back to 1 and +x-acemq-error+ with it
       # @return [ReplayResult]
       # @raise [ReplayFailed] when the broker refused part-way
       def self.replay(connection, from:, exchange: "", routing_key: nil, limit: 0,
-                      deadline: 0, &filter)
+                      deadline: 0, restart: true, &filter)
         raise ArgumentError, "a replay needs a queue to read from" if from.to_s.empty?
 
         refuse_a_loop(from, exchange, routing_key)
         Replay.new(connection, from: from, exchange: exchange, routing_key: routing_key,
-                               limit: limit, deadline: deadline, filter: filter).run
+                               limit: limit, deadline: deadline, restart: restart,
+                               filter: filter).run
       end
 
       # Refuses a replay that would put every message back where it found it.
@@ -119,7 +131,8 @@ module AceMQ
       #
       # @api private
       class Replay
-        def initialize(connection, from:, exchange:, routing_key:, limit:, deadline:, filter:)
+        def initialize(connection, from:, exchange:, routing_key:, limit:, deadline:, restart:,
+                       filter:)
           # The raw publish, because a replayed message keeps the bytes and the
           # envelope it already had; re-encoding it would be inventing a new
           # message with an old one's identity.
@@ -129,6 +142,7 @@ module AceMQ
           @routing_key = routing_key
           @limit = limit.to_i
           @deadline = deadline.to_f
+          @restart = restart
           @filter = filter
           @result = ReplayResult.new(moved: 0, skipped: 0, reason: :drained)
           # Messages the filter declines are held unacknowledged, not returned
@@ -193,11 +207,32 @@ module AceMQ
         end
 
         def stamped(envelope, routing_key)
-          envelope.to_headers(routing_key).merge(
+          going_back(envelope).to_headers(routing_key).merge(
             REPLAYED_FROM_HEADER => @from,
             REPLAYED_AT_HEADER => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             REPLAY_COUNT_HEADER => replay_count(envelope) + 1
           )
+        end
+
+        # The envelope the message goes back with.
+        #
+        # Attempt one and no error, unless the caller asked for the original.
+        # A message that comes back on the last attempt of its policy is dead
+        # lettered again before any handler is called, so a replay that kept the
+        # count would move a queue onto itself and look, from the outside, like
+        # a replay that did nothing. The error goes with it: it is the reason
+        # the message failed the time before, and leaving it on a message that
+        # has not failed yet is a header that says something untrue.
+        #
+        # The identity is untouched — same id, same correlation, same first-seen
+        # time — because this is the same message going round again and not a
+        # new one. Age-based giving up is measured from first_seen, so a replay
+        # of something very old still gives up on age, which is right: the fix
+        # was for the bug, not for the clock.
+        def going_back(envelope)
+          return envelope unless @restart
+
+          envelope.with(attempt: 1, error: "")
         end
 
         # A count written by another language's library arrives as whatever that

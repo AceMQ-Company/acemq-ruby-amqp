@@ -483,6 +483,17 @@ over the same message and everything behind it is never seen. The broker still
 has the held ones, so a tool that dies half way through returns them rather than
 losing them.
 
+**A replayed message goes back on attempt one**, with `x-acemq-error` cleared.
+Anything else does nothing that can be seen from outside: a message
+dead-lettered on the last attempt of a five-attempt policy arrives back on
+attempt five, the consumer gives up on it before the handler is called, and two
+thousand messages move from the dead-letter queue to the dead-letter queue. Pass
+`restart: false` to put back exactly what was there — for an audit, or for a
+queue read by something that counts attempts itself. The identity is untouched
+either way: same id, same correlation, same `x-acemq-first-seen`, so giving up
+on **age** still applies, which is right — the fix was for the bug, not for the
+clock.
+
 Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
 and `acemq-replay-count`, so a consumer that needs to treat them differently
 can and one that does not is unaffected. A message is acknowledged only after
