@@ -64,7 +64,7 @@ module AceMQ
       DEFAULT_PREFETCH = 20
 
       attr_reader :transport, :codec, :origin, :retry_policy, :prefetch,
-                  :retry_threshold, :retry_exchange
+                  :retry_threshold
 
       # Opens a connection to a broker.
       #
@@ -76,17 +76,14 @@ module AceMQ
       # @param prefetch [Integer] unacknowledged messages per consumer
       # @param retry_threshold [Numeric] seconds; a retry delayed this long or
       #   longer waits in the broker rather than in the consumer
-      # @param retry_exchange [String] the exchange those waits come back
       #   through
       # @param transport_options [Hash] passed to {Transport.open}
       # @return [Connection]
       def self.open(url, codec: JSONCodec.new, origin: nil, retry_policy: RetryPolicy.none,
                     prefetch: DEFAULT_PREFETCH,
-                    retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
-                    retry_exchange: RetryLadder::RETRY_EXCHANGE, **transport_options)
+                    retry_threshold: RetryLadder::DEFAULT_THRESHOLD, **transport_options)
         new(transport: Transport.open(url, **transport_options), codec: codec, origin: origin,
-            retry_policy: retry_policy, prefetch: prefetch, retry_threshold: retry_threshold,
-            retry_exchange: retry_exchange)
+            retry_policy: retry_policy, prefetch: prefetch, retry_threshold: retry_threshold)
       end
 
       # Wraps a transport that is already open.
@@ -96,15 +93,13 @@ module AceMQ
       # the retry arithmetic below testable without a broker in the room.
       def initialize(transport:, codec: JSONCodec.new, origin: nil,
                      retry_policy: RetryPolicy.none, prefetch: DEFAULT_PREFETCH,
-                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
-                     retry_exchange: RetryLadder::RETRY_EXCHANGE)
+                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
         @transport = transport
         @codec = Codec.check!(codec)
         @origin = origin.nil? || origin.to_s.empty? ? self.class.default_origin : origin.to_s
         @retry_policy = retry_policy
         @prefetch = prefetch
         @retry_threshold = retry_threshold
-        @retry_exchange = retry_exchange
         @consumers = []
         @lock = Mutex.new
       end
@@ -176,7 +171,7 @@ module AceMQ
       #   queue instead of in this process.
       # @return [Consumer]
       def consume(queue, codec: nil, retry_policy: nil, prefetch: nil, concurrency: 1,
-                  tag: nil, arguments: {}, retry_threshold: nil, retry_exchange: nil,
+                  tag: nil, arguments: {}, retry_threshold: nil,
                   &handler)
         unless handler
           raise ArgumentError,
@@ -187,8 +182,7 @@ module AceMQ
           transport: @transport, queue: queue, handler: handler,
           codec: codec.nil? ? @codec : Codec.check!(codec),
           retry_policy: retry_policy || @retry_policy,
-          retry_threshold: retry_threshold || @retry_threshold,
-          retry_exchange: retry_exchange || @retry_exchange
+          retry_threshold: retry_threshold || @retry_threshold
         )
         consumer.start(prefetch: prefetch || @prefetch, concurrency: concurrency, tag: tag,
                        arguments: arguments)
@@ -254,15 +248,13 @@ module AceMQ
       attr_reader :queue, :retry_policy, :codec, :ladder
 
       def initialize(transport:, queue:, handler:, codec:, retry_policy:,
-                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
-                     retry_exchange: RetryLadder::RETRY_EXCHANGE)
+                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
         @transport = transport
         @queue = queue
         @handler = handler
         @codec = codec
         @retry_policy = retry_policy
-        @ladder = RetryLadder.for(queue, retry_policy, threshold: retry_threshold,
-                                                       exchange: retry_exchange)
+        @ladder = RetryLadder.for(queue, retry_policy, threshold: retry_threshold)
         @dead_letter_queue = Naming.dead_letter_queue(queue)
         @parked_queue = Naming.parked_queue(queue)
         @lock = Mutex.new

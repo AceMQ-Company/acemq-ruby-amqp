@@ -61,14 +61,28 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
   end
 
   describe "the arguments a rung is declared with" do
-    it "expires to the source queue through the retry exchange" do
+    it "expires to the source queue through the default exchange" do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
 
       expect(ladder.rungs.first.arguments).to eq(
         "x-message-ttl" => 60_000,
-        "x-dead-letter-exchange" => "acemq.retry",
+        "x-dead-letter-exchange" => "",
         "x-dead-letter-routing-key" => "orders.new"
       )
+    end
+
+    it "declares a rung exactly as the Python library declares it" do
+      # Two services on one queue declare the same rung by name. If they
+      # disagree about its arguments the second one gets PRECONDITION_FAILED
+      # and cannot consume at all, so this table is contract rather than
+      # preference, and it is written out here so a change has to be
+      # deliberate.
+      ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
+
+      expect(ladder.rungs.first.arguments.keys).to eq(
+        %w[x-message-ttl x-dead-letter-exchange x-dead-letter-routing-key]
+      )
+      expect(ladder.rungs.first.arguments["x-message-ttl"]).to be_an(Integer)
     end
 
     it "puts the delay on the queue rather than on the message" do
@@ -103,15 +117,17 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
   describe "declaring" do
     let(:transport) { FakeTransport.new }
 
-    it "declares the exchange, every rung, and one binding home" do
+    it "declares the rungs and nothing else" do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
       ladder.declare(transport)
 
-      expect(transport.declared_exchanges.map(&:first)).to eq(["acemq.retry"])
       expect(transport.declared_queues.map(&:first)).to eq(["orders.new.retry.1m"])
-      # One binding, under the source queue's own name, because every rung
-      # dead-letters under that name however many rungs there are.
-      expect(transport.bindings).to eq([["orders.new", "acemq.retry", "orders.new"]])
+      # No exchange and no binding: a rung expires through the default
+      # exchange, and every queue is bound to that by its own name from the
+      # moment it exists. A named exchange would need a binding per source
+      # queue, and a forgotten one loses every message the rung expires.
+      expect(transport.declared_exchanges).to be_empty
+      expect(transport.bindings).to be_empty
     end
 
     it "declares nothing at all when no delay needs a queue" do

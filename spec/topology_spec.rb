@@ -73,17 +73,20 @@ RSpec.describe AceMQ::AMQP::Topology do
                                                "orders.new.retry.2m"])
     expect(topology.queues[2].arguments).to eq(
       "x-message-ttl" => 30_000,
-      "x-dead-letter-exchange" => "acemq.retry",
+      "x-dead-letter-exchange" => "",
       "x-dead-letter-routing-key" => "orders.new"
     )
   end
 
-  it "binds the source queue to the retry exchange so an expired rung comes home" do
+  it "needs no exchange and no binding for an expired rung to come home" do
     policy = AceMQ::AMQP::RetryPolicy.fixed(3, 60)
     topology = described_class.new.queue("orders.new", retry_policy: policy)
 
-    expect(topology.exchanges.map(&:name)).to eq(["acemq.retry"])
-    expect(topology.bindings.map(&:to_s)).to eq(["acemq.retry -> orders.new (orders.new)"])
+    # The default exchange routes by queue name, so the rung's dead-letter
+    # routing key is the source queue and there is nothing else to declare.
+    # One fewer object, and one fewer thing to forget.
+    expect(topology.exchanges).to be_empty
+    expect(topology.bindings).to be_empty
     expect(topology.problems).to be_empty
   end
 

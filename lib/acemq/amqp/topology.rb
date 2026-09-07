@@ -60,18 +60,14 @@ module AceMQ
         def to_s = "#{exchange} -> #{queue} (#{routing_key})"
       end
 
-      attr_reader :exchanges, :queues, :bindings, :dead_letter_exchange, :retry_exchange
+      attr_reader :exchanges, :queues, :bindings, :dead_letter_exchange
 
       # @param dead_letter_exchange [String] where dead letters are routed
       #   through. The shared name by default, which is what makes a broker
       #   legible; nameable because a shared vhost with one team per prefix has
       #   no business declaring an exchange outside its own.
-      # @param retry_exchange [String] where a rung's expired messages are
-      #   routed back through, nameable for the same reason
-      def initialize(dead_letter_exchange: DEAD_LETTER_EXCHANGE,
-                     retry_exchange: RetryLadder::RETRY_EXCHANGE)
+      def initialize(dead_letter_exchange: DEAD_LETTER_EXCHANGE)
         @dead_letter_exchange = dead_letter_exchange
-        @retry_exchange = retry_exchange
         @exchanges = []
         @queues = []
         @bindings = []
@@ -143,16 +139,16 @@ module AceMQ
       # @param threshold [Numeric] seconds
       # @return [Topology] self
       def retry_ladder(source, policy, threshold: RetryLadder::DEFAULT_THRESHOLD)
-        ladder = RetryLadder.for(source, policy, threshold: threshold,
-                                                 exchange: @retry_exchange)
+        ladder = RetryLadder.for(source, policy, threshold: threshold)
         return self if ladder.empty?
 
-        exchange(@retry_exchange, :direct) unless declared_exchange?(@retry_exchange)
+        # Queues only. A rung expires through the default exchange, so there is
+        # no exchange to declare and no binding that can be forgotten.
         ladder.rungs.each do |rung|
           @queues << Queue.new(name: rung.queue, durable: true, auto_delete: false,
                                exclusive: false, arguments: rung.arguments)
         end
-        binding(ladder.source, @retry_exchange, ladder.source)
+        self
       end
 
       # Routes messages matching a key from an exchange to a queue.

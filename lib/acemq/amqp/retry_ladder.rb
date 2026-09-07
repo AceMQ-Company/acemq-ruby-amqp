@@ -27,8 +27,9 @@ module AceMQ
     # instant. That is a correctness bug rather than a throughput one, and it is
     # why delays past a threshold are handed to the broker instead: the message
     # is published into a rung queue whose +x-message-ttl+ is the delay and
-    # whose dead-letter target is the queue it came from, and the broker returns
-    # it when the time is up. Nothing is consuming a rung; the time-to-live is
+    # whose dead-letter target is the queue it came from — through the default
+    # exchange, which routes by queue name — and the broker returns it when the
+    # time is up. Nothing is consuming a rung; the time-to-live is
     # the only thing that ever takes a message out of one.
     #
     # For +orders.new+ with delays of 1s, 30s and 60s and the default threshold:
@@ -45,12 +46,6 @@ module AceMQ
     # before anything is published — which is what makes them declarable up
     # front, by {Topology}, rather than discovered one failure at a time.
     class RetryLadder
-      # The exchange a rung dead-letters through on its way back to the source
-      # queue. Shared with the Java, Go, .NET and Python libraries: an operator
-      # should see one retry exchange on a broker rather than one per language
-      # that happened to publish to it.
-      RETRY_EXCHANGE = "acemq.retry"
-
       # Delays at or above this go to the broker; anything shorter waits here.
       #
       # Thirty seconds because that is roughly where the two failure modes
@@ -66,16 +61,15 @@ module AceMQ
         def to_s = "#{queue} (ttl #{delay}s)"
       end
 
-      attr_reader :source, :threshold, :exchange, :rungs
+      attr_reader :source, :threshold, :rungs
 
       # Works out the ladder a policy needs, touching no broker.
       #
       # @param source [String] the queue being consumed
       # @param policy [RetryPolicy] whose schedule the rungs are
       # @param threshold [Numeric] seconds; delays at or above it get a rung
-      # @param exchange [String] the exchange rungs dead-letter through
       # @return [RetryLadder]
-      def self.for(source, policy, threshold: DEFAULT_THRESHOLD, exchange: RETRY_EXCHANGE)
+      def self.for(source, policy, threshold: DEFAULT_THRESHOLD)
         source = source.to_s
         rungs = {}
         policy.schedule.each do |delay|
@@ -87,10 +81,9 @@ module AceMQ
           # PRECONDITION_FAILED at declaration time.
           name = Naming.retry_queue(source, delay)
           rungs[name] ||= Rung.new(delay: delay, queue: name,
-                                   arguments: arguments_for(source, delay, exchange))
+                                   arguments: arguments_for(source, delay))
         end
-        new(source: source, threshold: threshold.to_f, exchange: exchange,
-            rungs: rungs.values)
+        new(source: source, threshold: threshold.to_f, rungs: rungs.values)
       end
 
       # The arguments a rung queue has to carry.
@@ -102,19 +95,31 @@ module AceMQ
       # queue per delay is more queues and is the only arrangement that actually
       # delivers the schedule it was given.
       #
+      # A rung expires through the **default exchange**, which routes by queue
+      # name, so the routing key is the source queue and there is no exchange to
+      # declare and no binding to forget. A named retry exchange would need a
+      # binding per source queue, and a missing one loses every message the rung
+      # ever expires — silently, because an unroutable dead letter is dropped.
+      #
+      # These three arguments are the cross-language contract for a rung. Two
+      # services on the same queue declare the same rung by name, so if one of
+      # them declares it with different arguments the second gets
+      # PRECONDITION_FAILED and cannot consume at all. This library and the
+      # Python one produce identical tables; anything that changes here changes
+      # there.
+      #
       # @api private
-      def self.arguments_for(source, delay, exchange)
+      def self.arguments_for(source, delay)
         {
           "x-message-ttl" => (delay * 1000).round,
-          "x-dead-letter-exchange" => exchange,
+          "x-dead-letter-exchange" => "",
           "x-dead-letter-routing-key" => source
         }
       end
 
-      def initialize(source:, threshold:, exchange:, rungs:)
+      def initialize(source:, threshold:, rungs:)
         @source = source
         @threshold = threshold
-        @exchange = exchange
         @rungs = rungs.freeze
         freeze
       end
@@ -148,8 +153,7 @@ module AceMQ
       # The rung queue names, in schedule order.
       def queues = @rungs.map(&:queue)
 
-      # Declares the exchange, the rungs and the binding that brings an expired
-      # message home.
+      # Declares the rungs.
       #
       # {Topology} declares the same thing up front, which is where it belongs:
       # a queue that appears in a plan somebody reviewed. This exists because
@@ -158,19 +162,18 @@ module AceMQ
       # is a message that simply stops existing. Declaring is idempotent, and a
       # duplicate declaration is a great deal cheaper than a lost message.
       #
-      # @param connection [Connection, Transport] anything answering
-      #   declare_exchange, declare_queue and bind
+      # There is no exchange and no binding to declare: a rung expires through
+      # the default exchange, and every queue is bound to that by its own name
+      # from the moment it exists.
+      #
+      # @param connection [Connection, Transport] anything answering declare_queue
       # @return [RetryLadder] self
       def declare(connection)
         return self if empty?
 
-        connection.declare_exchange(@exchange, kind: "direct", durable: true)
         @rungs.each do |rung|
           connection.declare_queue(rung.queue, durable: true, arguments: rung.arguments)
         end
-        # One binding brings every rung's expired messages back, because every
-        # rung dead-letters under the source queue's own name.
-        connection.bind(queue: @source, exchange: @exchange, routing_key: @source)
         self
       end
 

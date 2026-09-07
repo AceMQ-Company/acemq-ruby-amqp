@@ -168,26 +168,21 @@ RSpec.describe "against a real broker", :integration do
     let(:queue) { queue_named("rung") }
     let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
     let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
-    let(:retry_exchange) { queue_named("retry") }
     let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
 
     before do
       scrub(queue, dlq, rung)
-      AceMQ::AMQP::Topology.new(retry_exchange: retry_exchange)
+      AceMQ::AMQP::Topology.new
                            .queue(queue, retry_policy: policy, retry_threshold: 1)
                            .queue(dlq)
                            .apply(mq)
     end
 
-    after do
-      scrub(queue, dlq, rung)
-      mq.transport.delete_exchange(retry_exchange)
-    end
+    after { scrub(queue, dlq, rung) }
 
     it "waits in the broker, and the broker brings it back with the attempt advanced" do
       attempts = []
-      mq.consume(queue, retry_policy: policy, retry_threshold: 1,
-                        retry_exchange: retry_exchange) do |message|
+      mq.consume(queue, retry_policy: policy, retry_threshold: 1) do |message|
         attempts << message.attempt
         message.attempt == 1 ? AceMQ::AMQP::Ack.retry("the warehouse is down") : AceMQ::AMQP::Ack.accept
       end
