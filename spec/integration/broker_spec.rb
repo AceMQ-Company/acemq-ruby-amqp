@@ -169,6 +169,7 @@ RSpec.describe "against a real broker", :integration do
     let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
     let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
     let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
+    let(:ladder) { AceMQ::AMQP::RetryLadder.for(queue, policy, threshold: 1) }
 
     before do
       scrub(queue, dlq, rung)
@@ -178,32 +179,100 @@ RSpec.describe "against a real broker", :integration do
                            .apply(mq)
     end
 
+    # The exchange is shared and conventional — every AceMQ library declares
+    # `acemq.retry` by that name — so it is left where it is. The binding goes
+    # with the queue: RabbitMQ removes a queue's bindings when the queue is
+    # deleted, so scrubbing the queues leaves nothing of this behind.
     after { scrub(queue, dlq, rung) }
+
+    it "declares the rung the way every other library declares it" do
+      # Printed rather than only asserted, because the point of this table is
+      # that somebody can hold it beside the Go, .NET, Java and Python ones and
+      # see that they are the same.
+      arguments = ladder.rungs.first.arguments
+      puts <<~RUNG
+        --- rung declaration, as this library builds it ---
+          exchange  #{AceMQ::AMQP::Naming::RETRY_EXCHANGE} (direct, durable)
+          queue     #{ladder.rungs.first.queue} (durable)
+                      x-message-ttl              #{arguments["x-message-ttl"].inspect}
+                      x-dead-letter-exchange     #{arguments["x-dead-letter-exchange"].inspect}
+                      x-dead-letter-routing-key  #{arguments["x-dead-letter-routing-key"].inspect}
+          binding   #{queue} -> #{AceMQ::AMQP::Naming::RETRY_EXCHANGE} -> #{queue}
+          dead letters
+                    #{dlq} -> #{AceMQ::AMQP::Naming::DEAD_LETTER_EXCHANGE} -> #{dlq}
+                    #{AceMQ::AMQP::Naming.parked_queue(queue)} -> \
+        #{AceMQ::AMQP::Naming::DEAD_LETTER_EXCHANGE} -> #{AceMQ::AMQP::Naming.parked_queue(queue)}
+        ---------------------------------------------------
+      RUNG
+
+      expect(arguments).to eq(
+        "x-message-ttl" => 2000,
+        "x-dead-letter-exchange" => "acemq.retry",
+        "x-dead-letter-routing-key" => queue
+      )
+
+      # The broker agrees, which a plan on paper cannot show: redeclaring the
+      # rung with this exact table is accepted, and redeclaring it with the old
+      # one — the default exchange — is refused. That refusal is the whole
+      # reason the table has to be identical in five languages.
+      mq.declare_queue(rung, durable: true, arguments: arguments)
+      expect do
+        mq.declare_queue(rung, durable: true,
+                               arguments: arguments.merge("x-dead-letter-exchange" => ""))
+      end.to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+    end
+
+    it "routes a message home through the retry exchange and nothing else" do
+      # The binding on its own, with no time-to-live and no consumer involved:
+      # publishing to acemq.retry under the source queue's name reaches the
+      # source queue. A rung with this binding missing would look perfectly
+      # healthy right up to the moment the broker silently dropped the message.
+      mq.transport.publish(exchange: AceMQ::AMQP::Naming::RETRY_EXCHANGE,
+                           routing_key: queue, body: '{"order_id":"A-7"}',
+                           content_type: "application/json")
+
+      expect(wait_for { mq.message_count(queue) == 1 }).to be(true)
+    end
 
     it "waits in the broker, and the broker brings it back with the attempt advanced" do
       attempts = []
-      mq.consume(queue, retry_policy: policy, retry_threshold: 1) do |message|
+      consumer = mq.consume(queue, retry_policy: policy, retry_threshold: 1) do |message|
         attempts << message.attempt
-        message.attempt == 1 ? AceMQ::AMQP::Ack.retry("the warehouse is down") : AceMQ::AMQP::Ack.accept
+        AceMQ::AMQP::Ack.retry("the warehouse is down")
       end
 
       published = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       mq.publish({ "order_id" => "A-5" }, to: queue, type: "order.placed.v2")
 
-      # The message is in the rung and nothing is consuming it. This is the
-      # difference the whole design turns on: were the consumer sleeping on an
-      # unacknowledged message instead, restarting this process would have the
-      # broker redeliver at once and the two-second backoff would be nothing.
       expect(wait_for { mq.message_count(rung) == 1 }).to be(true)
       expect(attempts).to eq([1])
+
+      # The consumer is closed before anything is counted, so a zero on the
+      # source queue is the broker's own count and not a message this process
+      # happens to be holding. This is the difference the whole design turns on:
+      # were the consumer sleeping on an unacknowledged message instead,
+      # cancelling it here would return the message at once and the two-second
+      # backoff would be nothing.
+      consumer.cancel
+      expect(mq.message_count(rung)).to eq(1)
       expect(mq.message_count(queue)).to eq(0)
 
-      # Nobody woke it up. The queue's time-to-live expired and its dead-letter
-      # target is the queue it came from.
-      expect(wait_for(seconds: 15) { attempts.size >= 2 }).to be(true)
-      expect(attempts).to eq([1, 2])
+      # Nobody woke it up and nothing is attached. The rung's time-to-live
+      # expired, and its dead-letter exchange and routing key carried the
+      # message back through acemq.retry to the queue it came from.
+      expect(wait_for(seconds: 15) { mq.message_count(queue) == 1 }).to be(true)
+      expect(mq.message_count(rung)).to eq(0)
       expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - published).to be >= 2
-      expect(wait_for { mq.message_count(rung).zero? }).to be(true)
+
+      properties, body = take_one(queue)
+      expect(body).to eq('{"order_id":"A-5"}')
+      expect(properties[:headers][AceMQ::AMQP::Headers::ATTEMPT]).to eq(2)
+      # RabbitMQ writes its own account of the journey: it came out of the rung,
+      # and it came out because its time ran out rather than because anything
+      # rejected it.
+      death = properties[:headers]["x-death"]&.first
+      expect(death["queue"]).to eq(rung)
+      expect(death["reason"]).to eq("expired")
     end
   end
 

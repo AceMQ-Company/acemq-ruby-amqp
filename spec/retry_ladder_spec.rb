@@ -61,28 +61,32 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
   end
 
   describe "the arguments a rung is declared with" do
-    it "expires to the source queue through the default exchange" do
+    it "expires to the source queue through the shared retry exchange" do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
 
       expect(ladder.rungs.first.arguments).to eq(
         "x-message-ttl" => 60_000,
-        "x-dead-letter-exchange" => "",
+        "x-dead-letter-exchange" => AceMQ::AMQP::Naming::RETRY_EXCHANGE,
         "x-dead-letter-routing-key" => "orders.new"
       )
     end
 
-    it "declares a rung exactly as the Python library declares it" do
+    it "declares a rung exactly as Java, Go, .NET and Python declare it" do
       # Two services on one queue declare the same rung by name. If they
       # disagree about its arguments the second one gets PRECONDITION_FAILED
       # and cannot consume at all, so this table is contract rather than
-      # preference, and it is written out here so a change has to be
-      # deliberate.
+      # preference. The names are read from the constant, so that renaming the
+      # exchange cannot leave this passing against a stale copy of the string;
+      # the keys and the values are written out, so that changing the table
+      # itself has to be deliberate.
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
 
       expect(ladder.rungs.first.arguments.keys).to eq(
         %w[x-message-ttl x-dead-letter-exchange x-dead-letter-routing-key]
       )
       expect(ladder.rungs.first.arguments["x-message-ttl"]).to be_an(Integer)
+      expect(AceMQ::AMQP::Naming::RETRY_EXCHANGE).to eq("acemq.retry")
+      expect(AceMQ::AMQP::Naming::DEAD_LETTER_EXCHANGE).to eq("acemq.dlx")
     end
 
     it "puts the delay on the queue rather than on the message" do
@@ -117,17 +121,31 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
   describe "declaring" do
     let(:transport) { FakeTransport.new }
 
-    it "declares the rungs and nothing else" do
+    it "declares the exchange, the rungs and the binding that brings them home" do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
       ladder.declare(transport)
 
+      expect(transport.declared_exchanges)
+        .to eq([[AceMQ::AMQP::Naming::RETRY_EXCHANGE, { kind: :direct, durable: true }]])
       expect(transport.declared_queues.map(&:first)).to eq(["orders.new.retry.1m"])
-      # No exchange and no binding: a rung expires through the default
-      # exchange, and every queue is bound to that by its own name from the
-      # moment it exists. A named exchange would need a binding per source
-      # queue, and a forgotten one loses every message the rung expires.
-      expect(transport.declared_exchanges).to be_empty
-      expect(transport.bindings).to be_empty
+      expect(transport.bindings)
+        .to eq([["orders.new", AceMQ::AMQP::Naming::RETRY_EXCHANGE, "orders.new"]])
+    end
+
+    it "never declares a rung without the binding that carries it home" do
+      # The failure this exists to prevent is silent. A rung with no binding
+      # accepts the message, holds it for the time-to-live and then drops it,
+      # because an unroutable dead letter goes nowhere and reports nothing, so
+      # the binding is part of declaring rather than something arranged later.
+      ladder = described_class.for("orders.new", RetryPolicy.fixed(4, 90), threshold: 30)
+      ladder.declare(transport)
+
+      expect(transport.declared_queues).not_to be_empty
+      expect(transport.bindings.size).to eq(1)
+      queue, exchange, key = transport.bindings.first
+      expect(queue).to eq("orders.new")
+      expect(exchange).to eq(ladder.rungs.first.arguments["x-dead-letter-exchange"])
+      expect(key).to eq(ladder.rungs.first.arguments["x-dead-letter-routing-key"])
     end
 
     it "declares nothing at all when no delay needs a queue" do

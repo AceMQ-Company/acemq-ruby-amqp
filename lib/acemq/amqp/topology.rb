@@ -47,10 +47,22 @@ module AceMQ
     class Topology
       # The exchange dead letters reach their queue through.
       #
-      # A name shared with the Java, Go, .NET and Python libraries, because an
-      # operator looking at a broker should see one dead-letter exchange rather
-      # than one per language that happened to publish to it.
-      DEAD_LETTER_EXCHANGE = "acemq.dlx"
+      # The name itself lives in {Naming}, with the retry exchange it is a pair
+      # with, so that the two strings the broker's shape depends on are written
+      # down in one place and read everywhere else.
+      DEAD_LETTER_EXCHANGE = Naming::DEAD_LETTER_EXCHANGE
+
+      # The exchange a retry rung expires through.
+      #
+      # Unlike {DEAD_LETTER_EXCHANGE} this one cannot be renamed per topology,
+      # and that is deliberate rather than an omission. The dead-letter exchange
+      # is only ever named by the queue arguments this topology writes itself,
+      # so a team on a shared vhost can point it somewhere inside their own
+      # prefix without anybody else noticing. The retry exchange is written into
+      # the rung's argument table, which is the table five libraries have to
+      # agree on: a topology that renamed it would declare rungs that answer
+      # PRECONDITION_FAILED to the very consumer meant to publish into them.
+      RETRY_EXCHANGE = Naming::RETRY_EXCHANGE
 
       Exchange = Struct.new(:name, :kind, :durable, :auto_delete, :arguments,
                             keyword_init: true)
@@ -134,21 +146,31 @@ module AceMQ
       # ever published into, and a consumer on one would take the message
       # before its time-to-live had expired, which is the entire wait.
       #
+      # The binding that does get added goes the other way: +source+ is bound to
+      # {RETRY_EXCHANGE} under its own name, which is what carries an expired
+      # message home. It is added here rather than left to whoever declares the
+      # source queue because a rung without it fails silently — the message
+      # enters the rung, the time-to-live runs out, and the broker drops it,
+      # having nowhere to route it and nobody to tell. Which is also why
+      # +source+ has to be a queue this topology declares: {#problems} says so,
+      # and the alternative is a plan that binds something no deployment
+      # creates.
+      #
       # @param source [String] the queue whose retries these are
       # @param policy [RetryPolicy]
       # @param threshold [Numeric] seconds
       # @return [Topology] self
       def retry_ladder(source, policy, threshold: RetryLadder::DEFAULT_THRESHOLD)
+        source = source.to_s
         ladder = RetryLadder.for(source, policy, threshold: threshold)
         return self if ladder.empty?
 
-        # Queues only. A rung expires through the default exchange, so there is
-        # no exchange to declare and no binding that can be forgotten.
+        exchange(RETRY_EXCHANGE, :direct) unless declared_exchange?(RETRY_EXCHANGE)
         ladder.rungs.each do |rung|
           @queues << Queue.new(name: rung.queue, durable: true, auto_delete: false,
                                exclusive: false, arguments: rung.arguments)
         end
-        self
+        binding(source, RETRY_EXCHANGE, source)
       end
 
       # Routes messages matching a key from an exchange to a queue.

@@ -73,21 +73,49 @@ RSpec.describe AceMQ::AMQP::Topology do
                                                "orders.new.retry.2m"])
     expect(topology.queues[2].arguments).to eq(
       "x-message-ttl" => 30_000,
-      "x-dead-letter-exchange" => "",
+      "x-dead-letter-exchange" => AceMQ::AMQP::Naming::RETRY_EXCHANGE,
       "x-dead-letter-routing-key" => "orders.new"
     )
   end
 
-  it "needs no exchange and no binding for an expired rung to come home" do
+  it "declares the retry exchange and the one binding that brings a rung home" do
     policy = AceMQ::AMQP::RetryPolicy.fixed(3, 60)
     topology = described_class.new.queue("orders.new", retry_policy: policy)
 
-    # The default exchange routes by queue name, so the rung's dead-letter
-    # routing key is the source queue and there is nothing else to declare.
-    # One fewer object, and one fewer thing to forget.
-    expect(topology.exchanges).to be_empty
-    expect(topology.bindings).to be_empty
+    # The binding is the part that fails silently when it is missing: the rung
+    # holds the message for its time-to-live and the broker then drops it,
+    # having nowhere to route it. So it is declared with the rungs rather than
+    # arranged by whoever remembers.
+    expect(topology.exchanges.map(&:name)).to eq(["acemq.retry"])
+    expect(topology.exchanges.first.kind).to eq("direct")
+    expect(topology.exchanges.first.durable).to be(true)
+    expect(topology.bindings.map(&:to_s)).to eq(["acemq.retry -> orders.new (orders.new)"])
     expect(topology.problems).to be_empty
+  end
+
+  it "declares the retry exchange once, however many queues have rungs" do
+    policy = AceMQ::AMQP::RetryPolicy.fixed(3, 60)
+    topology = described_class.new
+                              .queue("orders.new", retry_policy: policy)
+                              .queue("orders.shipped", retry_policy: policy)
+
+    expect(topology.exchanges.map(&:name)).to eq(["acemq.retry"])
+    expect(topology.bindings.map(&:queue)).to eq(["orders.new", "orders.shipped"])
+  end
+
+  it "wires dead letters and parking through the shared exchange, bound by their own names" do
+    # The same shape Java declares, and the reason both queues are reachable at
+    # all: nothing is bound to them by the source queue's name.
+    topology = described_class.new.queue("orders.new",
+                                         dead_letter: true).parked_queue("orders.new")
+
+    expect(topology.exchanges.map(&:name)).to eq([AceMQ::AMQP::Naming::DEAD_LETTER_EXCHANGE])
+    expect(topology.exchanges.first.kind).to eq("direct")
+    expect(topology.exchanges.first.durable).to be(true)
+    expect(topology.bindings.map { |b| [b.queue, b.exchange, b.routing_key] }).to eq(
+      [["orders.new.dlq", "acemq.dlx", "orders.new.dlq"],
+       ["orders.new.parked", "acemq.dlx", "orders.new.parked"]]
+    )
   end
 
   it "declares no rungs for a policy whose delays all fit in the consumer" do

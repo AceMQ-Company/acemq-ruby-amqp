@@ -29,6 +29,24 @@ module AceMQ
       # Where a message goes when a person has to look at it.
       PARKED_SUFFIX = ".parked"
 
+      # The exchange a retry rung dead-letters through on its way back to the
+      # queue the message came from.
+      #
+      # Written here, once, and read everywhere else. The name is half of the
+      # rung's argument table, and that table is a contract between five
+      # libraries rather than a preference — see {RetryLadder.arguments_for} for
+      # what depends on it and why a second copy of this string would be a bug
+      # nobody sees until two services disagree about a queue.
+      RETRY_EXCHANGE = "acemq.retry"
+
+      # The exchange the dead-letter and parking queues are reached through.
+      #
+      # Shared with the Java, Go, .NET and Python libraries for the same reason
+      # the suffixes are: an operator looking at a broker should see one
+      # dead-letter exchange rather than one per language that happened to
+      # publish through it.
+      DEAD_LETTER_EXCHANGE = "acemq.dlx"
+
       # +orders.new+ becomes +orders.new.dlq+.
       def self.dead_letter_queue(queue)
         queue + DEAD_LETTER_SUFFIX

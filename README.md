@@ -150,6 +150,53 @@ consumer discovering them one failure at a time. Hand `queue` the policy and it
 works them out; `retry_threshold:` moves the line, on both the topology and the
 consumer, and the two have to agree.
 
+### The shape a rung has on the broker
+
+The same in Java, Go, .NET, Python and Ruby, because two services consuming one
+queue declare the same rung by name — and a rung declared with different
+arguments answers the second one `PRECONDITION_FAILED`, leaving it unable to
+consume at all:
+
+```
+acemq.retry                        direct, durable
+acemq.dlx                          direct, durable
+
+orders.new.retry.40s               x-message-ttl              40000
+                                   x-dead-letter-exchange     acemq.retry
+                                   x-dead-letter-routing-key  orders.new
+
+orders.new       -> acemq.retry -> orders.new          (an expired rung comes home)
+orders.new.dlq   -> acemq.dlx   -> orders.new.dlq
+orders.new.parked-> acemq.dlx   -> orders.new.parked
+```
+
+The default exchange would route a rung home by queue name with no exchange and
+no binding at all, and that is genuinely one fewer thing to forget. It is not
+what is done, for two reasons. The first is agreement: five libraries have to
+declare one table, and this is the one Java has always declared. The second is
+that the default exchange cannot be bound, listed or given a policy, so the path
+a retry takes home would exist only inside a queue argument, invisible from the
+broker; `acemq.retry` puts that path in the topology where it can be reviewed,
+and lets a service be granted write on one exchange rather than on every queue
+in the vhost.
+
+The cost is the binding, and it is real: an expired message with nothing bound
+to carry it is dropped silently. So the binding is never optional and never
+deferred — `RetryLadder#declare` and `Topology#retry_ladder` each declare the
+exchange, the rungs and the binding together, and a consumer declares them again
+before it subscribes.
+
+The names live in `Naming::RETRY_EXCHANGE` and `Naming::DEAD_LETTER_EXCHANGE`.
+The dead-letter exchange can be pointed elsewhere per topology
+(`Topology.new(dead_letter_exchange: "team.dlx")`), because only this library's
+own queue arguments name it. The retry exchange cannot, because it is written
+into the rung's argument table, which is the table everybody has to agree on.
+
+Ruby keeps its own 30-second threshold, which Java does not have: Java gives
+every delay in a schedule a rung. Below 30 seconds a wait lost to a restart
+costs seconds, and a queue per rung of a schedule that finishes in the time it
+takes to notice is not worth what it costs the broker.
+
 A consumer that sleeps through a five-minute backoff loses the whole wait when
 it restarts — the broker redelivers at once — which is a correctness bug rather
 than a throughput one. Below the threshold, a lost wait costs seconds and a

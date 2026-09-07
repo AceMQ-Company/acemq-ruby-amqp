@@ -27,15 +27,17 @@ module AceMQ
     # instant. That is a correctness bug rather than a throughput one, and it is
     # why delays past a threshold are handed to the broker instead: the message
     # is published into a rung queue whose +x-message-ttl+ is the delay and
-    # whose dead-letter target is the queue it came from — through the default
-    # exchange, which routes by queue name — and the broker returns it when the
-    # time is up. Nothing is consuming a rung; the time-to-live is
-    # the only thing that ever takes a message out of one.
+    # whose dead-letter target is the queue it came from — through
+    # {Naming::RETRY_EXCHANGE}, which every source queue is bound to by its own
+    # name — and the broker returns it when the time is up. Nothing is consuming
+    # a rung; the time-to-live is the only thing that ever takes a message out
+    # of one.
     #
     # For +orders.new+ with delays of 1s, 30s and 60s and the default threshold:
     #
-    #   orders.new.retry.30s   ttl 30s  -> orders.new
-    #   orders.new.retry.1m    ttl 60s  -> orders.new
+    #   acemq.retry            direct, durable
+    #   orders.new.retry.30s   ttl 30s  -> acemq.retry -> orders.new
+    #   orders.new.retry.1m    ttl 60s  -> acemq.retry -> orders.new
     #
     # The one-second delay gets no queue. Below the threshold the wait happens
     # in the consumer, where a second lost to a restart is a second, and the
@@ -95,24 +97,42 @@ module AceMQ
       # queue per delay is more queues and is the only arrangement that actually
       # delivers the schedule it was given.
       #
-      # A rung expires through the **default exchange**, which routes by queue
-      # name, so the routing key is the source queue and there is no exchange to
-      # declare and no binding to forget. A named retry exchange would need a
-      # binding per source queue, and a missing one loses every message the rung
-      # ever expires — silently, because an unroutable dead letter is dropped.
+      # A rung expires through {Naming::RETRY_EXCHANGE}, a durable direct
+      # exchange, under the source queue's own name as the routing key.
       #
-      # These three arguments are the cross-language contract for a rung. Two
-      # services on the same queue declare the same rung by name, so if one of
-      # them declares it with different arguments the second gets
-      # PRECONDITION_FAILED and cannot consume at all. This library and the
-      # Python one produce identical tables; anything that changes here changes
-      # there.
+      # The alternative is the default exchange, which routes by queue name and
+      # so needs no exchange and no binding at all. That is a real saving and it
+      # is not the one taken. Five libraries have to agree here, because two
+      # services consuming one queue declare the same rung by name and a rung
+      # declared with different arguments answers the second one
+      # PRECONDITION_FAILED, leaving it unable to consume at all; Java is the
+      # oldest of the five and the one most of the released code follows, Go has
+      # been brought into line with it, and this is the shape they share.
+      #
+      # It is also the better of the two on its own merits. The default exchange
+      # cannot be bound, listed or given a policy, so the path a retry takes
+      # home exists only in a queue argument nobody can see from the broker; a
+      # named exchange puts that path in the topology, where +acemq.retry+ and
+      # its bindings are things an operator can look at and a deployment can
+      # review. Permissions follow the same line — RabbitMQ grants write per
+      # exchange, so a service can be given +acemq.retry+ rather than the
+      # default exchange, which is write access to every queue in the vhost.
+      #
+      # The cost is the binding, and it is a real one: an expired message with
+      # nothing bound to carry it is dropped, silently, because an unroutable
+      # dead letter goes nowhere and reports nothing. That is answered by never
+      # letting the two apart — {#declare} declares the exchange, the rungs and
+      # the binding in one call, in that order, and does not make the binding
+      # conditional on anything.
+      #
+      # These three arguments are the cross-language contract for a rung.
+      # Anything that changes here changes in Java, Go, .NET and Python too.
       #
       # @api private
       def self.arguments_for(source, delay)
         {
           "x-message-ttl" => (delay * 1000).round,
-          "x-dead-letter-exchange" => "",
+          "x-dead-letter-exchange" => Naming::RETRY_EXCHANGE,
           "x-dead-letter-routing-key" => source
         }
       end
@@ -153,27 +173,40 @@ module AceMQ
       # The rung queue names, in schedule order.
       def queues = @rungs.map(&:queue)
 
-      # Declares the rungs.
+      # Declares the rungs, and everything that brings an expired one home.
       #
       # {Topology} declares the same thing up front, which is where it belongs:
       # a queue that appears in a plan somebody reviewed. This exists because
-      # the cost of the rung being absent is silent — the default exchange drops
-      # what it cannot route, so a retry published into a queue nobody declared
-      # is a message that simply stops existing. Declaring is idempotent, and a
-      # duplicate declaration is a great deal cheaper than a lost message.
+      # the cost of any of it being absent is silent — a publish into a queue
+      # nobody declared is dropped, and so is an expired message with nothing
+      # bound to route it — so a retry that goes missing leaves no trace at all.
+      # Declaring is idempotent, and a duplicate declaration is a great deal
+      # cheaper than a lost message.
       #
-      # There is no exchange and no binding to declare: a rung expires through
-      # the default exchange, and every queue is bound to that by its own name
-      # from the moment it exists.
+      # Three things, in the order the broker needs them: the exchange, then the
+      # rungs that dead-letter to it, then the one binding that carries every
+      # expired message back to the queue it came from. The binding is not
+      # optional and is not deferred until something first expires. A rung
+      # without it looks entirely healthy — the queue is there, the message goes
+      # in, the time-to-live runs out — and then the message is dropped, because
+      # an unroutable dead letter goes nowhere and says nothing.
       #
-      # @param connection [Connection, Transport] anything answering declare_queue
+      # The source queue itself is not declared here. It belongs to the caller,
+      # it usually has arguments of its own, and creating it as a side effect of
+      # setting up its retries would be this library guessing at somebody else's
+      # queue.
+      #
+      # @param connection [Connection, Transport] anything answering
+      #   declare_exchange, declare_queue and bind
       # @return [RetryLadder] self
       def declare(connection)
         return self if empty?
 
+        connection.declare_exchange(Naming::RETRY_EXCHANGE, kind: :direct, durable: true)
         @rungs.each do |rung|
           connection.declare_queue(rung.queue, durable: true, arguments: rung.arguments)
         end
+        connection.bind(queue: @source, exchange: Naming::RETRY_EXCHANGE, routing_key: @source)
         self
       end
 
