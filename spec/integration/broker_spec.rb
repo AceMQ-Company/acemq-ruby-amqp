@@ -276,6 +276,42 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "an interceptor" do
+    let(:queue) { queue_named("intercepted") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+
+    before do
+      scrub(queue, dlq)
+      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+    end
+
+    after { scrub(queue, dlq) }
+
+    it "stamps on the way out and on the way in, and both survive the wire" do
+      # The unit specs prove the seam runs. What only a broker can show is that
+      # what an interceptor put on an envelope goes through RabbitMQ's field
+      # table and comes back out the other side — and that a header stamped on
+      # the way in is still there on the dead letter, which is where somebody
+      # actually goes looking for it.
+      mq.intercept_publish { |context| context.set_header("tenant", "acme") }
+      mq.intercept_consume { |context| context.set_header("handled-by", "rspec") }
+
+      mq.consume(queue, retry_policy: AceMQ::AMQP::RetryPolicy.none) do |message|
+        expect(message.envelope.headers["tenant"]).to eq("acme")
+        AceMQ::AMQP::Ack.retry("the warehouse is down")
+      end
+
+      mq.publish({ "order_id" => "A-8" }, to: queue, type: "order.placed.v2")
+
+      properties, = take_one(dlq)
+      expect(properties).not_to be_nil
+      expect(properties[:headers]["tenant"]).to eq("acme")
+      expect(properties[:headers]["handled-by"]).to eq("rspec")
+      expect(properties[:headers][AceMQ::AMQP::Headers::ERROR])
+        .to match(/the warehouse is down/)
+    end
+  end
+
   describe "a body nothing can read" do
     let(:queue) { queue_named("undecodable") }
     let(:parked) { AceMQ::AMQP::Naming.parked_queue(queue) }

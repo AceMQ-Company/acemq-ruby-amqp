@@ -19,6 +19,7 @@ require "socket"
 require_relative "ack"
 require_relative "codec"
 require_relative "envelope"
+require_relative "interceptors"
 require_relative "naming"
 require_relative "retry_ladder"
 require_relative "retry_policy"
@@ -64,7 +65,7 @@ module AceMQ
       DEFAULT_PREFETCH = 20
 
       attr_reader :transport, :codec, :origin, :retry_policy, :prefetch,
-                  :retry_threshold
+                  :retry_threshold, :interceptors
 
       # Opens a connection to a broker.
       #
@@ -104,8 +105,42 @@ module AceMQ
         @retry_policy = retry_policy
         @prefetch = prefetch
         @retry_threshold = retry_threshold
+        @interceptors = Interceptors.new
         @consumers = []
         @lock = Mutex.new
+      end
+
+      # Adds an interceptor to every publish on this connection.
+      #
+      #   mq.intercept_publish { |context| context.set_header("tenant", Current.tenant) }
+      #
+      # See {Interceptors} for the hooks an object may answer, what raising from
+      # each one means, and how +order+ decides which runs first.
+      #
+      # Registration is expected at start-up. A publisher reads the list at the
+      # moment it publishes rather than copying it, so an interceptor added
+      # later does apply to publishers that already exist — but a message
+      # already on its way will not see it.
+      #
+      # @param interceptor [#before_publish, nil]
+      # @param order [Integer, nil] lower runs first
+      # @return [Connection] self
+      def intercept_publish(interceptor = nil, order: nil, &block)
+        @interceptors.add_publish(interceptor, order: order, &block)
+        self
+      end
+
+      # Adds an interceptor to every consumer on this connection.
+      #
+      #   mq.intercept_consume(Tracing.new)
+      #
+      # @param interceptor [#before_handle, nil]
+      # @param order [Integer, nil] lower runs first on the way in, last on the
+      #   way out
+      # @return [Connection] self
+      def intercept_consume(interceptor = nil, order: nil, &block)
+        @interceptors.add_consume(interceptor, order: order, &block)
+        self
       end
 
       # Names the machine but not the service, which is the most an
@@ -136,7 +171,8 @@ module AceMQ
       # @param envelope [Envelope, nil] one built elsewhere, for when a
       #   message's metadata derives from another message's
       # @param fields [Hash] envelope fields, when no envelope is given
-      # @return [Envelope] what was actually put on the wire
+      # @return [Envelope] what was actually put on the wire, which is what the
+      #   interceptors left rather than what was handed in
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
                   **fields)
         if envelope && !fields.empty?
@@ -147,10 +183,15 @@ module AceMQ
 
         codec = codec.nil? ? @codec : Codec.check!(codec)
         envelope ||= Envelope.new(origin: @origin, **fields)
-        @transport.publish(exchange: exchange, routing_key: to, body: codec.encode(payload),
-                           content_type: codec.content_type, message_id: envelope.id,
-                           headers: envelope.to_headers(to), persistent: persistent)
-        envelope
+        # Built whether or not anything is registered. It is one small object
+        # against a round trip to a broker, and the alternative is two code
+        # paths through the one method every message in the process goes down.
+        context = PublishContext.new(exchange: exchange, routing_key: to,
+                                     envelope: envelope, payload: payload)
+        send_intercepted(context, codec, persistent)
+      rescue StandardError => e
+        @interceptors.on_publish_error(context, e) if context
+        raise
       end
 
       # Reads messages from a queue until the returned consumer is cancelled.
@@ -186,7 +227,8 @@ module AceMQ
           transport: @transport, queue: queue, handler: handler,
           codec: codec.nil? ? @codec : Codec.check!(codec),
           retry_policy: retry_policy || @retry_policy,
-          retry_threshold: retry_threshold || @retry_threshold
+          retry_threshold: retry_threshold || @retry_threshold,
+          interceptors: @interceptors
         )
         consumer.start(prefetch: prefetch || @prefetch, concurrency: concurrency, tag: tag,
                        arguments: arguments)
@@ -236,6 +278,27 @@ module AceMQ
 
         nil
       end
+
+      private
+
+      # Sends what the interceptors left, and tells them the broker has it.
+      #
+      # Everything on the wire is read off the context rather than off the
+      # arguments this method was called with — the exchange, the key, the
+      # identifier, the headers and the payload — because an interceptor that
+      # could change one of them and not the others would be a seam with a hole
+      # in it, and the hole would be found by whoever needed to redirect a
+      # message rather than only stamp one.
+      def send_intercepted(context, codec, persistent)
+        @interceptors.before_publish(context)
+        @transport.publish(exchange: context.exchange, routing_key: context.routing_key,
+                           body: codec.encode(context.payload),
+                           content_type: codec.content_type, message_id: context.envelope.id,
+                           headers: context.envelope.to_headers(context.routing_key),
+                           persistent: persistent)
+        @interceptors.after_confirm(context)
+        context.envelope
+      end
     end
 
     # A running subscription. Cancel it to stop.
@@ -252,11 +315,13 @@ module AceMQ
       attr_reader :queue, :retry_policy, :codec, :ladder
 
       def initialize(transport:, queue:, handler:, codec:, retry_policy:,
-                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
+                     retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
+                     interceptors: Interceptors.new)
         @transport = transport
         @queue = queue
         @handler = handler
         @codec = codec
+        @interceptors = interceptors
         @retry_policy = retry_policy
         @ladder = RetryLadder.for(queue, retry_policy, threshold: retry_threshold)
         @dead_letter_queue = Naming.dead_letter_queue(queue)
@@ -285,8 +350,16 @@ module AceMQ
       def handle(delivery)
         enter
         envelope = envelope_for(delivery)
-        payload = decode(delivery)
-        settle(delivery, envelope, invoke(payload, envelope, delivery))
+        context = context_for(delivery, envelope, decode(delivery))
+        ack = invoke(context, delivery)
+        # After the handler and before the delivery is settled, so an
+        # interceptor can still see how it went and still undo whatever it set
+        # up on the way in. The envelope read back off the context is the one an
+        # interceptor may have changed, and it is the one a dead letter is
+        # written with — otherwise a header stamped on the way in would be there
+        # for the handler and gone from the queue somebody has to look at.
+        @interceptors.after_handle(context, ack)
+        settle(delivery, context.envelope, ack)
       rescue DecodeError => e
         # A body that will not decode decodes no better next time, so it is
         # parked rather than retried. Parked and not dead-lettered: a message
@@ -338,16 +411,29 @@ module AceMQ
         end
       end
 
-      # Runs the handler, turning anything it raises into a decision.
+      # What an interceptor sees, and what the handler is built from.
+      def context_for(delivery, envelope, payload)
+        ConsumeContext.new(queue: @queue, envelope: envelope, payload: payload,
+                           body: delivery.body, content_type: delivery.content_type,
+                           redelivered: delivery.redelivered?)
+      end
+
+      # Runs the interceptors and then the handler, turning anything either of
+      # them raises into a decision.
       #
       # A handler that raises has still said something: an ordinary failure is
       # worth another go, a {FatalError} is not. A handler that returns
       # something other than an {Ack} has said nothing at all, and that is a
       # bug which will repeat, so the message goes to the dead-letter queue
       # with the class name in the reason rather than round the queue forever.
-      def invoke(payload, envelope, delivery)
+      #
+      # An interceptor that refuses on the way in lands in the same place, and
+      # deliberately: the message is retried and eventually dead-lettered rather
+      # than acknowledged as though something had processed it.
+      def invoke(context, delivery)
+        @interceptors.before_handle(context)
         result = @handler.call(Message.new(
-                                 payload: payload, envelope: envelope,
+                                 payload: context.payload, envelope: context.envelope,
                                  routing_key: delivery.routing_key,
                                  content_type: delivery.content_type,
                                  redelivered: delivery.redelivered?, body: delivery.body
@@ -358,8 +444,10 @@ module AceMQ
                      "the handler for #{@queue} returned a #{result.class} rather than an Ack"
                    ))
       rescue FatalError => e
+        @interceptors.on_consume_error(context, e)
         Ack.reject(e)
       rescue StandardError => e
+        @interceptors.on_consume_error(context, e)
         Ack.retry(e)
       end
 

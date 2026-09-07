@@ -229,6 +229,65 @@ retry against an unconfigured connection dead-letters immediately. That is a
 great deal easier to explain than a message going round the broker as fast as it
 can be handed back.
 
+## Interceptors
+
+The seam for the things every message in an organisation needs and no library
+can guess: a tenant, a trace context, a log scope, a size limit, a metric.
+Without one they end up copied into every call site, where one of them is
+always the one that forgot.
+
+```ruby
+mq.intercept_publish { |context| context.set_header("tenant", Current.tenant) }
+
+mq.intercept_consume do |context|
+  raise FatalError, "not our tenant" unless serves?(context.envelope.headers["tenant"])
+end
+```
+
+A `PublishContext` is the message before it is encoded — `exchange`,
+`routing_key`, `envelope`, `payload` — and every one of them can be changed, so
+an interceptor can redirect a message as well as decorate it, and can rewrite
+the payload while it is still a Ruby object rather than patching bytes. A
+`ConsumeContext` is the message after it is decoded and before the handler sees
+it: `queue`, `envelope`, `payload`, `body`, `content_type`, `redelivered?`. What
+an interceptor leaves on the envelope is what the handler receives *and* what
+any dead letter is written with — a header the handler saw and the dead-letter
+queue did not would be missing exactly when somebody goes looking for it.
+`set_header` still refuses the reserved `x-acemq-` names.
+
+A block is the common case. An object is the full one, answering whichever of
+these it cares about:
+
+| publishing | consuming |
+|---|---|
+| `before_publish(context)` | `before_handle(context)` |
+| `after_confirm(context)` | `after_handle(context, ack)` |
+| `on_error(context, failure)` | `on_error(context, failure)` |
+| `order` | `order` |
+
+**Raising means different things in different places, on purpose.** From
+`before_publish` it *stops the publish* and the caller sees the exception —
+that is the point of intercepting rather than observing, and a message that
+must not go out is stopped once, here, rather than in every publisher. From
+`before_handle` the handler never runs and the delivery is treated exactly as a
+failed handler would be: retried, then dead-lettered. An interceptor that
+refuses a message has to be willing for that message to reach the dead-letter
+queue, which is the honest outcome — the alternative is acknowledging something
+nothing processed. `FatalError` still means what it means. From `after_confirm`,
+`after_handle` or `on_error` it is reported on stderr and otherwise ignored: the
+message has been sent or the delivery settled, and letting the exception out
+would report a successful publish as a failed one.
+
+Lower `order` runs first, equal orders run in registration order, and the way
+out of a handler is reversed, so a pair that opens something on the way in and
+closes it on the way out nests properly.
+
+Nothing here needs anything private. An interceptor is registered through a
+public method and handed a context whose every field is public, which is the
+same rule the patterns follow and the only way to know a seam is wide enough.
+An interceptor is called on whatever thread is publishing or handling, so one
+that keeps state has to be safe to call from several at once.
+
 ## TLS and credentials
 
 An `amqps://` URL is encrypted and the broker is verified against the machine's
