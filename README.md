@@ -222,6 +222,46 @@ same transaction as the work; that is also the only arrangement that closes the
 gap between the handler finishing and the acknowledgement reaching the broker,
 which is why this is a guard against duplicates rather than exactly-once.
 
+### Outbox
+
+```ruby
+store = Patterns::InMemoryOutboxStore.new
+
+db.transaction do
+  orders.insert(order)
+  store.add(Patterns.record(mq, event, to: "order.placed",
+                            exchange: "orders-events", type: "order.placed.v2"))
+end
+
+relay = Patterns::OutboxRelay.new(mq, store, interval: 1).start
+```
+
+A service that writes to a database and then publishes has two things that can
+fail independently. Crash between them and the work is committed with nobody
+told; publish first and fail to commit, and the world has been told about
+something that did not happen. Writing the message into the same transaction as
+the work removes the gap — both commit or neither does — and the relay publishes
+what was committed.
+
+A record holds encoded bytes rather than an object, because it outlives the
+process that wrote it and the class may not survive the deployment that happens
+while it waits. Its envelope is built by the same rules `publish` uses, so a
+message that went through the outbox is indistinguishable on the wire from one
+that did not.
+
+The relay is deliberately at-least-once: a record is removed only after the
+broker has confirmed it, so a crash in between sends it again. Consumers of
+anything sent this way need to be idempotent, which is why the pattern above is
+in the same library. Removing first would lose messages instead, and an absence
+cannot be recognised the way a duplicate can.
+
+`sweep` is public, so an application can flush its outbox at the end of a
+request rather than up to an interval later, and a test can drive a relay
+without waiting for a tick. A store is anything answering `add`, `pending` and
+`mark_published`, and it is only worth having if `add` can join the caller's
+transaction — a store that opens its own connection has the gap back, in a
+place that looks like it has been dealt with.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

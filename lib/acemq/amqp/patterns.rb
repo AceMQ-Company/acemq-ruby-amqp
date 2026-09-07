@@ -16,6 +16,7 @@
 
 require_relative "../amqp"
 require_relative "patterns/idempotency"
+require_relative "patterns/outbox"
 
 module AceMQ
   module AMQP

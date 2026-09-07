@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require "acemq/amqp"
+require "acemq/amqp/patterns"
 
 # Everything the unit specs cannot prove, and nothing they can.
 #
@@ -278,6 +279,40 @@ RSpec.describe "against a real broker", :integration do
 
       expect { mq.declare_queue(queue, durable: false) }
         .to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+    end
+  end
+
+  describe "an outbox" do
+    let(:queue) { queue_named("outbox") }
+    let(:store) { AceMQ::AMQP::Patterns::InMemoryOutboxStore.new }
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after { scrub(queue) }
+
+    it "sends a recorded message the broker cannot tell from a published one" do
+      # The point of the integration test rather than the unit one: the record
+      # holds bytes and a rendered header table, and what has to survive is
+      # RabbitMQ's field table putting them back with their types intact.
+      store.add(AceMQ::AMQP::Patterns.record(
+                  mq, { "order_id" => "A-6" },
+                  to: queue, type: "order.placed.v2", version: 4
+                ))
+      relay = AceMQ::AMQP::Patterns::OutboxRelay.new(mq, store)
+
+      expect(relay.sweep).to eq(1)
+      expect(store.size).to eq(0)
+
+      properties, body = take_one(queue)
+      expect(body).to eq('{"order_id":"A-6"}')
+      headers = properties[:headers]
+      expect(headers[AceMQ::AMQP::Headers::TYPE]).to eq("order.placed.v2")
+      expect(headers[AceMQ::AMQP::Headers::VERSION]).to eq(4)
+      expect(headers[AceMQ::AMQP::Headers::ORIGIN]).to eq("rspec@rbit")
+      expect(headers[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
     end
   end
 
