@@ -132,16 +132,18 @@ RSpec.describe "against a real broker", :integration do
     it "really does retry, and then really does dead-letter with the reason" do
       attempts = []
       mq.consume(queue, retry_policy: AceMQ::AMQP::RetryPolicy.fixed(3, 0.05)) do |message|
-        attempts << [message.attempt, message.redelivered?]
+        attempts << message.attempt
         AceMQ::AMQP::Ack.retry("the warehouse is down")
       end
 
       sent = mq.publish({ "order_id" => "A-2" }, to: queue, type: "order.placed.v2")
 
       wait_for { attempts.size >= 3 }
-      # Three deliveries, counted by the broker's redelivery flag rather than
-      # by the header, which a requeue leaves untouched.
-      expect(attempts).to eq([[1, false], [2, true], [3, true]])
+      # Three deliveries, and the count came off the wire: each retry was
+      # republished with the attempt advanced, so the number survives leaving
+      # this process. The broker's redelivery flag is false every time for the
+      # same reason — a republished retry is a new delivery, not a requeue.
+      expect(attempts).to eq([1, 2, 3])
 
       properties, body = take_one(dlq)
       expect(properties).not_to be_nil

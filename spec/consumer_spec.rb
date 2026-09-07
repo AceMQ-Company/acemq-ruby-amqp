@@ -65,53 +65,60 @@ RSpec.describe AceMQ::AMQP::Consumer do
   end
 
   describe "counting attempts" do
-    # Every delivery below says it is attempt 1 on the wire, which is exactly
-    # the point: a broker requeues the bytes it was given, so x-acemq-attempt
-    # still reads whatever the publisher wrote however many times the message
-    # has come back. The redelivery flag is the only signal there is.
-    it "counts them here rather than reading them off the wire" do
+    it "reads the attempt off the wire, where the contract puts it" do
       seen = []
       subject = consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) do |message|
         seen << message.attempt
         Ack.retry("not yet")
       end
 
-      [false, true, true].each do |redelivered|
-        delivery, = FakeDelivery.build(headers: headers_for(attempt: 1),
-                                       redelivered: redelivered)
+      [1, 2, 3].each do |attempt|
+        delivery, = FakeDelivery.build(headers: headers_for(attempt: attempt))
         subject.handle(delivery)
       end
 
       expect(seen).to eq([1, 2, 3])
     end
 
-    it "starts again when the same id arrives as a first delivery" do
-      # A first delivery of an id this consumer has seen before is a different
-      # message run, not the fourth attempt of the old one.
-      seen = []
-      subject = consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) do |message|
-        seen << message.attempt
-        Ack.retry("no")
-      end
+    it "advances the attempt on the message it republishes" do
+      # The count has to travel with the message. Kept in this process instead,
+      # it is wrong the moment a second consumer exists: a message that moves
+      # between them is for ever on attempt one, and five attempts becomes
+      # unbounded.
+      delivery, = FakeDelivery.build(headers: headers_for(attempt: 2))
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) { Ack.retry("no") }
+        .handle(delivery)
 
-      [true, false].each do |redelivered|
-        delivery, = FakeDelivery.build(headers: headers_for, redelivered: redelivered)
-        subject.handle(delivery)
-      end
+      again = transport.published_to("orders.new")
+      expect(again.size).to eq(1)
+      expect(again.first.headers[Headers::ATTEMPT]).to eq(3)
+    end
 
-      expect(seen).to eq([2, 1])
+    it "keeps the identity of the message it retries" do
+      delivery, = FakeDelivery.build(headers: headers_for(attempt: 1))
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) { Ack.retry("no") }
+        .handle(delivery)
+
+      # Same id, same correlation: a retry is the same message again, not a new
+      # one, and anything keyed on the id has to agree.
+      republished = transport.published_to("orders.new").first
+      expect(republished.headers[Headers::ID]).to eq(headers_for[Headers::ID])
+      expect(republished.headers[Headers::CORRELATION])
+        .to eq(headers_for[Headers::CORRELATION])
     end
   end
 
   describe "retrying" do
-    it "returns the message to the broker while attempts remain" do
+    it "puts the message back on its own queue while attempts remain" do
       policy = AceMQ::AMQP::RetryPolicy.fixed(3, 0)
       delivery, recorder = FakeDelivery.build(headers: headers_for)
       consumer(policy: policy) { Ack.retry("the warehouse is down") }.handle(delivery)
 
-      expect(recorder.requeued?).to be(true)
-      expect(recorder.acked?).to be(false)
-      expect(transport.published).to be_empty
+      # Republished and then acknowledged, rather than requeued: the attempt
+      # has to advance, and only a new publish can carry it.
+      expect(transport.published_to("orders.new").size).to eq(1)
+      expect(recorder.acked?).to be(true)
+      expect(recorder.requeued?).to be(false)
     end
 
     it "waits the policy's delay before returning it" do
@@ -127,11 +134,12 @@ RSpec.describe AceMQ::AMQP::Consumer do
       policy = AceMQ::AMQP::RetryPolicy.fixed(2, 0)
       subject = consumer(policy: policy) { Ack.retry("the warehouse is down") }
 
-      first, first_recorder = FakeDelivery.build(headers: headers_for)
+      first, first_recorder = FakeDelivery.build(headers: headers_for(attempt: 1))
       subject.handle(first)
-      expect(first_recorder.requeued?).to be(true)
+      expect(first_recorder.acked?).to be(true)
+      expect(transport.published_to("orders.new").size).to eq(1)
 
-      second, second_recorder = FakeDelivery.build(headers: headers_for, redelivered: true)
+      second, second_recorder = FakeDelivery.build(headers: headers_for(attempt: 2))
       subject.handle(second)
 
       dead = transport.published_to("orders.new.dlq")
@@ -200,7 +208,8 @@ RSpec.describe AceMQ::AMQP::Consumer do
       delivery, recorder = FakeDelivery.build(headers: headers_for)
       consumer(policy: policy) { raise "the database went away" }.handle(delivery)
 
-      expect(recorder.requeued?).to be(true)
+      expect(transport.published_to("orders.new").size).to eq(1)
+      expect(recorder.acked?).to be(true)
     end
 
     it "treats a FatalError as a rejection, however many attempts remain" do

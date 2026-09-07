@@ -208,8 +208,8 @@ module AceMQ
 
     # A running subscription. Cancel it to stop.
     #
-    # Where the retry policy is actually enforced: the attempt is counted here,
-    # the delay is waited here, and the decision to give up and dead-letter is
+    # Where the retry policy is actually enforced: the delay is waited here, the
+    # attempt is advanced here, and the decision to give up and dead-letter is
     # made here rather than left to the broker, because the broker cannot write
     # +x-acemq-error+ onto a message explaining why it gave up.
     class Consumer
@@ -223,7 +223,6 @@ module AceMQ
         @retry_policy = retry_policy
         @dead_letter_queue = Naming.dead_letter_queue(queue)
         @parked_queue = Naming.parked_queue(queue)
-        @attempts = {}
         @lock = Mutex.new
         @in_flight = 0
       end
@@ -251,7 +250,6 @@ module AceMQ
         # that failed five times and a message nothing could read are two
         # different problems, and whoever drains the dead letters should not
         # have to sort them by hand.
-        forget(envelope&.id)
         park(delivery, envelope, "could not be decoded: #{e.message}")
       ensure
         leave
@@ -272,30 +270,18 @@ module AceMQ
 
       private
 
-      # The envelope for this delivery, with the attempt this consumer has
-      # counted rather than the one on the wire.
+      # The envelope for this delivery, attempt included.
       #
-      # The header cannot answer the question. A broker requeues the bytes it
-      # was given, so +x-acemq-attempt+ still reads whatever the publisher
-      # wrote however many times the message has come back; the redelivery flag
-      # is the only signal there is, and it is counted here, per consumer,
-      # keyed by message id.
+      # Read off the wire, because +x-acemq-attempt+ is defined as the count the
+      # retry engine increments, and a retry here republishes with it advanced.
+      #
+      # Counting in memory instead — from the broker's redelivery flag, keyed by
+      # message id — is wrong the moment there is more than one consumer: a
+      # requeued message can come back to a different one, which has never seen
+      # it and calls it attempt one. A policy of five attempts then retries for
+      # ever, and the count is lost across a restart as well.
       def envelope_for(delivery)
-        envelope = Envelope.from_headers(delivery.headers, delivery.routing_key)
-        envelope.with(attempt: attempt_for(envelope.id, delivery.redelivered?))
-      end
-
-      def attempt_for(id, redelivered)
-        @lock.synchronize do
-          @attempts[id] = redelivered ? @attempts.fetch(id, 1) + 1 : 1
-        end
-      end
-
-      # Drops a message's attempt count once it is settled, so the map holds
-      # only what is in flight rather than everything this process has ever
-      # seen.
-      def forget(id)
-        @lock.synchronize { @attempts.delete(id) } if id
+        Envelope.from_headers(delivery.headers, delivery.routing_key)
       end
 
       # A codec that chooses by content type needs to be told it; a plain one
@@ -336,10 +322,8 @@ module AceMQ
 
       def settle(delivery, envelope, ack)
         if ack.accept?
-          forget(envelope.id)
           delivery.ack
         elsif ack.reject?
-          forget(envelope.id)
           dead_letter(delivery, envelope, "rejected by the handler: #{describe(ack.error)}")
         else
           retry_or_give_up(delivery, envelope, ack)
@@ -351,24 +335,27 @@ module AceMQ
           # The handler asked for a retry but marked the reason as one that
           # will not change. Honouring the mark rather than the request is the
           # entire point of having it.
-          forget(envelope.id)
           return dead_letter(delivery, envelope, "retrying cannot help: #{describe(ack.error)}")
         end
 
         delay = @retry_policy.next_delay(envelope.attempt, envelope.age)
         if delay.nil?
-          forget(envelope.id)
           return dead_letter(delivery, envelope, "#{gave_up(envelope)}: #{describe(ack.error)}")
         end
 
         # Waiting here holds the delivery, and so holds one of this consumer's
         # prefetch slots. That is the honest cost of delaying a retry without a
-        # ladder of delay queues: the alternative is to acknowledge and
-        # republish, which turns one message into two and throws away the
-        # broker's redelivery flag, which is the only thing that knows this is
-        # attempt three.
+        # ladder of delay queues.
         sleep(delay) if delay.positive?
-        delivery.nack(requeue: true)
+
+        # Republished rather than requeued, with the attempt advanced. A requeue
+        # hands back the bytes the broker was given, so the count would have to
+        # live in this process — and then a fleet of consumers each counts its
+        # own, a message that moves between them is for ever on attempt one, and
+        # a restart forgets everything. The trade is that the message goes to the
+        # back of its queue rather than the front.
+        republish(@queue, delivery, envelope.with(attempt: envelope.attempt + 1))
+        delivery.ack
       end
 
       def gave_up(envelope)
