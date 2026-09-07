@@ -13,9 +13,10 @@ reserved headers, the same defaults, the same retry arithmetic. A Ruby consumer
 reads what a Java producer writes, and the fixtures the Java implementation
 produces pin that rather than leaving it to be discovered in production.
 
-> **Status: in build.** The contract layer — envelope, retry schedule, naming,
-> acknowledgement model — is implemented and tested against the shared
-> fixtures. The transport is next. Nothing is published to RubyGems yet.
+> **Status: in build.** The contract layer and the AMQP transport — connect,
+> publish, consume, retry, dead-letter — are implemented and tested, against
+> the shared fixtures and against a real broker. Nothing is published to
+> RubyGems yet.
 
 ## What is here today
 
@@ -24,6 +25,29 @@ require "acemq/amqp"
 
 include AceMQ::AMQP
 
+mq = Connection.open("amqp://guest:guest@localhost:5672",
+                     origin: "checkout@pod-7",
+                     retry_policy: RetryPolicy.exponential(5, 1, 60))
+
+Topology.new
+        .exchange("orders-events", :topic)
+        .queue("orders.new", dead_letter: true)
+        .binding("orders.new", "orders-events", "order.#")
+        .apply(mq)
+
+mq.publish({ "order_id" => "A-1" }, to: "order.placed",
+           exchange: "orders-events", type: "order.placed.v2")
+
+mq.consume("orders.new") do |message|
+  message.payload          # => { "order_id" => "A-1" }
+  message.envelope.attempt # => which delivery this is
+  warehouse.reserve(message.payload) ? Ack.accept : Ack.retry("the warehouse said no")
+end
+```
+
+The contract on its own, with no broker anywhere:
+
+```ruby
 # What travels with a message, and what another language will read back.
 envelope = Envelope.new(type: "order.placed.v2", origin: "checkout@pod-7")
 envelope.to_headers("order.placed")
@@ -35,9 +59,15 @@ policy.schedule                      # => [1.0, 2.0, 4.0, 8.0]
 Naming.dead_letter_queue("orders.new")   # => "orders.new.dlq"
 ```
 
-The contract layer has **no runtime dependencies**. Reading an AceMQ envelope
-should not require installing a broker client, so `bunny` arrives with the
-transport rather than as a condition of using any of this.
+The gem has **no runtime dependencies**. Reading an AceMQ envelope should not
+require installing a broker client, so `bunny` is required lazily by the
+transport, at the moment a connection is opened, and named in the error if it
+is not there. Add it to your own Gemfile to use the transport:
+
+```ruby
+gem "acemq-amqp"
+gem "bunny", "~> 2.23"
+```
 
 ## What is identical, and what is not
 
@@ -86,16 +116,47 @@ thundering herd.
 Giving up on **age** as well as attempts is the honest limit when a queue has
 been paused — a message can be on attempt one and four days old.
 
+### What the consumer actually does
+
+`Ack.retry` returns the message to the broker after waiting the policy's delay.
+The attempt is counted **by the consumer**, from the broker's redelivery flag,
+not read off `x-acemq-attempt`: a broker requeues the bytes it was given, so the
+header still reads whatever the publisher wrote however many times the message
+has come round.
+
+When the policy has no attempt left — or the message is older than the policy
+allows, or the handler marked the reason `FatalError` — the message is
+republished to `{queue}.dlq` with the reason in `x-acemq-error`, and the
+original is then acknowledged. Acknowledging a failure looks wrong and is what
+makes it reliable: the message is already safely somewhere else, so the original
+is a copy that has been dealt with. Rejecting it instead would either requeue it
+into a hot loop or hand it to whatever dead-lettering the queue happens to carry
+— and neither of those can write down *why*, which is the one thing whoever
+finds it needs.
+
+A body no codec can read goes to `{queue}.parked` rather than `{queue}.dlq`. A
+message that failed five times and a message nothing could read are different
+problems, and mixing them means somebody sorts them by hand.
+
+Without a policy, `Connection` uses `RetryPolicy.none` — one delivery — so a
+retry against an unconfigured connection dead-letters immediately. That is a
+great deal easier to explain than a message going round the broker as fast as it
+can be handed back.
+
 ## Requirements
 
-Ruby 3.1 or newer. RabbitMQ for the transport, once it lands.
+Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
 
 ## Development
 
 ```bash
 bundle install
-bundle exec rspec        # the contract, no broker needed
+bundle exec rspec        # the contract and the retry engine, no broker needed
 bundle exec rubocop
+
+# Anything that needs a broker is tagged :integration and skipped unless this
+# is set, so a laptop with no Docker still runs everything else.
+ACEMQ_TEST_BROKER=amqp://guest:guest@localhost:5672 bundle exec rspec
 ```
 
 The fixtures under `spec/fixtures/` are produced by the Java implementation and
