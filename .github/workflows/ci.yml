@@ -1,9 +1,9 @@
 # Build and test on every Ruby this library promises to run on.
 #
 # The contract layer has no dependencies and needs no broker, so it runs on the
-# whole matrix and takes seconds. When the transport lands, anything needing a
-# broker gets its own job against a service container, run once — running it
-# four times would learn the same thing four times.
+# whole matrix and takes seconds. Anything that needs a broker is tagged
+# :integration and runs in its own job against a service container, once —
+# running it four times would learn the same thing four times.
 name: ci
 
 on:
@@ -43,7 +43,28 @@ jobs:
       - name: Lint
         run: bundle exec rubocop
 
-  # There is no integration job yet, deliberately. The transport does not exist,
-  # so there are no tests that need a broker -- and a job that starts RabbitMQ to
-  # run nothing is a green tick that means nothing. It comes back with the
-  # transport, along with the tests that justify it.
+  integration:
+    name: against a real broker
+    runs-on: ubuntu-latest
+    services:
+      broker:
+        image: rabbitmq:4-alpine
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      # spec_helper skips everything tagged :integration unless this is set, so
+      # the variable is what turns the job on rather than a second config file.
+      - name: Test against the broker
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672
+        run: bundle exec rspec --tag integration
