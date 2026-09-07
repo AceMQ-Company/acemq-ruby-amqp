@@ -14,13 +14,14 @@
 # notice something is a test that is sometimes flaky and always slow. What that
 # cannot show is concurrency, which is what the integration specs are for.
 class LoopbackTransport
-  attr_reader :published, :declared_queues, :declared_exchanges, :bindings
+  attr_reader :published, :declared_queues, :declared_exchanges, :bindings, :subscriptions
 
   def initialize
     @published = []
     @declared_queues = []
     @declared_exchanges = []
     @bindings = []
+    @subscriptions = []
     @waiting = Hash.new { |queues, name| queues[name] = [] }
     @subscribers = Hash.new { |queues, name| queues[name] = [] }
     @draining = {}
@@ -61,7 +62,8 @@ class LoopbackTransport
 
   # Subscribes, and hands over anything that arrived before there was anybody to
   # hand it to.
-  def subscribe(queue, **_options, &handler)
+  def subscribe(queue, **options, &handler)
+    @subscriptions << [queue, options]
     @lock.synchronize { @subscribers[queue] << handler }
     drain(queue)
     Subscription.new(self, queue, handler)

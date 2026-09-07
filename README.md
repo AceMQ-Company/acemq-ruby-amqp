@@ -470,6 +470,65 @@ says "this one does not continue" without inventing an empty message for the
 next service to work out how to ignore. The correlation goes forward and the
 causation records what produced what.
 
+### Schemas
+
+```ruby
+registry = Patterns::InMemorySchemaRegistry.new
+schema = registry.register("order.placed", "avro", definition)
+
+registry.latest("order.placed")
+registry.by_id(schema.id)
+```
+
+A producer and a consumer have to agree about what a message means, and they
+are deployed on different afternoons. A registry lets the message carry a small
+identifier instead of its whole shape.
+
+Registering the same definition twice returns the same identifier rather than
+making a second version — otherwise a service that registers on every start
+adds a version per restart. The fingerprint is SHA-256 of the exact bytes, so
+two definitions differing only in whitespace count as different: normalising
+would need a parser per format, and a registry that quietly treated two
+definitions as one because it mis-parsed them would be worse than a strict one.
+
+A lookup that finds nothing raises rather than returning an empty definition.
+`InMemorySchemaRegistry` is for tests and for seeing the shape of the thing —
+nothing is shared between processes, which is the entire point of a registry.
+Nothing here puts anything on the wire yet: which header carries a schema
+identifier is a cross-language contract, and one invented here would be one the
+other AceMQ libraries could not read.
+
+### Streams
+
+```ruby
+Patterns.declare_stream(mq, "events", max_age: 7 * 24 * 3600, max_bytes: 10 * 1024**3)
+
+Patterns.read_stream(mq, "events", offset: Patterns::StreamOffset.first,
+                     prefetch: 100, name: "projection-1") do |message|
+  project(message.payload)
+  Ack.accept
+end
+```
+
+A stream does not remove a message when somebody reads it, so several consumers
+read the same stream independently and a new one can start from the beginning.
+Positions: `first`, `next` (the default), `last`, `at(offset)`, `since(time)`.
+
+**Acknowledging does not remove the message** — it advances this consumer's
+position, so restarting from `next` carries on rather than re-reading. Rejecting
+does not dead-letter it either, because there is nothing to remove it from: a
+message that cannot be handled has to be dealt with by the handler, and the
+stream moves on regardless. Nothing is lost, and nothing is retried for you.
+
+That is why `read_stream` uses `RetryPolicy.none` whatever the connection
+carries. A retry republishes, and republishing onto a stream appends a second
+copy rather than redelivering the first, so a projection reading it would see
+the message twice.
+
+Retention is unbounded by default, which for a stream means until the disk is
+full — a mistake an ordinary queue cannot make. Set at least one limit on
+anything that will run for long.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

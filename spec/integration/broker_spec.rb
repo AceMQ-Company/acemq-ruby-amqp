@@ -390,6 +390,62 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "a stream" do
+    let(:stream) { queue_named("stream") }
+
+    before do
+      scrub(stream)
+      AceMQ::AMQP::Patterns.declare_stream(mq, stream, max_age: 3600,
+                                                       max_bytes: 10 * 1024 * 1024)
+    end
+
+    after { scrub(stream) }
+
+    it "keeps what it has delivered, so a second reader sees it all again" do
+      # The whole difference from a queue, and the only place it can be shown:
+      # an acknowledgement advances a reader's position rather than removing
+      # anything, so a reader starting from the beginning after everything has
+      # been read still sees everything.
+      3.times { |i| mq.publish({ "n" => i }, to: stream) }
+
+      first = []
+      AceMQ::AMQP::Patterns.read_stream(mq, stream,
+                                        offset: AceMQ::AMQP::Patterns::StreamOffset.first,
+                                        name: "rbit-reader-1") do |message|
+        first << message.payload["n"]
+        AceMQ::AMQP::Ack.accept
+      end
+      expect(wait_for { first.size == 3 }).to be(true)
+
+      second = []
+      AceMQ::AMQP::Patterns.read_stream(mq, stream,
+                                        offset: AceMQ::AMQP::Patterns::StreamOffset.first,
+                                        name: "rbit-reader-2") do |message|
+        second << message.payload["n"]
+        AceMQ::AMQP::Ack.accept
+      end
+
+      expect(wait_for { second.size == 3 }).to be(true)
+      expect(first).to eq([0, 1, 2])
+      expect(second).to eq([0, 1, 2])
+    end
+
+    it "starts at the position it was asked for" do
+      3.times { |i| mq.publish({ "n" => i }, to: stream) }
+
+      seen = []
+      AceMQ::AMQP::Patterns.read_stream(mq, stream,
+                                        offset: AceMQ::AMQP::Patterns::StreamOffset.at(2),
+                                        name: "rbit-reader-3") do |message|
+        seen << message.payload["n"]
+        AceMQ::AMQP::Ack.accept
+      end
+
+      expect(wait_for { seen.size == 1 }).to be(true)
+      expect(seen).to eq([2])
+    end
+  end
+
   describe "publishing" do
     let(:queue) { queue_named("confirms") }
 
