@@ -396,6 +396,39 @@ the failure is passed on — a half-started group holds messages nothing is goin
 to handle. Closing stops every consumer even when one refuses, and raises the
 refusal afterwards.
 
+### Routing slips
+
+```ruby
+slip = Patterns::RoutingSlip.new
+                            .step("orders-events", "order.validate", name: "validate")
+                            .step("orders-events", "order.charge",   name: "charge")
+                            .step("orders-events", "order.ship",     name: "ship")
+
+slip.start(mq, order)
+
+# in the charging service
+mq.consume("charge-queue", &Patterns.follow_slip(mq) do |message|
+  charge(message.payload)     # the payload to send onwards
+end)
+```
+
+The alternative to a central orchestrator: the route is decided once, by
+whoever started the work, and travels with the message as an
+`acemq-routing-slip` header. Each service does its part and sends the message
+to the next stop.
+
+What it costs: no single place says what the whole route is at runtime, so a
+route that is wrong is discovered one hop at a time. Worth it when the steps
+vary per message, and not worth it when every message goes the same way — a
+fixed chain of consumers is simpler and easier to follow.
+
+Completed steps are carried rather than dropped, so a slip that fails half way
+says how far it got, which is exactly what whoever finds it in a dead-letter
+queue is asking. The message is accepted only once the next one is out, so a
+failure to publish retries the step — which is why a step that changes anything
+should be idempotent. A slip that will not parse is fatal rather than retried:
+it will not parse next time either.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
