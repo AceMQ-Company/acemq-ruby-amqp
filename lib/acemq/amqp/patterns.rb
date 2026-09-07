@@ -22,6 +22,7 @@ require_relative "patterns/replay"
 require_relative "patterns/ordered"
 require_relative "patterns/consumer_group"
 require_relative "patterns/routing_slip"
+require_relative "patterns/pipeline"
 
 module AceMQ
   module AMQP

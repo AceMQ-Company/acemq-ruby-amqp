@@ -429,6 +429,47 @@ failure to publish retries the step — which is why a step that changes anythin
 should be idempotent. A slip that will not parse is fatal rather than retried:
 it will not parse next time either.
 
+### Pipelines and middleware
+
+```ruby
+mq.consume("orders.new", &Patterns.chain(
+  ->(message) { place(message.payload) },
+  Patterns.with_logging { |line| logger.info(line) },
+  Patterns.with_timeout(10),
+  Patterns.with_idempotency(store)
+))
+```
+
+The order reads outside-in: the first one named is the outermost, so logging
+here records what the timeout and the idempotency guard decided.
+
+`with_timeout` **reports** an overrun rather than interrupting one, and reports
+it as a retry whatever the handler said about itself — retrying work that may
+have succeeded risks doing it twice, and accepting work that may have failed
+loses it, and only the first of those is a problem you can solve. Ruby's
+`Timeout.timeout` would interrupt, by raising inside whatever line the handler
+happened to be on, which can leave a transaction half-written; and the message
+is held until the handler returns either way, so there is nothing to gain.
+
+There is no `with_recovery`. An exception is the ordinary failure channel in
+Ruby and the consumer already turns one into a retry; a wrapper that rejected
+on every exception would send a database outage straight to the dead-letter
+queue.
+
+Chaining services into a pipeline:
+
+```ruby
+mq.consume("orders.new", &Patterns.then_publish(mq, to: "shipment.requested",
+                                                exchange: "shipping-events") do |message|
+  message.payload["digital"] ? nil : { "order_id" => message.payload["order_id"] }
+end)
+```
+
+Returning `nil` publishes nothing and accepts the message, which is how a step
+says "this one does not continue" without inventing an empty message for the
+next service to work out how to ignore. The correlation goes forward and the
+causation records what produced what.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
