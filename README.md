@@ -367,6 +367,35 @@ Patterns.partitioned_routing_key("orders", order_id, 8)   # => "orders.3"
 point: Ruby randomises string hashes per process, so two workers would disagree
 about where a key belongs, and so would a Go publisher and a Ruby consumer.
 
+### Consumer groups
+
+```ruby
+group = Patterns::ConsumerGroup.new(mq, "orders.new", size: 4) do |message|
+  place(message.payload)
+  Ack.accept
+end
+
+at_exit { group.close }
+```
+
+Starting workers by hand means remembering to stop every one, and a partial
+shutdown leaves messages held by a consumer nobody is waiting for. A group is
+also sized from configuration, which is the number most often changed after a
+service is running.
+
+**Concurrency, or a group?** `concurrency:` runs several handlers on one
+consumer and one channel. A group runs several consumers, each with its own
+channel and prefetch. Reach for the group when handlers are slow enough that
+one channel's prefetch becomes the limit, or when a fair share across processes
+matters: the broker round-robins between consumers, so four here compete evenly
+with four in another instance where one consumer with concurrency four would
+not.
+
+If a later consumer will not start, the ones already running are stopped before
+the failure is passed on — a half-started group holds messages nothing is going
+to handle. Closing stops every consumer even when one refuses, and raises the
+refusal afterwards.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.

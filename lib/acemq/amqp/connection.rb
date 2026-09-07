@@ -221,8 +221,22 @@ module AceMQ
           @consumers = []
           taken
         end
-        consumers.each(&:cancel)
+
+        # Every consumer is stopped even when one of them refuses, and the
+        # connection is closed either way. Stopping at the first failure would
+        # leave the rest of them running and the socket open, so a shutdown that
+        # went slightly wrong would become a process that will not exit — which
+        # is a worse problem than whatever the first consumer objected to.
+        failure = nil
+        consumers.each do |consumer|
+          consumer.cancel
+        rescue StandardError => e
+          failure ||= e
+        end
         @transport.close
+        raise failure if failure
+
+        nil
       end
     end
 

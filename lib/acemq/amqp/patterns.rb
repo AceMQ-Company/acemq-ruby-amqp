@@ -20,6 +20,7 @@ require_relative "patterns/outbox"
 require_relative "patterns/request_reply"
 require_relative "patterns/replay"
 require_relative "patterns/ordered"
+require_relative "patterns/consumer_group"
 
 module AceMQ
   module AMQP
