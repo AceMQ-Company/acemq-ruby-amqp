@@ -22,6 +22,8 @@ require_relative "amqp/naming"
 require_relative "amqp/ack"
 require_relative "amqp/codec"
 require_relative "amqp/topology"
+require_relative "amqp/transport"
+require_relative "amqp/connection"
 
 # AceMQ for Ruby.
 #
@@ -33,4 +35,8 @@ require_relative "amqp/topology"
 #
 # The API shape is Ruby's, deliberately. The contract is portable; the
 # ergonomics are native.
-
+#
+# Requiring this file loads the contract and the transport, but not a broker
+# client: bunny is required by {AceMQ::AMQP::Transport} at the moment a
+# connection is opened, and not before. A process that only reads envelopes off
+# a log never needs it installed.

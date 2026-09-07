@@ -2,6 +2,8 @@
 
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 
+Dir[File.expand_path("support/*.rb", __dir__)].each { |file| require file }
+
 RSpec.configure do |config|
   config.expect_with(:rspec) { |c| c.syntax = :expect }
   # A broker is not needed by anything under spec/ except the integration

@@ -1,0 +1,95 @@
+# frozen_string_literal: true
+
+# Copyright 2026 AceMQ.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+require "acemq/amqp"
+
+RSpec.describe AceMQ::AMQP::Connection do
+  let(:transport) { FakeTransport.new }
+  let(:mq) { described_class.new(transport: transport, origin: "checkout@pod-7") }
+
+  it "puts the envelope's headers on the message" do
+    mq.publish({ "id" => "A-1" }, to: "orders.new", type: "order.placed.v2")
+    sent = transport.published.last
+
+    expect(sent.headers[AceMQ::AMQP::Headers::TYPE]).to eq("order.placed.v2")
+    expect(sent.headers[AceMQ::AMQP::Headers::ORIGIN]).to eq("checkout@pod-7")
+    expect(sent.headers[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
+    expect(sent.headers[AceMQ::AMQP::Headers::VERSION]).to eq(1)
+    expect(sent.content_type).to eq("application/json")
+    expect(sent.body).to eq('{"id":"A-1"}')
+  end
+
+  it "defaults the type to the routing key, as every other language does" do
+    mq.publish({}, to: "orders.new")
+    expect(transport.published.last.headers[AceMQ::AMQP::Headers::TYPE]).to eq("orders.new")
+  end
+
+  it "sends the message id as the broker's message id as well as the header" do
+    # Two names for the same thing, because the broker's own field is what a
+    # management console shows and the header is what another language reads.
+    envelope = mq.publish({}, to: "orders.new")
+    expect(transport.published.last.message_id).to eq(envelope.id)
+    expect(transport.published.last.headers[AceMQ::AMQP::Headers::ID]).to eq(envelope.id)
+  end
+
+  it "returns what actually went on the wire" do
+    envelope = mq.publish({}, to: "orders.new", correlation_id: "corr-9")
+    expect(envelope.correlation_id).to eq("corr-9")
+  end
+
+  it "refuses to be told the envelope twice" do
+    # One or the other. Silently letting the keywords lose to the envelope
+    # would leave somebody looking for a correlation id they know they set.
+    expect { mq.publish({}, to: "q", envelope: AceMQ::AMQP::Envelope.new, type: "x") }
+      .to raise_error(ArgumentError, /one or the other/)
+  end
+
+  it "names the machine when nobody names the service" do
+    expect(described_class.new(transport: transport).origin).to start_with("acemq@")
+  end
+
+  it "refuses something that is not a codec, at start-up rather than at 3am" do
+    expect { described_class.new(transport: transport, codec: Object.new) }
+      .to raise_error(ArgumentError, /not a codec/)
+  end
+
+  it "refuses to consume without a handler" do
+    expect { mq.consume("orders.new") }.to raise_error(ArgumentError, /needs a block/)
+  end
+
+  it "closes the transport" do
+    mq.close
+    expect(transport.closed?).to be(true)
+  end
+end
+
+RSpec.describe AceMQ::AMQP::Transport do
+  it "names the gem to install when bunny is not there" do
+    # The gemspec declares no runtime dependencies on purpose, so this is the
+    # first moment anybody finds out. "cannot load such file -- bunny" does not
+    # say which library wanted it or what to do about it.
+    allow(described_class).to receive(:require).with("bunny").and_raise(LoadError, "no bunny")
+
+    expect { described_class.load_driver! }
+      .to raise_error(AceMQ::AMQP::DependencyMissing, /gem "bunny"/)
+  end
+
+  it "keeps the password out of an error that will be logged" do
+    # A credential that reaches a log is a credential that has to be rotated.
+    expect(described_class.redact("amqps://svc:hunter2@broker:5671/prod"))
+      .to eq("amqps://svc:***@broker:5671/prod")
+  end
+end
