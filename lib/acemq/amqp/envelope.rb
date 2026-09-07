@@ -51,22 +51,14 @@ module AceMQ
                      correlation_id: nil, causation_id: "", attempt: 1,
                      first_seen: Time.now, origin: "", error: "", claim: "",
                      headers: {})
-        offending = headers.keys.map(&:to_s).select { |name| Headers.reserved?(name) }.sort
-        unless offending.empty?
-          # Refused rather than dropped: silently discarding a header somebody
-          # set is worse than saying no, and these would otherwise be written
-          # twice and read back inconsistently.
-          raise ArgumentError,
-                "these header names belong to AceMQ and cannot be set by hand: " \
-                "#{offending.join(', ')}"
-        end
+        self.class.refuse_reserved_names(headers)
 
         @id = id
         @type = type
-        @version = version < 1 ? 1 : version
+        @version = [version, 1].max
         @correlation_id = correlation_id.nil? || correlation_id.empty? ? id : correlation_id
         @causation_id = causation_id
-        @attempt = attempt < 1 ? 1 : attempt
+        @attempt = [attempt, 1].max
         @first_seen = first_seen
         @origin = origin
         @error = error
@@ -164,6 +156,21 @@ module AceMQ
 
       def ==(other)
         other.is_a?(Envelope) && to_headers == other.to_headers
+      end
+
+      # Reserved names in an application's own hash are refused rather than
+      # dropped: silently discarding a header somebody set is worse than saying
+      # no, and these would otherwise be written twice and read back
+      # inconsistently.
+      #
+      # @api private
+      def self.refuse_reserved_names(headers)
+        offending = headers.keys.map(&:to_s).select { |name| Headers.reserved?(name) }.sort
+        return if offending.empty?
+
+        raise ArgumentError,
+              "these header names belong to AceMQ and cannot be set by hand: " \
+              "#{offending.join(", ")}"
       end
 
       # @api private

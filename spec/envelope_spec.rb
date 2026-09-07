@@ -32,7 +32,7 @@ RSpec.describe AceMQ::AMQP::Envelope do
   end
 
   FIXTURES["cases"].each do |fixture|
-    context "the #{fixture['case']} case" do
+    context "the #{fixture["case"]} case" do
       let(:expected) { fixture["headers"] }
       let(:envelope) { Envelope.from_headers(fixture["headers"], fixture["routingKey"]) }
 

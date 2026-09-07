@@ -90,24 +90,7 @@ module AceMQ
         return nil if attempt >= max_attempts
         return nil if max_message_age.positive? && message_age >= max_message_age
 
-        delay = initial_delay
-        (1...attempt).each do
-          delay *= multiplier
-          if max_delay.positive? && delay > max_delay
-            delay = max_delay
-            break
-          end
-        end
-        delay = max_delay if max_delay.positive? && delay > max_delay
-
-        if jitter_factor.positive? && delay.positive?
-          # Both directions, so a fleet of consumers that failed together does
-          # not come back together. One-sided jitter only ever delays, which
-          # turns a thundering herd into a slower thundering herd.
-          delay *= 1 + (((Kernel.rand * 2) - 1) * jitter_factor)
-        end
-
-        delay.negative? ? 0.0 : delay
+        [jittered(backoff(attempt)), 0.0].max
       end
 
       # The delays this policy would use, without jitter.
@@ -128,6 +111,31 @@ module AceMQ
       end
 
       private
+
+      # The delay this attempt has backed off to, capped.
+      #
+      # Capped inside the loop as well as after it: without the first, a policy
+      # with a large multiplier and many attempts overflows towards infinity
+      # before the ceiling is ever applied.
+      def backoff(attempt)
+        delay = initial_delay
+        (1...attempt).each do
+          delay *= multiplier
+          break delay = max_delay if max_delay.positive? && delay > max_delay
+        end
+        max_delay.positive? && delay > max_delay ? max_delay : delay
+      end
+
+      # The same delay, moved either side by the jitter factor.
+      #
+      # Both directions, so a fleet of consumers that failed together does not
+      # come back together. One-sided jitter only ever delays, which turns a
+      # thundering herd into a slower thundering herd.
+      def jittered(delay)
+        return delay unless jitter_factor.positive? && delay.positive?
+
+        delay * (1 + (((Kernel.rand * 2) - 1) * jitter_factor))
+      end
 
       def copy(**changes)
         RetryPolicy.new(

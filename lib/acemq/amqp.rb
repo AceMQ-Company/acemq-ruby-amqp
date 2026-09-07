@@ -31,7 +31,3 @@ require_relative "amqp/ack"
 #
 # The API shape is Ruby's, deliberately. The contract is portable; the
 # ergonomics are native.
-module AceMQ
-  module AMQP
-  end
-end
