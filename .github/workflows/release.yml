@@ -190,7 +190,16 @@ jobs:
 
       - uses: ruby/setup-ruby@v1
         with:
+          # 3.1 is the floor the gem supports and the right thing to build on,
+          # but the RubyGems that ships with it writes only the classic index --
+          # no versions, no info/, no names. A current client reads the compact
+          # index first, so a feed built by the old generator looks empty to it
+          # while looking perfectly correct to the generator that made it. That
+          # is exactly how 0.2.0 went out resolvable by CI's Ruby and not by a
+          # developer's. `rubygems: latest` upgrades the tool without moving off
+          # the floor.
           ruby-version: '3.1'
+          rubygems: latest
           bundler-cache: true
 
       - name: Work out the version
@@ -255,6 +264,9 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
+          # The same RubyGems a consumer on a current Ruby has, so this
+          # resolves through the compact index rather than the classic one.
+          gem update --system --silent
           export GEM_HOME="$RUNNER_TEMP/verify-gems"
           for attempt in $(seq 1 20); do
             if gem install acemq-amqp -v "$VERSION" \
