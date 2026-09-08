@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require_relative "naming"
+require_relative "queue_type"
 
 module AceMQ
   module AMQP
@@ -203,8 +204,14 @@ module AceMQ
         return self if empty?
 
         connection.declare_exchange(Naming::RETRY_EXCHANGE, kind: :direct, durable: true)
+        # Classic, said out loud rather than left to the default, which is
+        # quorum. A rung is a queue the Java, Go, .NET and Python libraries
+        # declare too, all four of them classic, and the queue type is part of
+        # the argument table the broker compares: a rung declared quorum here
+        # would be refused to every one of them.
         @rungs.each do |rung|
-          connection.declare_queue(rung.queue, durable: true, arguments: rung.arguments)
+          connection.declare_queue(rung.queue, queue_type: QueueType::CLASSIC,
+                                               durable: true, arguments: rung.arguments)
         end
         connection.bind(queue: @source, exchange: Naming::RETRY_EXCHANGE, routing_key: @source)
         self

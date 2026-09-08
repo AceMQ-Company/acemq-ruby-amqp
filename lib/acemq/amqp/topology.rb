@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require_relative "naming"
+require_relative "queue_type"
 require_relative "retry_ladder"
 
 module AceMQ
@@ -66,7 +67,7 @@ module AceMQ
 
       Exchange = Struct.new(:name, :kind, :durable, :auto_delete, :arguments,
                             keyword_init: true)
-      Queue = Struct.new(:name, :durable, :auto_delete, :exclusive, :arguments,
+      Queue = Struct.new(:name, :type, :durable, :auto_delete, :exclusive, :arguments,
                          keyword_init: true)
       Binding = Struct.new(:queue, :exchange, :routing_key, keyword_init: true) do
         def to_s = "#{exchange} -> #{queue} (#{routing_key})"
@@ -96,7 +97,24 @@ module AceMQ
         self
       end
 
-      # Adds a durable queue.
+      # Adds a durable quorum queue, which is the default everywhere in this
+      # library.
+      #
+      # The kind matters as much as the name. RabbitMQ treats +x-queue-type+ as
+      # part of a queue's identity, so a queue that exists as a quorum queue
+      # answers PRECONDITION_FAILED to anybody declaring it classic — and that
+      # anybody is the second service to start, in whichever language it
+      # happens to be written. Java declares a source queue quorum, Java is the
+      # one with deployments, so the other four libraries declare it quorum too
+      # and a Ruby service can share +orders+ with a Java one.
+      #
+      # +queue_type: :classic+ still gets a classic queue for a caller who
+      # wants one, and a +x-queue-type+ in +arguments+ is honoured as it always
+      # was, which is how {Patterns.declare_stream} declares a stream. A queue
+      # that is exclusive, auto-deleting or transient is classic whatever the
+      # default says, because RabbitMQ refuses to replicate a queue that goes
+      # away on its own; asking for quorum *and* one of those flags is a
+      # {QueueTypeError} rather than a silent downgrade.
       #
       # +dead_letter+ wires the queue to its own dead-letter queue, using the
       # names from {Naming} so that the dead letters of +orders.new+ are in
@@ -117,19 +135,23 @@ module AceMQ
       # back.
       #
       # @param name [String]
+      # @param queue_type [Symbol, nil] +:quorum+ by default, +:classic+ or
+      #   +:stream+ for a caller who needs one
       # @param dead_letter [Boolean] whether to wire up +{name}.dlq+
       # @param retry_policy [RetryPolicy, nil] whose rungs to declare
       # @param retry_threshold [Numeric] seconds; delays at or above it get a
       #   rung, and must match what the consumer of this queue is configured
       #   with
       # @return [Topology] self
+      # @raise [QueueTypeError] when the kind asked for and the flags asked for
+      #   cannot both be had
       def queue(name, durable: true, auto_delete: false, exclusive: false, arguments: {},
-                dead_letter: false, retry_policy: nil,
+                queue_type: nil, dead_letter: false, retry_policy: nil,
                 retry_threshold: RetryLadder::DEFAULT_THRESHOLD)
         name = name.to_s
         arguments = dead_letter_arguments(name, arguments) if dead_letter
-        @queues << Queue.new(name: name, durable: durable, auto_delete: auto_delete,
-                             exclusive: exclusive, arguments: arguments)
+        add_queue(name, queue_type, durable: durable, auto_delete: auto_delete,
+                                    exclusive: exclusive, arguments: arguments)
         dead_letter_queue(name) if dead_letter
         retry_ladder(name, retry_policy, threshold: retry_threshold) if retry_policy
         self
@@ -166,9 +188,16 @@ module AceMQ
         return self if ladder.empty?
 
         exchange(RETRY_EXCHANGE, :direct) unless declared_exchange?(RETRY_EXCHANGE)
+        # Classic, and not because nobody got round to changing it. Java's
+        # RetryTopology declares every rung CLASSIC, and a rung is a queue two
+        # libraries publish into by name, so the argument table — the queue type
+        # included — has to be the same one in both. It is also the queue this
+        # design leans on hardest: a rung exists to hold a message until a
+        # time-to-live expires it into an exchange, which is the plainest thing
+        # a classic queue does.
         ladder.rungs.each do |rung|
-          @queues << Queue.new(name: rung.queue, durable: true, auto_delete: false,
-                               exclusive: false, arguments: rung.arguments)
+          add_queue(rung.queue, QueueType::CLASSIC, durable: true, auto_delete: false,
+                                                    exclusive: false, arguments: rung.arguments)
         end
         binding(source, RETRY_EXCHANGE, source)
       end
@@ -189,6 +218,10 @@ module AceMQ
       # a service that only consumes dead letters needs the queue declared
       # without declaring the source queue it drains.
       #
+      # Classic, like the rungs and for the same reason: Java declares
+      # +{source}.dlq+ CLASSIC, and a dead-letter queue is a queue two services
+      # in two languages both declare before either of them drains it.
+      #
       # @param source [String] the queue whose dead letters these are
       # @return [Topology] self
       def dead_letter_queue(source)
@@ -198,8 +231,8 @@ module AceMQ
           exchange(@dead_letter_exchange,
                    :direct)
         end
-        @queues << Queue.new(name: dlq, durable: true, auto_delete: false, exclusive: false,
-                             arguments: {})
+        add_queue(dlq, QueueType::CLASSIC, durable: true, auto_delete: false,
+                                           exclusive: false, arguments: {})
         binding(dlq, @dead_letter_exchange, dlq)
       end
 
@@ -211,6 +244,8 @@ module AceMQ
       # and mixing them means whoever drains the dead letters has to sort them
       # by hand.
       #
+      # Classic, for the reason {#dead_letter_queue} is.
+      #
       # @param source [String]
       # @return [Topology] self
       def parked_queue(source)
@@ -219,8 +254,8 @@ module AceMQ
           exchange(@dead_letter_exchange,
                    :direct)
         end
-        @queues << Queue.new(name: parked, durable: true, auto_delete: false, exclusive: false,
-                             arguments: {})
+        add_queue(parked, QueueType::CLASSIC, durable: true, auto_delete: false,
+                                              exclusive: false, arguments: {})
         binding(parked, @dead_letter_exchange, parked)
       end
 
@@ -282,8 +317,13 @@ module AceMQ
                     auto_delete: e.auto_delete, arguments: e.arguments
           )
         end
+        # The kind goes out as well as the arguments, even though the arguments
+        # already carry it. A connection defaults an unqualified declaration to
+        # quorum, and a plan that said classic and then let the default answer
+        # for it would declare something nobody reviewed.
         @queues.each do |q|
-          connection.declare_queue(q.name, durable: q.durable, auto_delete: q.auto_delete,
+          connection.declare_queue(q.name, queue_type: q.type, durable: q.durable,
+                                           auto_delete: q.auto_delete,
                                            exclusive: q.exclusive, arguments: q.arguments)
         end
         @bindings.each do |b|
@@ -303,6 +343,20 @@ module AceMQ
       end
 
       private
+
+      # Adds one queue, with its kind settled before anything is stored.
+      #
+      # Settled here rather than at apply time so that the plan somebody reads
+      # is the declaration the broker gets: the kind is in the printed line and
+      # +x-queue-type+ is in the argument table, and neither is worked out later
+      # by something the reviewer never saw.
+      def add_queue(name, requested, durable:, auto_delete:, exclusive:, arguments:)
+        type, arguments = QueueType.resolve(name: name, requested: requested, durable: durable,
+                                            exclusive: exclusive, auto_delete: auto_delete,
+                                            arguments: arguments)
+        @queues << Queue.new(name: name, type: type, durable: durable, auto_delete: auto_delete,
+                             exclusive: exclusive, arguments: arguments)
+      end
 
       # The arguments that send a queue's rejected messages to its own dead
       # letter queue.
@@ -378,11 +432,16 @@ module AceMQ
         parts.join(", ")
       end
 
+      # The kind leads the line because it is the thing a reviewer holding this
+      # plan beside another library's is checking. It is not repeated from the
+      # argument table below it: +x-queue-type+ *is* the kind, and printing it
+      # twice would leave somebody wondering which one to believe.
       def describe_queue(queue)
-        parts = [queue.durable ? "durable" : "transient"]
+        parts = [queue.type.to_s, queue.durable ? "durable" : "transient"]
         parts << "auto-delete" if queue.auto_delete
         parts << "exclusive" if queue.exclusive
-        arguments = queue.arguments.sort_by { |name, _| name.to_s }
+        arguments = queue.arguments.reject { |name, _| name.to_s == QueueType::ARGUMENT }
+                         .sort_by { |name, _| name.to_s }
         (parts + arguments.map { |name, value| "#{name}=#{value}" }).join(", ")
       end
     end

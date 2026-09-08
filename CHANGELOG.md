@@ -25,6 +25,27 @@ While the version is `0.x` the public API may change in any release.
 > two services on one queue that disagree about a rung's arguments cannot both
 > consume it.
 
+> ### ⚠ Migrating: a source queue is now declared as a quorum queue
+>
+> `Topology#queue` and `Connection#declare_queue` send `x-queue-type: quorum`,
+> where 0.1.0 sent no `x-queue-type` at all and therefore declared a classic
+> queue. **A queue that already exists as classic cannot be redeclared as
+> quorum** — there is no conversion, and the declare is refused with
+> `PRECONDITION_FAILED`. Drain the queue and recreate it as quorum, or keep it
+> classic deliberately with `queue_type: :classic` until you can.
+>
+> The rungs, `{queue}.dlq` and `{queue}.parked` are unchanged: they were classic
+> and stay classic, as they are in Java. Anything exclusive, auto-deleting or
+> transient — a health probe's queue, a generated reply queue — also stays
+> classic, because RabbitMQ refuses to replicate a queue that goes away on its
+> own; asking for quorum *and* one of those flags now raises `QueueTypeError`
+> instead of reaching the broker.
+>
+> The change exists because Java declares a source queue as a quorum queue and
+> Java is the library with deployments. A Java service and a Ruby service that
+> both declare `orders` have to agree on its type or the second one to start
+> cannot consume at all.
+
 ### Added
 
 - **TLS and credentials.** `amqps://` with verification on, a custom CA, client
@@ -52,6 +73,12 @@ While the version is `0.x` the public API may change in any release.
 - **A rung returns through the named `acemq.retry` exchange** rather than the
   default exchange, with one binding `{queue} -> acemq.retry -> {queue}`, and
   dead letters route through `acemq.dlx`. See the migration note above.
+- **A durable source queue is a quorum queue**, in `Topology#queue` and in
+  `Connection#declare_queue`, matching Java's `declareQueue`. `queue_type:`
+  takes `:classic`, `:quorum` or `:stream`; an `x-queue-type` already in
+  `arguments` is honoured, which is how `Patterns.declare_stream` works; and the
+  retry rungs, `{queue}.dlq` and `{queue}.parked` stay classic. See the
+  migration note above.
 - **A replay resets `x-acemq-attempt` to 1** unless `restart: false`. A message
   dead-lettered on its last attempt would otherwise be dead-lettered again
   before a handler ever saw it.

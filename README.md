@@ -77,7 +77,8 @@ gem "bunny", "~> 2.23"
 **Identical**, because a message crosses languages: the reserved header names
 and their types, the defaults applied when they are absent, the retry schedule
 arithmetic, the `{queue}.dlq` / `{queue}.parked` / `{queue}.retry.{delay}`
-naming, and the rules for giving up.
+naming, the kind of queue each of those is declared as, and the rules for
+giving up.
 
 **Not identical**, deliberately: the API shape. Go gets `ctx`, .NET gets
 `IAsyncEnumerable`, Python gets dataclasses, and Ruby gets keyword arguments,
@@ -161,9 +162,18 @@ consume at all:
 acemq.retry                        direct, durable
 acemq.dlx                          direct, durable
 
-orders.new.retry.40s               x-message-ttl              40000
+orders.new                         quorum, durable
+                                   x-queue-type               quorum
+                                   x-dead-letter-exchange     acemq.dlx
+                                   x-dead-letter-routing-key  orders.new.dlq
+
+orders.new.retry.40s               classic, durable
+                                   x-message-ttl              40000
                                    x-dead-letter-exchange     acemq.retry
                                    x-dead-letter-routing-key  orders.new
+
+orders.new.dlq                     classic, durable
+orders.new.parked                  classic, durable
 
 orders.new       -> acemq.retry -> orders.new          (an expired rung comes home)
 orders.new.dlq   -> acemq.dlx   -> orders.new.dlq
@@ -191,6 +201,44 @@ The dead-letter exchange can be pointed elsewhere per topology
 (`Topology.new(dead_letter_exchange: "team.dlx")`), because only this library's
 own queue arguments name it. The retry exchange cannot, because it is written
 into the rung's argument table, which is the table everybody has to agree on.
+
+### A source queue is a quorum queue
+
+`Topology#queue` and `mq.declare_queue` declare a **durable quorum queue**, the
+same default as `declareQueue` in Java, and for the same reason the rung table
+is identical: `x-queue-type` is part of a queue's identity to the broker. A Java
+service declaring `orders` as quorum and a Ruby service declaring it as classic
+do not disagree politely — whichever starts second is answered
+`PRECONDITION_FAILED` and consumes nothing at all. A quorum queue is also the
+answer to the failure a classic queue turns into lost messages: it is replicated,
+so it survives losing the node its leader was on.
+
+**Three kinds of queue stay classic, deliberately**: the retry rungs,
+`{queue}.dlq` and `{queue}.parked`. Java declares all three classic, so this
+library does too — and a rung's whole behaviour is a time-to-live expiring into
+an exchange, which is the plainest thing a classic queue does.
+
+**Anything exclusive, auto-deleting or transient is classic because it can be
+nothing else.** RabbitMQ refuses to replicate a queue that goes away on its own,
+so a health probe's queue and a generated reply queue stay classic whatever the
+default says. Asking for both at once — `queue_type: :quorum` with
+`exclusive: true` — raises `QueueTypeError` here rather than reaching the broker,
+whose own refusal is `invalid property 'exclusive-owner'` and mentions neither
+quorum queues nor the flag that caused it.
+
+```ruby
+Topology.new
+        .queue("orders.new", dead_letter: true)   # quorum; .dlq classic
+        .queue("scratch", queue_type: :classic)   # classic, because you said so
+        .apply(mq)
+
+Patterns.declare_stream(mq, "events")             # x-queue-type: stream, untouched
+```
+
+> **Upgrading:** a queue that already exists as classic **cannot be redeclared as
+> quorum**. The broker refuses the declaration, and there is no conversion. Drain
+> it and recreate it under the new type, or keep it classic explicitly with
+> `queue_type: :classic` until you can.
 
 Ruby keeps its own 30-second threshold, which Java does not have: Java gives
 every delay in a schedule a rung. Below 30 seconds a wait lost to a restart
@@ -563,7 +611,10 @@ A requester is meant to be kept and reused — it holds a queue and a consumer,
 so one per request means a queue per request. Without `reply_to:` it generates
 an exclusive, transient, auto-deleting queue that goes away with the process; a
 reply queue that outlived its requester would collect answers nobody is waiting
-for.
+for. That one is classic, necessarily — the broker replicates nothing that
+disappears with its connection. A named `reply_to:` queue is an ordinary durable
+queue and gets the ordinary quorum default, so naming a queue a topology also
+declares is safe.
 
 The responder's block returns the answer rather than an `Ack`, and raising sends
 the failure back to the caller: somebody blocked on a reply should learn that it

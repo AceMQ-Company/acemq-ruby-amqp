@@ -74,6 +74,15 @@ RSpec.describe "against a real broker", :integration do
     nil
   end
 
+  # One argument to a line, sorted by name, which is what makes a printed table
+  # something somebody can hold beside the Java, Go, .NET or Python one.
+  def argument_lines(queue)
+    return "      (no arguments)" if queue.arguments.empty?
+
+    queue.arguments.sort_by { |name, _| name.to_s }
+         .map { |name, value| "      #{name.to_s.ljust(26)} #{value.inspect}" }.join("\n")
+  end
+
   describe "a round trip" do
     let(:queue) { queue_named("roundtrip") }
 
@@ -125,7 +134,10 @@ RSpec.describe "against a real broker", :integration do
 
     before do
       scrub(queue, dlq)
-      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+      # dead_letter_queue rather than queue(dlq): a dead-letter queue is classic
+      # in every one of the five libraries, and declaring it here as an ordinary
+      # queue would now make it quorum and disagree with all of them.
+      AceMQ::AMQP::Topology.new.queue(queue).dead_letter_queue(queue).apply(mq)
     end
 
     after { scrub(queue, dlq) }
@@ -175,7 +187,7 @@ RSpec.describe "against a real broker", :integration do
       scrub(queue, dlq, rung)
       AceMQ::AMQP::Topology.new
                            .queue(queue, retry_policy: policy, retry_threshold: 1)
-                           .queue(dlq)
+                           .dead_letter_queue(queue)
                            .apply(mq)
     end
 
@@ -193,7 +205,7 @@ RSpec.describe "against a real broker", :integration do
       puts <<~RUNG
         --- rung declaration, as this library builds it ---
           exchange  #{AceMQ::AMQP::Naming::RETRY_EXCHANGE} (direct, durable)
-          queue     #{ladder.rungs.first.queue} (durable)
+          queue     #{ladder.rungs.first.queue} (classic, durable)
                       x-message-ttl              #{arguments["x-message-ttl"].inspect}
                       x-dead-letter-exchange     #{arguments["x-dead-letter-exchange"].inspect}
                       x-dead-letter-routing-key  #{arguments["x-dead-letter-routing-key"].inspect}
@@ -215,11 +227,19 @@ RSpec.describe "against a real broker", :integration do
       # rung with this exact table is accepted, and redeclaring it with the old
       # one — the default exchange — is refused. That refusal is the whole
       # reason the table has to be identical in five languages.
-      mq.declare_queue(rung, durable: true, arguments: arguments)
+      #
+      # queue_type: :classic is said out loud because declare_queue defaults to
+      # quorum, and a rung is one of the queues that stays classic. Left off, it
+      # is this refusal all over again with x-queue-type as the argument that
+      # differs — which is exactly what a hand-written redeclaration of a rung
+      # would hit after upgrading.
+      mq.declare_queue(rung, queue_type: :classic, durable: true, arguments: arguments)
       expect do
-        mq.declare_queue(rung, durable: true,
+        mq.declare_queue(rung, queue_type: :classic, durable: true,
                                arguments: arguments.merge("x-dead-letter-exchange" => ""))
       end.to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+      expect { mq.declare_queue(rung, durable: true, arguments: arguments) }
+        .to raise_error(AceMQ::AMQP::TransportError, /x-queue-type/i)
     end
 
     it "routes a message home through the retry exchange and nothing else" do
@@ -282,7 +302,7 @@ RSpec.describe "against a real broker", :integration do
 
     before do
       scrub(queue, dlq)
-      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+      AceMQ::AMQP::Topology.new.queue(queue).dead_letter_queue(queue).apply(mq)
     end
 
     after { scrub(queue, dlq) }
@@ -318,7 +338,7 @@ RSpec.describe "against a real broker", :integration do
 
     before do
       scrub(queue, parked)
-      AceMQ::AMQP::Topology.new.queue(queue).queue(parked).apply(mq)
+      AceMQ::AMQP::Topology.new.queue(queue).parked_queue(queue).apply(mq)
     end
 
     after { scrub(queue, parked) }
@@ -379,6 +399,135 @@ RSpec.describe "against a real broker", :integration do
 
       expect { mq.declare_queue(queue, durable: false) }
         .to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+    end
+  end
+
+  # The one thing that stops a Java service and a Ruby service sharing a queue.
+  #
+  # RabbitMQ treats x-queue-type as part of a queue's identity, so this is not a
+  # preference each library gets to hold on its own: the second service to
+  # declare a queue whose type it disagrees about is answered
+  # PRECONDITION_FAILED and consumes nothing at all. Java declares a source
+  # queue quorum, so all five do.
+  describe "the queue type five libraries have to agree on" do
+    let(:queue) { queue_named("quorum") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+    let(:parked) { AceMQ::AMQP::Naming.parked_queue(queue) }
+    let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
+    let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
+
+    # What a Java service writes for the same queue: Topology.Builder.queue is a
+    # durable quorum queue, and queueWithDeadLetter adds the two dead-letter
+    # arguments. Held here as a literal rather than built from this library's
+    # own code, because a table generated by the thing under test proves nothing
+    # about the other four.
+    let(:java_arguments) do
+      {
+        "x-queue-type" => "quorum",
+        "x-dead-letter-exchange" => "acemq.dlx",
+        "x-dead-letter-routing-key" => dlq
+      }
+    end
+
+    let(:topology) do
+      AceMQ::AMQP::Topology.new
+                           .queue(queue, dead_letter: true, retry_policy: policy,
+                                         retry_threshold: 1)
+                           .parked_queue(queue)
+    end
+
+    before do
+      scrub(queue, dlq, parked, rung)
+      topology.apply(mq)
+    end
+
+    after { scrub(queue, dlq, parked, rung) }
+
+    # A second connection is what a second service is. The transport rather than
+    # the connection, so nothing this library defaults gets added on the way
+    # past: these are the arguments as another language would send them.
+    def declared_by_another_service(name, arguments)
+      other = AceMQ::AMQP::Connection.open(BROKER, origin: "java@rbit")
+      other.transport.declare_queue(name, durable: true, arguments: arguments)
+    ensure
+      other&.close
+    end
+
+    it "accepts the arguments a Java service sends, and refuses the same queue as classic" do
+      # The whole claim, in two declarations. The first is what a Java service
+      # starting second would send for a queue this one declared; the broker
+      # taking it means the two can share the queue. The second is that same
+      # declaration without x-queue-type — a classic queue, which is what this
+      # library sent before this change — and the broker refusing it is why the
+      # change had to happen.
+      expect { declared_by_another_service(queue, java_arguments) }.not_to raise_error
+
+      classic = java_arguments.except("x-queue-type")
+      expect { declared_by_another_service(queue, classic) }
+        .to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+    end
+
+    it "keeps the dead-letter queue classic, which is the half that must not change" do
+      # The mirror image, and just as load-bearing. Java declares {queue}.dlq
+      # CLASSIC, so a dlq this library quietly made quorum would break the same
+      # two services in the other direction.
+      expect { declared_by_another_service(dlq, {}) }.not_to raise_error
+      expect { declared_by_another_service(dlq, { "x-queue-type" => "quorum" }) }
+        .to raise_error(AceMQ::AMQP::TransportError, /PRECONDITION_FAILED/i)
+    end
+
+    it "prints the whole topology, so it can be held beside the other four" do
+      puts <<~TOPOLOGY
+        --- topology, as this library declares it ---
+        #{topology.plan.map { |line| "  #{line}" }.join("\n")}
+
+          queues, with the argument table each is declared with
+        #{topology.queues.map { |q| "    #{q.name} (#{q.type})\n#{argument_lines(q)}" }.join("\n")}
+          exchanges
+        #{topology.exchanges.map { |e| "    #{e.name} (#{e.kind}, durable: #{e.durable})" }.join("\n")}
+          bindings
+        #{topology.bindings.map { |b| "    #{b}" }.join("\n")}
+        ---------------------------------------------
+      TOPOLOGY
+
+      types = topology.queues.to_h { |q| [q.name, q.type] }
+      expect(types).to eq(queue => :quorum, dlq => :classic, rung => :classic,
+                          parked => :classic)
+      expect(topology.queues.first.arguments).to eq(java_arguments)
+    end
+
+    it "runs a whole retry cycle on the quorum queue, through a classic rung" do
+      # Quorum queues do not dead-letter the way classic ones do — the strategy
+      # is at-most-once by default and the accounting is different — so the
+      # round trip is proved rather than assumed: out of the quorum queue, into
+      # the classic rung, and home again on attempt 2 with nothing attached.
+      attempts = []
+      consumer = mq.consume(queue, retry_policy: policy, retry_threshold: 1) do |message|
+        attempts << message.attempt
+        AceMQ::AMQP::Ack.retry("the warehouse is down")
+      end
+
+      mq.publish({ "order_id" => "A-11" }, to: queue, type: "order.placed.v2")
+      expect(wait_for { mq.message_count(rung) == 1 }).to be(true)
+      expect(attempts).to eq([1])
+
+      # Cancelled before anything is counted, so the zero below is the broker's
+      # own count of the quorum queue and not a message this process is holding.
+      consumer.cancel
+      expect(mq.message_count(queue)).to eq(0)
+      expect(mq.message_count(rung)).to eq(1)
+
+      # Nothing woke it up. The rung's time-to-live expired and carried it back
+      # through acemq.retry into the quorum queue it came from.
+      expect(wait_for(seconds: 15) { mq.message_count(queue) == 1 }).to be(true)
+      expect(mq.message_count(rung)).to eq(0)
+
+      properties, body = take_one(queue)
+      expect(body).to eq('{"order_id":"A-11"}')
+      expect(properties[:headers][AceMQ::AMQP::Headers::ATTEMPT]).to eq(2)
+      death = properties[:headers]["x-death"]&.first
+      expect(death["queue"]).to eq(rung)
+      expect(death["reason"]).to eq("expired")
     end
   end
 
@@ -458,7 +607,7 @@ RSpec.describe "against a real broker", :integration do
 
     before do
       scrub(queue, dlq)
-      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+      AceMQ::AMQP::Topology.new.queue(queue).dead_letter_queue(queue).apply(mq)
     end
 
     after { scrub(queue, dlq) }
@@ -605,7 +754,7 @@ RSpec.describe "against a real broker", :integration do
 
     before do
       scrub(queue, dlq)
-      AceMQ::AMQP::Topology.new.queue(queue).queue(dlq).apply(mq)
+      AceMQ::AMQP::Topology.new.queue(queue).dead_letter_queue(queue).apply(mq)
     end
 
     after { scrub(queue, dlq) }

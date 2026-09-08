@@ -28,8 +28,79 @@ RSpec.describe AceMQ::AMQP::Topology do
     expect(topology.queues.map(&:name)).to eq(["orders.new", "orders.new.dlq"])
     expect(topology.queues.first.arguments).to eq(
       "x-dead-letter-exchange" => "acemq.dlx",
-      "x-dead-letter-routing-key" => "orders.new.dlq"
+      "x-dead-letter-routing-key" => "orders.new.dlq",
+      "x-queue-type" => "quorum"
     )
+  end
+
+  it "declares a source queue quorum, which is what the other four declare" do
+    # The whole of the interop problem in one argument. A Java service declares
+    # orders.new with x-queue-type=quorum; a Ruby service that left the argument
+    # out would be declaring a classic queue, and whichever of the two started
+    # second would be refused with PRECONDITION_FAILED and consume nothing.
+    queue = described_class.new.queue("orders.new").queues.first
+
+    expect(queue.type).to eq(:quorum)
+    expect(queue.arguments).to eq("x-queue-type" => "quorum")
+  end
+
+  it "leaves the rungs, the dead-letter queue and the parked queue classic" do
+    # Java's RetryTopology declares all three CLASSIC. They are queues two
+    # libraries declare and one of them publishes into by name, so the argument
+    # table has to match — and a rung is a time-to-live expiring into an
+    # exchange, which is the plainest thing a classic queue does.
+    policy = AceMQ::AMQP::RetryPolicy.fixed(3, 60)
+    topology = described_class.new
+                              .queue("orders.new", dead_letter: true, retry_policy: policy)
+                              .parked_queue("orders.new")
+
+    types = topology.queues.to_h { |queue| [queue.name, queue.type] }
+    expect(types).to eq(
+      "orders.new" => :quorum,
+      "orders.new.dlq" => :classic,
+      "orders.new.retry.1m" => :classic,
+      "orders.new.parked" => :classic
+    )
+    # And no x-queue-type anywhere on the classic ones: Java sends none, and an
+    # argument table that differs is the refusal this change exists to prevent.
+    kinds = topology.queues.drop(1).map { |queue| queue.arguments["x-queue-type"] }
+    expect(kinds).to all(be_nil)
+  end
+
+  it "still gives a caller the classic queue they asked for" do
+    queue = described_class.new.queue("orders.new", queue_type: :classic).queues.first
+
+    expect(queue.type).to eq(:classic)
+    expect(queue.arguments).to eq({})
+  end
+
+  it "leaves a queue classic when it is exclusive, auto-deleting or transient" do
+    # RabbitMQ replicates nothing that goes away on its own, so a quorum default
+    # applied to these would declare a queue the broker refuses outright.
+    topology = described_class.new
+                              .queue("temporary", exclusive: true, durable: false)
+                              .queue("scratch", auto_delete: true)
+                              .queue("transient", durable: false)
+
+    expect(topology.queues.map(&:type)).to eq(%i[classic classic classic])
+    expect(topology.queues.map(&:arguments)).to all(eq({}))
+  end
+
+  it "refuses a quorum queue that is also exclusive rather than declaring it" do
+    expect do
+      described_class.new.queue("replies", queue_type: :quorum, exclusive: true)
+    end.to raise_error(AceMQ::AMQP::QueueTypeError, /quorum queue while it is exclusive/)
+  end
+
+  it "leaves a stream alone, however it was asked for" do
+    # A stream says so in its own arguments, which is how Patterns.declare_stream
+    # declares one, and the default must not overrule it.
+    topology = described_class.new
+                              .queue("events", arguments: { "x-queue-type" => "stream" })
+                              .queue("events.two", queue_type: :stream)
+
+    expect(topology.queues.map(&:type)).to eq(%i[stream stream])
+    expect(topology.queues.map(&:arguments)).to all(eq("x-queue-type" => "stream"))
   end
 
   it "sets the dead-letter routing key as well as the exchange" do
@@ -196,11 +267,19 @@ RSpec.describe AceMQ::AMQP::Topology do
   end
 
   it "reads as something worth putting in a deployment log" do
-    topology = described_class.new.exchange("events", :topic).queue("orders.new")
+    # The kind is in the plan because the kind is what a reviewer holding this
+    # beside the Java, Go, .NET or Python plan is checking.
+    topology = described_class.new
+                              .exchange("events", :topic)
+                              .queue("orders.new", dead_letter: true)
     expect(topology.to_s).to eq(<<~PLAN.chomp)
-      Topology: 1 exchanges, 1 queues, 0 bindings
+      Topology: 2 exchanges, 2 queues, 1 bindings
         declare exchange events (topic)
-        declare queue orders.new (durable)
+        declare exchange acemq.dlx (direct)
+        declare queue orders.new (quorum, durable, x-dead-letter-exchange=acemq.dlx, \
+      x-dead-letter-routing-key=orders.new.dlq)
+        declare queue orders.new.dlq (classic, durable)
+        bind orders.new.dlq to acemq.dlx on "orders.new.dlq"
     PLAN
   end
 

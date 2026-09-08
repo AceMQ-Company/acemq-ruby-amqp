@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require_relative "credentials"
+require_relative "queue_type"
 require_relative "security"
 
 module AceMQ
@@ -163,8 +164,18 @@ module AceMQ
       end
 
       # Creates a queue unless it is already there.
-      def declare_queue(name, durable: true, auto_delete: false, exclusive: false,
-                        arguments: {})
+      #
+      # Deliberately without the quorum default {Connection#declare_queue} has:
+      # this is the layer that does what it is told, and a caller who reached
+      # past the connection to it is declaring exactly what they wrote down.
+      # +queue_type+ is honoured when it is given, because {Topology#apply} can
+      # be handed a transport and its plan says which kind each queue is.
+      #
+      # @param queue_type [Symbol, nil] +:classic+, +:quorum+ or +:stream+;
+      #   nothing is added to the arguments when it is not given
+      def declare_queue(name, queue_type: nil, durable: true, auto_delete: false,
+                        exclusive: false, arguments: {})
+        arguments = QueueType.table(queue_type, arguments) if queue_type
         with_admin_channel do |channel|
           channel.queue_declare(name, durable: durable, auto_delete: auto_delete,
                                       exclusive: exclusive, arguments: stringify(arguments))

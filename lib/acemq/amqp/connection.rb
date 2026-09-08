@@ -22,6 +22,7 @@ require_relative "envelope"
 require_relative "health"
 require_relative "interceptors"
 require_relative "naming"
+require_relative "queue_type"
 require_relative "retry_ladder"
 require_relative "retry_policy"
 require_relative "telemetry"
@@ -267,7 +268,31 @@ module AceMQ
       def consumers = @lock.synchronize { @consumers.dup }
 
       def declare_exchange(name, **options) = @transport.declare_exchange(name, **options)
-      def declare_queue(name, **options) = @transport.declare_queue(name, **options)
+
+      # Declares a durable quorum queue, which is what a queue is here unless
+      # something says otherwise.
+      #
+      # The same default as Java's +declareQueue+, and the reason is interop
+      # rather than taste: +x-queue-type+ is part of a queue's identity to the
+      # broker, so two services sharing +orders+ have to declare the same kind
+      # or the second one is refused with PRECONDITION_FAILED and cannot
+      # consume at all. {QueueType} has the rest of the rule — a queue that is
+      # exclusive, auto-deleting or transient stays classic because RabbitMQ
+      # allows nothing else, and a +x-queue-type+ already in +arguments+ is
+      # honoured, which is how a stream is declared.
+      #
+      # @param queue_type [Symbol, nil] +:classic+, +:quorum+ or +:stream+
+      # @raise [QueueTypeError] when the kind and the flags cannot both be had
+      def declare_queue(name, queue_type: nil, durable: true, auto_delete: false,
+                        exclusive: false, arguments: {})
+        type, arguments = QueueType.resolve(name: name, requested: queue_type,
+                                            durable: durable, exclusive: exclusive,
+                                            auto_delete: auto_delete, arguments: arguments)
+        @transport.declare_queue(name, queue_type: type, durable: durable,
+                                       auto_delete: auto_delete, exclusive: exclusive,
+                                       arguments: arguments)
+      end
+
       def bind(**options) = @transport.bind(**options)
       def pull(queue) = @transport.pull(queue)
       def message_count(queue) = @transport.message_count(queue)

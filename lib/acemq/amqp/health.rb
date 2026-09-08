@@ -17,6 +17,8 @@
 require "securerandom"
 require "time"
 
+require_relative "queue_type"
+
 module AceMQ
   module AMQP
     # Whether this process can actually do what it is running to do.
@@ -148,7 +150,12 @@ module AceMQ
       # @api private
       def self.probe(connection)
         name = "acemq-health-#{SecureRandom.uuid}"
-        connection.declare_queue(name, durable: false, auto_delete: true, exclusive: true)
+        # Classic, which is the only thing a queue with these flags can be:
+        # RabbitMQ will not replicate a queue that disappears with the
+        # connection that declared it. Said out loud so that a probe is never
+        # quietly caught by the quorum default the rest of the library has.
+        connection.declare_queue(name, queue_type: QueueType::CLASSIC, durable: false,
+                                       auto_delete: true, exclusive: true)
         # Deleted rather than left to clean itself up, which it will not.
         # Auto-delete fires when the last consumer goes and a probe queue never
         # has one; exclusive fires when the connection goes and a connection

@@ -70,6 +70,31 @@ RSpec.describe AceMQ::AMQP::Connection do
     expect { mq.consume("orders.new") }.to raise_error(ArgumentError, /needs a block/)
   end
 
+  it "declares a queue as a quorum queue, the way declareQueue does in Java" do
+    # The direct call, not the topology: the same default has to hold here, or
+    # a service that declares its queue in one line still ends up with a classic
+    # queue no Java service can share.
+    mq.declare_queue("orders.new")
+
+    name, options = transport.declared_queues.last
+    expect(name).to eq("orders.new")
+    expect(options[:queue_type]).to eq(:quorum)
+    expect(options[:arguments]).to eq("x-queue-type" => "quorum")
+  end
+
+  it "declares a classic queue when asked for one, with no x-queue-type on it" do
+    mq.declare_queue("orders.new", queue_type: :classic)
+
+    expect(transport.declared_queues.last.last)
+      .to include(queue_type: :classic, arguments: {})
+  end
+
+  it "will not declare a quorum queue the broker would refuse" do
+    expect { mq.declare_queue("replies", queue_type: :quorum, auto_delete: true) }
+      .to raise_error(AceMQ::AMQP::QueueTypeError, /auto-delete/)
+    expect(transport.declared_queues).to be_empty
+  end
+
   it "closes the transport" do
     mq.close
     expect(transport.closed?).to be(true)

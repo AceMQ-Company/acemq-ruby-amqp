@@ -42,8 +42,11 @@ RSpec.describe AceMQ::AMQP::Health do
       declared = transport.declared_queues.map(&:first)
       expect(declared.size).to eq(1)
       expect(declared.first).to match(/\Aacemq-health-[0-9a-f-]{36}\z/)
+      # Classic, and it could be nothing else: a probe queue is exclusive and
+      # auto-deleting, and RabbitMQ refuses to replicate either.
       expect(transport.declared_queues.first.last)
-        .to eq({ durable: false, auto_delete: true, exclusive: true })
+        .to eq({ queue_type: :classic, durable: false, auto_delete: true,
+                 exclusive: true, arguments: {} })
       expect(transport).to have_received(:delete_queue).with(declared.first)
     end
 

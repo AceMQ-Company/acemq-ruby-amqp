@@ -157,4 +157,24 @@ RSpec.describe AceMQ::AMQP::Patterns::Requester do
     expect(declared.last).to include(exclusive: true, auto_delete: true, durable: false)
     requester.close
   end
+
+  it "keeps a generated reply queue classic, and lets a named one be quorum" do
+    # The one place the library's quorum default would have broken something.
+    # RabbitMQ refuses an exclusive or auto-delete quorum queue outright, so a
+    # generated reply queue has to stay classic or it stops being declarable at
+    # all. A named one follows the default instead, because it is a queue a
+    # topology may well have declared too — and the two declarations have to
+    # agree or the second is refused with PRECONDITION_FAILED.
+    generated = described_class.new(mq, to: "price.requests")
+    named = described_class.new(mq, to: "price.requests", reply_to: "price.replies")
+
+    declared = transport.declared_queues.to_h
+    expect(declared[generated.reply_queue])
+      .to include(queue_type: :classic, exclusive: true, arguments: {})
+    expect(declared["price.replies"])
+      .to include(queue_type: :quorum, arguments: { "x-queue-type" => "quorum" })
+
+    generated.close
+    named.close
+  end
 end

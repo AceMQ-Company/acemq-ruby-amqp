@@ -17,6 +17,7 @@
 require "securerandom"
 
 require_relative "../ack"
+require_relative "../queue_type"
 require_relative "../retry_policy"
 
 module AceMQ
@@ -131,9 +132,21 @@ module AceMQ
 
         private
 
+        # The generated queue is classic and could be nothing else. RabbitMQ
+        # refuses an exclusive or auto-delete quorum queue outright, so a reply
+        # queue that goes away with the requester that made it is not a queue
+        # the broker will replicate — which is the one place the library's
+        # quorum default would have declared something undeclarable, and the
+        # reason it is written down here rather than left to the flags.
+        #
+        # A named one is left to that default, so it comes out quorum. That is
+        # what makes it safe to name a queue a topology also declares: both
+        # declarations then say the same thing, and the second one is accepted
+        # rather than refused with PRECONDITION_FAILED.
         def declare_reply_queue
           if @generated
-            @connection.declare_queue(@reply_queue, durable: false, auto_delete: true,
+            @connection.declare_queue(@reply_queue, queue_type: QueueType::CLASSIC,
+                                                    durable: false, auto_delete: true,
                                                     exclusive: true)
           else
             @connection.declare_queue(@reply_queue)
