@@ -204,10 +204,7 @@ module AceMQ
         def sweep
           published = 0
           @store.pending(@batch).each do |record|
-            @transport.publish(exchange: record.exchange, routing_key: record.routing_key,
-                               body: record.body, content_type: record.content_type,
-                               message_id: record.id, headers: record.headers,
-                               persistent: true)
+            publish(record)
             # Marked after the confirm, never before. A crash in this gap
             # republishes the record, which is the at-least-once this pattern
             # promises; marking first would lose it instead.
@@ -232,6 +229,25 @@ module AceMQ
         end
 
         private
+
+        # Publishes one record, telling the store when that failed.
+        #
+        # A store that claims records under a lease wants to hear about a
+        # failure: counting the attempt is what eventually stops a record
+        # nothing can publish from being tried on every sweep for ever, and
+        # giving up the lease is what lets the next sweep have a go rather than
+        # waiting the lease out for nothing. A store with no such notion — the
+        # in-memory one — is simply not asked, and the failure travels on
+        # exactly as it did before.
+        def publish(record)
+          @transport.publish(exchange: record.exchange, routing_key: record.routing_key,
+                             body: record.body, content_type: record.content_type,
+                             message_id: record.id, headers: record.headers,
+                             persistent: true)
+        rescue StandardError => e
+          @store.mark_failed(record.id, e.message) if @store.respond_to?(:mark_failed)
+          raise
+        end
 
         def run
           until stopped?

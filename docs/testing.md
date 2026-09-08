@@ -188,6 +188,16 @@ The TLS examples need a broker with a TLS listener and the authority that signed
 its certificate, and skip when they have neither. See
 [security](security.md#testing-it).
 
+The [SQL-backed stores](patterns.md#sql-backed-stores) need no environment for
+the ordinary run: they are tested against SQLite in memory, which is a real
+database with real transactions, and a stub of a transaction could not test the
+one thing the outbox store claims. Naming a PostgreSQL database runs the same
+examples against it too, because the dialect is a separate proof from the logic:
+
+```bash
+ACEMQ_TEST_POSTGRES=postgres://user:pass@localhost:5432/acemq_test bundle exec rspec
+```
+
 ## The cross-language fixtures
 
 `spec/fixtures/envelope-fixtures.json` was produced by the Java implementation

@@ -26,6 +26,7 @@ to reimplement them, and then there would be two retry engines to keep in step.
 | [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
 | [Schemas](#schemas) | remember what a message used to look like |
 | [Streams](#streams) | a queue that keeps what it has delivered |
+| [SQL-backed stores](#sql-backed-stores) | the three of those, in a database that outlives the process |
 
 Nothing here needs anything private. Every one of them is written against the
 public API, which is the only honest test of whether that API is wide enough.
@@ -58,12 +59,16 @@ Patterns.idempotent(store, key: ->(message) { message.payload["order_id"] }) { �
 ```
 
 A store is anything answering `first_time?(key)` and `forget(key)`, and
-**`first_time?` has to be atomic** — it both asks and claims.
+**`first_time?` has to be atomic** — it both asks and claims. A store that also
+answers `confirm(key)` has it called after a handler accepts, which is what a
+store whose rows outlive the process needs; see
+[the idempotency store](#the-idempotency-store-a-hold-is-a-lease).
 
 `InMemoryIdempotencyStore` is right behind one worker and wrong the moment there
 are two: each has its own memory, so both are told they are first. Its `window:`
 is how long a key is remembered, and it sweeps as it goes rather than growing
-without limit.
+without limit. [`SQLIdempotencyStore`](#the-idempotency-store-a-hold-is-a-lease)
+is the shared one.
 
 The store worth having is your own database, written in the same transaction as
 the work:
@@ -131,7 +136,9 @@ relay.sweep                                     # publish what is pending, now
 A store is anything answering `add`, `pending(limit = 0)` and
 `mark_published(id)`, and it is only worth having **if `add` can join the
 caller's transaction**. A store that opens its own connection has the gap back,
-in a place that looks like it has been dealt with.
+in a place that looks like it has been dealt with. `InMemoryOutboxStore` does
+not close that gap and says so;
+[`SQLOutboxStore`](#the-outbox-add-takes-your-connection) is the one that does.
 
 ## The claim check
 
@@ -532,6 +539,8 @@ empty definition.
 
 `InMemorySchemaRegistry` is for tests and for seeing the shape of the thing —
 nothing is shared between processes, which is the entire point of a registry.
+[`SQLSchemaRegistry`](#the-schema-registry-identifiers-that-survive-a-restart)
+is the one whose identifiers survive a restart.
 **Nothing here puts anything on the wire yet**: which header carries a schema
 identifier is a cross-language contract, and one invented here would be one the
 other AceMQ libraries could not read.
@@ -580,6 +589,178 @@ Retention is **unbounded by default**, which for a stream means until the disk i
 full — a mistake an ordinary queue cannot make. Set at least one of `max_age:`
 or `max_bytes:` on anything that will run for long.
 
+## SQL-backed stores
+
+The idempotency store, the outbox and the schema registry each shipped with an
+in-memory implementation and a comment saying why it is not the one to use. This
+is the other one.
+
+```ruby
+store = Patterns::SQLOutboxStore.new(connection: db)
+store.create_schema            # development and tests only
+
+db.transaction do
+  orders.insert(order)
+  store.add(Patterns.record(mq, event, to: "order.placed"), connection: db)
+end
+```
+
+| | |
+|---|---|
+| `Patterns::SQLOutboxStore` | `add`, `pending`, `mark_published`, `mark_failed`, `pending_count`, `purge_published` |
+| `Patterns::SQLIdempotencyStore` | `first_time?`, `confirm`, `forget`, `confirmed?`, `purge_expired` |
+| `Patterns::SQLSchemaRegistry` | `register`, `by_id`, `latest`, `versions` |
+
+### The connection is yours
+
+**This gem still declares no runtime dependencies.** There is no driver here;
+there is a seam three methods wide, and `SQL.connect` recognises what it is
+handed by the methods that object answers rather than by its class. A
+`SQLite3::Database`, a `PG::Connection`, or anything answering
+`run(sql, params)`, `placeholder(index)` and `constraint_violation?(error)` all
+work, and wrapping a pool, a Sequel database or an ActiveRecord connection is a
+dozen lines of the same shape.
+
+Statements are written with `?` and rendered per driver, so nothing here builds
+SQL out of anything a caller supplied except a table name — which is validated
+as a plain identifier, because no database binds one as a parameter.
+
+Times are stored as fixed-width ISO-8601 UTC, so that a string comparison in the
+database orders instants the way instants are ordered. There is no timestamp
+type spelled the same way in SQLite and PostgreSQL and no portable way to bind a
+`Time`; this is understood by both.
+
+**What has actually been run.** SQLite, by the ordinary specs — no environment
+needed, the sqlite3 gem is a development dependency. PostgreSQL, by
+`spec/integration/postgres_spec.rb`, which runs when `ACEMQ_TEST_POSTGRES` names
+one:
+
+```sh
+export ACEMQ_TEST_POSTGRES="postgres://user:pass@localhost:5432/acemq_test"
+bundle exec rspec
+```
+
+Nothing else has been exercised. MySQL, SQL Server and everything else are
+"should work, has not been run", and that is a different claim.
+
+### The outbox: `add` takes your connection
+
+This is the whole reason the class exists. `InMemoryOutboxStore` is criticised in
+its own comment for not sharing a transaction with anybody's database, and **a
+store that opened its own connection would have exactly that flaw while looking
+as though it had been dealt with**: the insert would commit on its own, and a
+business write that rolled back afterwards would leave a message queued for
+something that never happened.
+
+So the insert goes on the connection you hand in, inside the transaction you
+opened, and the store neither commits it nor closes it. The message becomes
+durable exactly when the work does:
+
+```ruby
+db.transaction do
+  orders.insert(order)
+  store.add(record, connection: db)
+end
+# roll this back and the message is not in the outbox either
+```
+
+`connection:` may also be given once, at construction, as a callable — the shape
+a framework that binds a connection per request wants:
+
+```ruby
+Patterns::SQLOutboxStore.new(connection: -> { Thread.current[:db] }, relay: relay_pool)
+```
+
+What it must never be is something that opens a fresh connection.
+
+`relay:` is where the relay's own work goes — claiming, marking, counting — and
+it runs on a background thread with no ambient transaction. Under a connection
+pool it has to be a different connection from the one a request is using. With
+one connection, the same one for both is correct and is the default.
+
+**Claiming is a lease, not a lock.** A held lock lasts as long as its
+transaction, so a relay that dies mid-batch either strands its rows or holds a
+transaction open across a network publish. A lease is a timestamp: it expires on
+its own, however the holder died. The claim is taken in two statements and
+decided by the update's row count, never by the select — two relays that select
+the same candidates both try to update them, and the loser matches nothing.
+
+`pending` therefore *claims* rather than merely reading, and what comes back is
+what this call won. `mark_failed` counts the attempt and frees the lease, so a
+record nothing can publish eventually stops being claimed and stays for somebody
+to look at rather than being tried for ever. `OutboxRelay` calls it for you when
+the store answers to it.
+
+A body is stored as text. One that is not text — anything the
+[claim check](#the-claim-check) or a binary codec produced — is stored base64
+with a column saying so, because PostgreSQL refuses invalid UTF-8 in a text
+column and losing the message to a driver error would be the worse trade.
+
+### The idempotency store: a hold is a lease
+
+`SQLIdempotencyStore` is the one `InMemoryIdempotencyStore` cannot replace. An
+in-process store deduplicates within one worker, and the moment there are three
+behind one queue the redelivery lands on a different one, finds an empty hash,
+and does the work again.
+
+A shared store has a failure the in-memory one does not: a consumer that takes a
+key and then dies mid-handler leaves its row behind, and naively every
+redelivery of that message, for ever, is discarded as a duplicate — a crash that
+should have cost one retry silently deleting a message instead. So a key is held
+under a **lease** that expires after `claim_timeout:`. Too short and two
+consumers work on the same message at once; too long and a crashed consumer
+stalls that message for the duration. It should comfortably exceed the slowest
+handler.
+
+That is why the store answers a third method. `Patterns.idempotent` calls
+`confirm` after a handler accepts, on any store that has one:
+
+```
+first_time?(key)  # take it, under a lease
+confirm(key)      # the work is done: hold it for retention, not for the lease
+forget(key)       # the work failed: give the hold up so a retry can run
+```
+
+A store with no `confirm` — the in-memory one — is simply never asked, because a
+crash wipes it and a key it holds is a key somebody is working on now.
+Confirmations are kept for `retention:` and then forgotten; a duplicate arriving
+later than that is handled again. Schedule `purge_expired` — hourly is ample.
+Nothing on the message path deletes anything, because a store that tidies up on
+the hot path makes every message pay for it.
+
+`forget` gives up only this store's own live hold, never another worker's and
+never a confirmation: the first would put two consumers on one message and the
+second would undo one.
+
+### The schema registry: identifiers that survive a restart
+
+`InMemorySchemaRegistry` hands out fresh identifiers on restart, which makes
+every message written before the restart unreadable and does it silently.
+`SQLSchemaRegistry` fixes exactly that and nothing more — no compatibility
+checking, no versioning interface, no HTTP.
+
+Identifiers come from a counter row rather than from `MAX(id) + 1`: two writers
+registering different schemas at the same moment compute the same next
+identifier, and the loser cannot win by retrying because the winner is doing the
+same arithmetic. Updating one row takes a row lock, so writers queue for an
+instant and every one gets a number. Registration is rare enough that
+serialising it costs nothing worth measuring.
+
+The same definition registered twice returns the same identifier, from any
+process, for ever — a unique index on (subject, fingerprint) is what makes that
+true rather than a check-then-insert.
+
+As with the in-memory registry, **nothing here puts anything on the wire**.
+Which header carries a schema identifier is a cross-language contract and not
+one AceMQ has agreed yet.
+
+### `create_schema` is for development
+
+Each store can make its own tables, and in production they belong in whatever
+migration tool already owns the schema — alongside the business tables the
+outbox commits with. A library that creates tables at start-up has taken a
+decision about when your database changes that is not its to take.
+
 ## Next
 
 - [Consuming](consuming.md) — every pattern here hands back something `consume`
@@ -587,4 +768,5 @@ or `max_bytes:` on anything that will run for long.
 - [Reliability](reliability.md) — the retry engine the patterns deliberately do
   not replace
 - [Interceptors](interceptors.md) — the cross-cutting version of a pipeline
-- [Testing without a broker](testing.md) — all ten are testable in-process
+- [Testing without a broker](testing.md) — every one of them is testable
+  in-process

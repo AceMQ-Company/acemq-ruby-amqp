@@ -33,9 +33,21 @@ module AceMQ
       #   first_time?(key)  # records the key, true when it had not been seen
       #   forget(key)       # removes it, so a message that failed can be redone
       #
+      # and, optionally, a third:
+      #
+      #   confirm(key)      # the work is done; start remembering it properly
+      #
       # +first_time?+ has to be atomic. Two consumers handed the same message at
       # the same moment must not both be told they are first, or the guard has
       # done nothing except cost a round trip.
+      #
+      # +confirm+ is what a store needs when its record outlives the process
+      # that made it. {InMemoryIdempotencyStore} has no use for one — a crash
+      # wipes it, so a key it holds is a key somebody is working on now. A store
+      # in a database has to tell the two apart, because a key left behind by a
+      # consumer that died has to expire and a key left behind by work that
+      # finished must not. {SQLIdempotencyStore} answers it; a store that does
+      # not is simply never asked.
       #
       # A duck type rather than a class to inherit from, because the store
       # somebody actually wants is their own database — ideally the very rows
@@ -169,7 +181,14 @@ module AceMQ
       # @api private
       def self.forgetting_on_failure(store, key)
         ack = yield
-        store.forget(key) unless ack.is_a?(Ack) && ack.accept?
+        if ack.is_a?(Ack) && ack.accept?
+          # Only a store that keeps its keys past the life of this process has
+          # anything to do here, and asking rather than requiring it is what
+          # lets a two-method store stay a two-method store.
+          store.confirm(key) if store.respond_to?(:confirm)
+        else
+          store.forget(key)
+        end
         ack
       rescue StandardError
         # A handler that raises has failed, and in Ruby that is the ordinary way

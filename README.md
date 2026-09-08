@@ -521,6 +521,7 @@ to reimplement them, and then there would be two retry engines to keep in step.
 | [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
 | [Schemas](#schemas) | remember what a message used to look like |
 | [Streams](#streams) | a queue that keeps what it has delivered |
+| [SQL-backed stores](#sql-backed-stores) | the three of those, in a database that outlives the process |
 
 ### Idempotency
 
@@ -922,6 +923,53 @@ Retention is unbounded by default, which for a stream means until the disk is
 full — a mistake an ordinary queue cannot make. Set at least one limit on
 anything that will run for long.
 
+### SQL-backed stores
+
+The idempotency store, the outbox and the schema registry each shipped with an
+in-memory implementation and a comment saying why it is not the one to use.
+`SQLIdempotencyStore`, `SQLOutboxStore` and `SQLSchemaRegistry` are the other
+one.
+
+```ruby
+store = Patterns::SQLOutboxStore.new(connection: db)
+store.create_schema            # development and tests only
+
+db.transaction do
+  orders.insert(order)
+  store.add(Patterns.record(mq, event, to: "order.placed"), connection: db)
+end
+```
+
+**The connection handed to `add` is the whole point.** A store that opened its
+own connection would commit the insert on its own, and a business write that
+rolled back afterwards would leave a message queued for something that never
+happened — the exact fault the pattern was adopted to prevent, now harder to
+notice because the code looks right. So the insert goes on your connection,
+inside your transaction, and the store neither commits it nor closes it: roll
+the transaction back and the message is not in the outbox either. `connection:`
+may also be a callable given once, which is the shape a framework that binds a
+connection per request wants; `relay:` is a separate connection for the relay's
+own background work.
+
+**This gem still declares no runtime dependencies.** There is no driver here,
+only a seam three methods wide — `run(sql, params)`, `placeholder(index)`,
+`constraint_violation?(error)` — and `SQL.connect` recognises what it is handed
+by the methods that object answers rather than by its class. A
+`SQLite3::Database` and a `PG::Connection` both work as they are.
+
+**What has actually been run:** SQLite, by the ordinary specs (the sqlite3 gem
+is a development dependency, so they need no environment), and PostgreSQL, by
+`spec/integration/postgres_spec.rb` when `ACEMQ_TEST_POSTGRES` names one.
+Nothing else — MySQL and the rest are "should work, has not been run", which is
+a different claim.
+
+Records are claimed under a **lease** rather than a lock, so a relay that dies
+mid-batch releases them without anybody intervening, and the claim is decided by
+an update's row count rather than by the select that preceded it. The
+idempotency store holds a key the same way, which is what stops a consumer that
+died mid-handler from having silently deleted a message; it answers a third
+method, `confirm`, that `Patterns.idempotent` calls after a handler accepts.
+
 ## Requirements
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
@@ -936,6 +984,11 @@ bundle exec rubocop
 # Anything that needs a broker is tagged :integration and skipped unless this
 # is set, so a laptop with no Docker still runs everything else.
 ACEMQ_TEST_BROKER=amqp://guest:guest@localhost:5672 bundle exec rspec
+
+# The SQL-backed stores are tested against SQLite by the ordinary run, and
+# against PostgreSQL as well when there is one to point at. "Written for
+# PostgreSQL" and "run against PostgreSQL" are different claims.
+ACEMQ_TEST_POSTGRES=postgres://user:pass@localhost:5432/acemq_test bundle exec rspec
 ```
 
 The TLS examples need a broker with a TLS listener and the authority that signed

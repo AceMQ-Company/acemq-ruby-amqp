@@ -26,6 +26,10 @@ require_relative "patterns/routing_slip"
 require_relative "patterns/pipeline"
 require_relative "patterns/schema"
 require_relative "patterns/streams"
+require_relative "patterns/sql"
+require_relative "patterns/sql_idempotency"
+require_relative "patterns/sql_outbox"
+require_relative "patterns/sql_schema"
 
 module AceMQ
   module AMQP

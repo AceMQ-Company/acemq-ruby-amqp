@@ -16,9 +16,16 @@ group :development, :test do
   # It is bunny's omission rather than ours, and it belongs beside bunny for
   # whoever next wonders why a standard-library name is in a Gemfile.
   gem "logger", "~> 1.6"
+  # The database-backed stores are written against a connection seam rather
+  # than against a driver, and neither of these is a runtime dependency: the
+  # gem still declares none, and a process that never opens a database never
+  # installs one. They are here because a store whose whole claim is
+  # transactional cannot be tested against a stub of a transaction.
+  gem "pg", "~> 1.5"
   gem "rspec", "~> 3.13"
   gem "rubocop", "~> 1.66"
   gem "rubocop-rspec", "~> 3.0"
+  gem "sqlite3", "~> 2.0"
   # The documentation site's API reference is generated from the comments in
   # lib/. Here rather than in the gemspec because nobody installing this gem
   # needs a documentation tool to use it.

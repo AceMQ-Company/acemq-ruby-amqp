@@ -19,6 +19,25 @@ While the version is `0.x` the public API may change in any release.
   pointed at the same store reads what a Java publisher checked in. Until now
   `x-acemq-claim` was a reserved header this library could read and never
   produce.
+- **Database-backed stores.** `Patterns::SQLOutboxStore`,
+  `Patterns::SQLIdempotencyStore` and `Patterns::SQLSchemaRegistry`, written
+  against a three-method connection seam rather than against a driver — the gem
+  still declares no runtime dependencies. `SQLOutboxStore#add` takes the
+  caller's own connection so the message insert and the business write commit
+  together, which is the property the in-memory outbox is criticised in its own
+  comment for lacking. Run against SQLite by the ordinary specs and against
+  PostgreSQL when `ACEMQ_TEST_POSTGRES` names one.
+
+### Changed
+
+- `Patterns.idempotent` calls `confirm(key)` after a handler accepts, on a store
+  that answers it. A store whose rows outlive the process has to tell a key left
+  by work that finished from a key left by a consumer that died; one with no
+  `confirm` — `InMemoryIdempotencyStore` — is never asked, so nothing that
+  worked before behaves differently.
+- `OutboxRelay` calls `mark_failed(id, reason)` when a publish raises, on a
+  store that answers it, then re-raises as before. It is what counts the attempt
+  and gives up the record's lease.
 
 ## [0.2.0] — 2026-09-07
 
