@@ -1,0 +1,137 @@
+{
+  "generatedBy": "acemq-amqp-libraries/scripts/codec-samples.sh",
+  "what": "One order, encoded by the Java and Go libraries own codecs. Base64 because two of these formats are binary and one of the text ones is whitespace-significant.",
+  "document": {
+    "what": "What the yaml, toml and xml samples carry. XML has no types, so every value in an xml sample arrives as a string.",
+    "orderId": "A-1",
+    "customer": "acme",
+    "totalCents": 4250,
+    "currency": "GBP",
+    "paid": true,
+    "lines": [
+      "widget",
+      "gasket"
+    ]
+  },
+  "record": {
+    "what": "What the protobuf and avro samples carry: the same order without the list, because both are schema-bound and the schema below has no field for one.",
+    "orderId": "A-1",
+    "customer": "acme",
+    "totalCents": 4250,
+    "currency": "GBP",
+    "paid": true
+  },
+  "avroSchema": {
+    "type": "record",
+    "name": "Order",
+    "namespace": "org.acemq.samples",
+    "fields": [
+      {
+        "name": "orderId",
+        "type": "string"
+      },
+      {
+        "name": "customer",
+        "type": "string"
+      },
+      {
+        "name": "totalCents",
+        "type": "long"
+      },
+      {
+        "name": "currency",
+        "type": "string"
+      },
+      {
+        "name": "paid",
+        "type": "boolean"
+      }
+    ]
+  },
+  "samples": [
+    {
+      "producer": "java",
+      "format": "yaml",
+      "contentType": "application/yaml",
+      "bodyBase64": "b3JkZXJJZDogQS0xCmN1c3RvbWVyOiBhY21lCnRvdGFsQ2VudHM6IDQyNTAKY3VycmVuY3k6IEdCUApwYWlkOiB0cnVlCmxpbmVzOgotIHdpZGdldAotIGdhc2tldAo=",
+      "note": "com.fasterxml.jackson.dataformat.yaml via YamlCodec, its default mapper"
+    },
+    {
+      "producer": "java",
+      "format": "toml",
+      "contentType": "application/toml",
+      "bodyBase64": "b3JkZXJJZCA9ICdBLTEnCmN1c3RvbWVyID0gJ2FjbWUnCnRvdGFsQ2VudHMgPSA0MjUwCmN1cnJlbmN5ID0gJ0dCUCcKcGFpZCA9IHRydWUKbGluZXMgPSBbJ3dpZGdldCcsICdnYXNrZXQnXQo=",
+      "note": "com.fasterxml.jackson.dataformat.toml via TomlCodec, its default mapper"
+    },
+    {
+      "producer": "java",
+      "format": "xml",
+      "contentType": "application/xml",
+      "bodyBase64": "PE9yZGVyPjxvcmRlcklkPkEtMTwvb3JkZXJJZD48Y3VzdG9tZXI+YWNtZTwvY3VzdG9tZXI+PHRvdGFsQ2VudHM+NDI1MDwvdG90YWxDZW50cz48Y3VycmVuY3k+R0JQPC9jdXJyZW5jeT48cGFpZD50cnVlPC9wYWlkPjxsaW5lcz48bGluZXM+d2lkZ2V0PC9saW5lcz48bGluZXM+Z2Fza2V0PC9saW5lcz48L2xpbmVzPjwvT3JkZXI+",
+      "note": "com.fasterxml.jackson.dataformat.xml via XmlCodec, serialising a POJO named Order"
+    },
+    {
+      "producer": "java",
+      "format": "protobuf",
+      "contentType": "application/x-protobuf",
+      "bodyBase64": "ChAKB29yZGVySWQSBRoDQS0xChIKCGN1c3RvbWVyEgYaBGFjbWUKFwoKdG90YWxDZW50cxIJEQAAAAAAmrBAChEKCGN1cnJlbmN5EgUaA0dCUAoKCgRwYWlkEgIgAQ==",
+      "note": "com.google.protobuf marshalling a google.protobuf.Struct via ProtobufCodec"
+    },
+    {
+      "producer": "java",
+      "format": "avro-fixed",
+      "contentType": "avro/binary",
+      "bodyBase64": "BkEtMQhhY21ltEIGR0JQAQ==",
+      "note": "org.apache.avro via AvroCodec.of(schema)"
+    },
+    {
+      "producer": "java",
+      "format": "avro-registered",
+      "contentType": "application/vnd.acemq.avro",
+      "bodyBase64": "AAAAAAEGQS0xCGFjbWW0QgZHQlAB",
+      "note": "org.apache.avro via AvroCodec.registered(registry), schema id 1"
+    },
+    {
+      "producer": "go",
+      "format": "yaml",
+      "contentType": "application/yaml",
+      "bodyBase64": "b3JkZXJJZDogQS0xCmN1c3RvbWVyOiBhY21lCnRvdGFsQ2VudHM6IDQyNTAKY3VycmVuY3k6IEdCUApwYWlkOiB0cnVlCmxpbmVzOgogICAgLSB3aWRnZXQKICAgIC0gZ2Fza2V0Cg==",
+      "note": "gopkg.in/yaml.v3 via codec/yaml"
+    },
+    {
+      "producer": "go",
+      "format": "toml",
+      "contentType": "application/toml",
+      "bodyBase64": "b3JkZXJJZCA9ICJBLTEiCmN1c3RvbWVyID0gImFjbWUiCnRvdGFsQ2VudHMgPSA0MjUwCmN1cnJlbmN5ID0gIkdCUCIKcGFpZCA9IHRydWUKbGluZXMgPSBbIndpZGdldCIsICJnYXNrZXQiXQo=",
+      "note": "github.com/BurntSushi/toml via codec/toml"
+    },
+    {
+      "producer": "go",
+      "format": "xml",
+      "contentType": "application/xml",
+      "bodyBase64": "PG9yZGVyPjxvcmRlcklkPkEtMTwvb3JkZXJJZD48Y3VzdG9tZXI+YWNtZTwvY3VzdG9tZXI+PHRvdGFsQ2VudHM+NDI1MDwvdG90YWxDZW50cz48Y3VycmVuY3k+R0JQPC9jdXJyZW5jeT48cGFpZD50cnVlPC9wYWlkPjxsaW5lcz53aWRnZXQ8L2xpbmVzPjxsaW5lcz5nYXNrZXQ8L2xpbmVzPjwvb3JkZXI+",
+      "note": "encoding/xml via codec/xml"
+    },
+    {
+      "producer": "go",
+      "format": "protobuf",
+      "contentType": "application/x-protobuf",
+      "bodyBase64": "ChAKB29yZGVySWQSBRoDQS0xChIKCGN1c3RvbWVyEgYaBGFjbWUKFwoKdG90YWxDZW50cxIJEQAAAAAAmrBAChEKCGN1cnJlbmN5EgUaA0dCUAoKCgRwYWlkEgIgAQ==",
+      "note": "google.golang.org/protobuf marshalling a google.protobuf.Struct via codec/protobuf"
+    },
+    {
+      "producer": "go",
+      "format": "avro-fixed",
+      "contentType": "avro/binary",
+      "bodyBase64": "BkEtMQhhY21ltEIGR0JQAQ==",
+      "note": "github.com/hamba/avro/v2 via codec/avro Of()"
+    },
+    {
+      "producer": "go",
+      "format": "avro-registered",
+      "contentType": "application/vnd.acemq.avro",
+      "bodyBase64": "AAAAAAEGQS0xCGFjbWW0QgZHQlAB",
+      "note": "github.com/hamba/avro/v2 via codec/avro Registered(), schema id 1"
+    }
+  ]
+}

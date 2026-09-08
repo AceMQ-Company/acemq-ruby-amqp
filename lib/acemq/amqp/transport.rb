@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require_relative "ack"
 require_relative "credentials"
 require_relative "queue_type"
 require_relative "security"
@@ -28,13 +29,6 @@ module AceMQ
 
     # A message the broker would not take.
     class PublishError < TransportError; end
-
-    # The gem this transport needs is not installed.
-    #
-    # Its own class so a caller can rescue it and fall back, and its message
-    # names the gem rather than leaving somebody to work out which library
-    # +cannot load such file -- bunny+ was talking about.
-    class DependencyMissing < StandardError; end
 
     # One message, as it arrived, before any codec has looked at it.
     #

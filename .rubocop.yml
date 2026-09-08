@@ -38,11 +38,27 @@ Metrics/AbcSize:
   Max: 35
 Metrics/ClassLength:
   Max: 200
+  Exclude:
+    # The TOML reader is a grammar, not a class that grew. It is long because
+    # TOML has four kinds of date, three kinds of string and four bases for an
+    # integer, and every method in it is a production of that grammar. Splitting
+    # it in two to score 114 twice would put half a grammar in each half and
+    # make it harder, not easier, to check against the specification.
+    - lib/acemq/amqp/codec/toml/reader.rb
 
 # The specs name the fixtures at the top level on purpose: they are the
 # contract, and reading them should not require unpicking a let block.
 Lint/ConstantDefinitionInBlock:
   Enabled: false
+
+# StringScanner#scan, #skip and #check only began taking a String in strscan
+# 3.1.0, and Ruby 3.1 — the floor this gem promises and the first entry in the
+# CI matrix — ships strscan 3.0.1, where a String raises TypeError. The cop does
+# not know that, so the TOML reader keeps its regexps and this says why rather
+# than leaving somebody to autocorrect it back and find out on CI.
+Style/RedundantRegexpArgument:
+  Exclude:
+    - lib/acemq/amqp/codec/toml/reader.rb
 Naming/FileName:
   Exclude:
     - lib/acemq-amqp.rb

@@ -73,6 +73,48 @@ gem "acemq-amqp"
 gem "bunny", "~> 2.23"
 ```
 
+### Codecs
+
+JSON, string and bytes, and the five formats the Java and Go libraries also
+ship, because a Java or Go service publishing one of those was until now a
+message this library could not decode:
+
+```ruby
+Codecs.names   # => ["bytes", "json", "string", "toml", "xml", "yaml"]
+
+mq = Connection.open(url, codec: YAMLCodec.new)
+mq = Connection.open(url, codec: CompositeCodec.new(JSONCodec.new, YAMLCodec.new))
+
+ProtobufCodec.new(Acme::Order)                             # application/x-protobuf
+AvroCodec.of(schema_json)                                  # avro/binary
+AvroCodec.registered(registry, subject: "order.placed",    # …/vnd.acemq.avro
+                     schema: schema_json)
+```
+
+Each reads more content types than it writes — `application/x-yaml`,
+`text/yaml`, `text/x-yaml` and `…+yaml` as well as `application/yaml` — because
+a producer in another stack uses whichever spelling its own library picked. Only
+`JSONCodec` and `BytesCodec` answer for a message with no content type at all.
+
+The gem still declares no runtime dependencies: YAML is Psych, the TOML reader
+and writer are written into the gem, and XML, Protobuf and Avro require REXML,
+`google-protobuf` and `avro` lazily and name the gem to install. REXML ships
+with Ruby but has been a *bundled* gem since Ruby 3.4, so a Bundler process
+needs it in its Gemfile:
+
+```ruby
+gem "rexml", "~> 3.3"            # for XMLCodec, under Bundler
+gem "google-protobuf", "~> 4.29" # for ProtobufCodec
+gem "avro", "~> 1.12"            # for AvroCodec
+```
+
+**`YAMLCodec` parses with `Psych.safe_load`, never `YAML.load`**, because a
+message body is untrusted input and `YAML.load` on one is remote code execution.
+`Date`, `Time` and `DateTime` are permitted by default since Java and Go both
+write timestamps; `Symbol` and YAML aliases have to be asked for. **`XMLCodec`
+refuses a `<!DOCTYPE>` outright**, which is not configurable. See
+[docs/serialization.md](docs/serialization.md).
+
 ## What is identical, and what is not
 
 **Identical**, because a message crosses languages: the reserved header names
@@ -1054,7 +1096,10 @@ method, `confirm`, that `Patterns.idempotent` calls after a handler accepts.
 
 ## Requirements
 
-Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport.
+Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport. Nothing
+else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
+`google-protobuf`, `avro` — and each of those says so by name when it is
+missing.
 
 ## Development
 

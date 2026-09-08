@@ -76,5 +76,14 @@ module AceMQ
     # Raising this says "stop now" without the handler having to know how many
     # attempts remain, which is knowledge handlers should not need.
     class FatalError < StandardError; end
+
+    # A gem this library needs for one optional thing is not installed.
+    #
+    # The gem declares no runtime dependencies, so the transport and the
+    # Protobuf, Avro and XML codecs reach for theirs lazily. Its own class so a
+    # caller can rescue it and fall back, and its message names the gem rather
+    # than leaving somebody to work out which library +cannot load such file --
+    # bunny+ was talking about.
+    class DependencyMissing < StandardError; end
   end
 end

@@ -17,6 +17,20 @@
 require "json"
 require_relative "ack"
 
+# The formats beyond JSON, each in a file of its own because each is a page of
+# reasoning rather than a method.
+#
+# Loading them costs nothing that is not already paid for: YAML is a default
+# gem, and the TOML reader and writer are written here. The three that need a
+# gem — REXML for XML, google-protobuf, avro — reach for it when a codec of
+# that kind is built, not when this file is read, so a process publishing JSON
+# installs none of them.
+require_relative "codec/yaml"
+require_relative "codec/toml"
+require_relative "codec/xml"
+require_relative "codec/protobuf"
+require_relative "codec/avro"
+
 module AceMQ
   module AMQP
     # A body that this codec cannot read.
@@ -279,9 +293,15 @@ module AceMQ
     # Codecs by name, so configuration can ask for a format without the calling
     # code naming the class.
     #
-    # The names are shared with the other libraries — +json+, +bytes+, +string+
-    # mean the same three things in Go — so a deployment that sets ACEMQ_CODEC
-    # does not have to be rewritten per language.
+    # The names are shared with the other libraries — +json+, +bytes+, +string+,
+    # +yaml+, +toml+ and +xml+ mean the same six things in Go and Java — so a
+    # deployment that sets ACEMQ_CODEC does not have to be rewritten per
+    # language.
+    #
+    # {ProtobufCodec} and {AvroCodec} are deliberately not here. Both are built
+    # around a message type or a schema, a name in configuration cannot carry
+    # one, and the Java library leaves them out of its own registry for exactly
+    # the same reason.
     module Codecs
       @registry = {}
       @lock = Mutex.new
@@ -328,6 +348,9 @@ module AceMQ
       register("json") { JSONCodec.new }
       register("bytes") { BytesCodec.new }
       register("string") { StringCodec.new }
+      register("yaml") { YAMLCodec.new }
+      register("toml") { TOMLCodec.new }
+      register("xml") { XMLCodec.new }
     end
   end
 end

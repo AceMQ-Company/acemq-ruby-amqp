@@ -584,6 +584,79 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  describe "a queue carrying more than one format" do
+    # Hands the bytes over untouched under whatever content type it was built
+    # with, so an example can put a message on the broker exactly as another
+    # language's library would have sent it: their bytes, their spelling of the
+    # type. Nothing this library would use in anger.
+    class AsSent
+      def initialize(content_type) = @content_type = content_type
+
+      attr_reader :content_type
+
+      def encode(payload) = payload.to_s
+      def decode(body) = body.to_s
+      def can_decode?(_content_type) = true
+    end
+
+    let(:queue) { queue_named("formats") }
+    let(:codec) do
+      AceMQ::AMQP::CompositeCodec.new(
+        AceMQ::AMQP::YAMLCodec.new, AceMQ::AMQP::JSONCodec.new,
+        AceMQ::AMQP::TOMLCodec.new, AceMQ::AMQP::XMLCodec.new
+      )
+    end
+    let(:consumer) { AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", codec: codec) }
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after do
+      consumer.close
+      scrub(queue)
+    end
+
+    it "writes with the first codec and sets the content type it names" do
+      publisher = AceMQ::AMQP::Connection.new(transport: mq.transport, codec: codec,
+                                              origin: "rspec@rbit")
+      publisher.publish({ "orderId" => "A-1" }, to: queue, type: "order.placed")
+
+      properties, body = take_one(queue)
+      expect(properties[:content_type]).to eq("application/yaml")
+      expect(body).to eq("orderId: A-1\n")
+    end
+
+    it "reads a body another language wrote, under the spelling that language used" do
+      # The whole point of the accept sets, over a real broker: the bytes and
+      # the content type are both what the other library would have sent, and
+      # the composite has to pick the right codec from the content type alone.
+      received = []
+      consumer.consume(queue) do |message|
+        received << [message.content_type, message.payload]
+        AceMQ::AMQP::Ack.accept
+      end
+
+      {
+        "application/x-yaml" => "orderId: A-1\ntotalCents: 4250\n",
+        "text/toml" => %(orderId = "A-2"\ntotalCents = 99\n),
+        "text/xml" => "<order><orderId>A-3</orderId></order>"
+      }.each do |type, body|
+        AceMQ::AMQP::Connection.new(transport: mq.transport, codec: AsSent.new(type),
+                                    origin: "rspec@rbit")
+                               .publish(body, to: queue, type: "order.placed")
+      end
+
+      wait_for { received.size == 3 }
+      expect(received.map(&:last)).to contain_exactly(
+        { "orderId" => "A-1", "totalCents" => 4250 },
+        { "orderId" => "A-2", "totalCents" => 99 },
+        { "orderId" => "A-3" }
+      )
+    end
+  end
+
   describe "a claim check" do
     let(:queue) { queue_named("claims") }
     let(:directory) { Dir.mktmpdir("acemq-claims") }

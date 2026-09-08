@@ -140,6 +140,17 @@ gem "bunny", "~> 2.23"   # for the transport
 
 Ruby 3.1 or newer. RabbitMQ for the broker.
 
+The gem itself declares no runtime dependencies, and three of the [nine
+codecs](serialization.md) are the only other things that ever ask for one. Each
+requires its gem lazily and names it when it is missing:
+
+```ruby
+gem "rexml", "~> 3.3"             # XMLCodec. Ships with Ruby, but is a bundled
+                                  # gem since 3.4, so Bundler needs it named.
+gem "google-protobuf", "~> 4.29"  # ProtobufCodec
+gem "avro", "~> 1.12"             # AvroCodec
+```
+
 Nothing is published to rubygems.org yet, so for now this is a git or path
 source. The [releasing section of the
 README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing) says what
@@ -151,7 +162,8 @@ has to happen before it is.
 - [Publishing](publishing.md) and [consuming](consuming.md)
 - [Exchanges, queues and bindings](topology.md)
 - [The envelope](envelope.md) — what travels with a message
-- [Codecs](serialization.md) — turning a payload into bytes and back
+- [Codecs](serialization.md) — turning a payload into bytes and back, in JSON,
+  YAML, TOML, XML, Protobuf, Avro, text or raw bytes
 - [Interceptors](interceptors.md) — the seam around publish and handle
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, dead letters and shutdown](reliability.md)
