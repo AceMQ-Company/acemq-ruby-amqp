@@ -105,13 +105,16 @@ RSpec.describe AceMQ::AMQP::Patterns::ClaimCheckCodec do
     end
 
     it "offloads a payload at the threshold, not merely above it" do
-      # Java's test is `encoded.length < threshold` for inline, so a payload of
-      # exactly the threshold goes to the store. An off-by-one here is a
-      # message Java would read as a claim check and Ruby as a payload.
-      at_threshold = described_class.wrapping(AceMQ::AMQP::BytesCodec.new, store, threshold: 10)
+      # Java's test is `encoded.length < threshold` for inline — strictly less
+      # than — so a payload of exactly the threshold goes to the store. At a
+      # threshold of 64, 63 bytes travel inline and 64 bytes are checked. An
+      # off-by-one here is a message Java reads as a claim check and Ruby reads
+      # as a payload.
+      sixty_four = described_class.wrapping(AceMQ::AMQP::BytesCodec.new, store, threshold: 64)
 
-      expect(described_class.key_of(at_threshold.encode("x" * 9))).to be_nil
-      expect(described_class.key_of(at_threshold.encode("x" * 10))).not_to be_nil
+      expect(described_class.key_of(sixty_four.encode("x" * 63))).to be_nil
+      expect(described_class.key_of(sixty_four.encode("x" * 64))).not_to be_nil
+      expect(described_class.key_of(sixty_four.encode("x" * 65))).not_to be_nil
     end
 
     it "counts bytes rather than characters" do
