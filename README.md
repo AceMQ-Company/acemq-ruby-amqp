@@ -512,6 +512,7 @@ to reimplement them, and then there would be two retry engines to keep in step.
 |---|---|
 | [Idempotency](#idempotency) | do a message's work once, however often it arrives |
 | [Outbox](#outbox) | decide to send and send, with no gap in between |
+| [Claim check](#claim-check) | keep a large payload off the broker |
 | [Request and reply](#request-and-reply) | ask a question and wait for the answer |
 | [Replay](#replay) | put dead letters back, once the fix is out |
 | [Ordering](#ordering) | keep some messages in order without serialising all of them |
@@ -588,6 +589,57 @@ without waiting for a tick. A store is anything answering `add`, `pending` and
 `mark_published`, and it is only worth having if `add` can join the caller's
 transaction — a store that opens its own connection has the gap back, in a
 place that looks like it has been dealt with.
+
+### Claim check
+
+```ruby
+store = Patterns::FilesystemClaimCheckStore.new("/mnt/claims")
+checked = Patterns::ClaimCheckCodec.wrapping(JSONCodec.new, store)
+
+mq = Connection.open(url, codec: checked)
+mq.publish(document, to: "document.stored")   # 40 MB does not go near the broker
+```
+
+A scanned medical report is tens of megabytes. Putting it on a queue fills the
+broker's memory, copies it to every bound queue, makes a dead-letter queue
+impossible to inspect, and turns a broker into a filesystem with worse tools.
+What travels instead is a claim check — the payload goes to a store, and the
+message carries the key.
+
+Below the threshold the payload travels inline, exactly as it would without this
+codec: offloading a two-hundred-byte message turns one broker round trip into a
+store round trip *and* a broker round trip, so an unconditional claim check
+makes the common case slower to fix the rare one. The default is 64 KiB, and
+`threshold: 0` offloads everything.
+
+Three bytes say which of the two a message is:
+
+```
+0xAC  0x01  0x00  payload   inline, and identical to what the delegate wrote
+0xAC  0x01  0x01  key       a claim check
+```
+
+The framing carries that rather than a header, because a header can be stripped
+by a shovel or a federation link and the body cannot. What follows the marker on
+a claim check is the store's key as bare UTF-8 — no URI, no scheme — and these
+are the same three bytes and the same 64 KiB the Java library writes, so a Ruby
+consumer pointed at the same store reads what a Java publisher checked in. A
+body with no framing at all is read as the delegate would read it, which is what
+makes it safe to put this codec in front of a queue that already has messages in
+it.
+
+`ClaimCheckCodec.key_of(body)` reads which object a message needs without
+fetching it, which is the difference between a five-minute check of a
+dead-letter queue and restoring a backup.
+
+A store answers `put`, `get` and `delete`; `get` returns `nil` for a key it no
+longer holds, and the codec turns that into a `DecodeError` explaining that the
+store's retention has to outlast every queue, every dead-letter queue and any
+replay somebody might do by hand. `InMemoryClaimCheckStore` is for tests only —
+it holds payloads in the publisher's own memory, so a consumer in another
+process finds nothing. `FilesystemClaimCheckStore` renames a temporary file into
+place so a fast reader never sees a truncated payload, and checks a key from the
+wire before it becomes a path segment.
 
 ### Request and reply
 

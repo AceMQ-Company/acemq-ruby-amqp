@@ -61,7 +61,11 @@ up on **age** as well as attempts is the honest limit for it.
 
 **`claim`** is for a payload too large to put in a message — the message carries
 a reference and the bytes live somewhere else. The field is on the wire and
-reserved; nothing in this library stores or fetches for you.
+reserved, and it is the application's own note about where a payload lives.
+Putting the payload aside and fetching it back is the
+[claim check](patterns.md#the-claim-check), which works on the body rather than
+on this header: a codec only ever sees bytes, and a header can be stripped by a
+shovel or a federation link where the body cannot.
 
 ## Frozen, and changed with `with`
 

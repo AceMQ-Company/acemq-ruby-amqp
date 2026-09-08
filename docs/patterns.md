@@ -17,6 +17,7 @@ to reimplement them, and then there would be two retry engines to keep in step.
 |---|---|
 | [Idempotency](#idempotency) | do a message's work once, however often it arrives |
 | [Outbox](#outbox) | decide to send and send, with no gap in between |
+| [Claim check](#the-claim-check) | keep a large payload off the broker |
 | [Request and reply](#request-and-reply) | ask a question and wait for the answer |
 | [Replay](#replay) | put dead letters back, once the fix is out |
 | [Ordering](#ordering) | keep some messages in order without serialising all of them |
@@ -131,6 +132,119 @@ A store is anything answering `add`, `pending(limit = 0)` and
 `mark_published(id)`, and it is only worth having **if `add` can join the
 caller's transaction**. A store that opens its own connection has the gap back,
 in a place that looks like it has been dealt with.
+
+## The claim check
+
+```ruby
+store = Patterns::FilesystemClaimCheckStore.new("/mnt/claims")
+checked = Patterns::ClaimCheckCodec.wrapping(JSONCodec.new, store)
+
+mq = Connection.open(url, codec: checked)
+mq.publish(document, to: "document.stored")   # 40 MB does not go near the broker
+```
+
+A scanned medical report is tens of megabytes. Putting it on a queue is possible
+and is a mistake: it fills the broker's memory, it is copied to every bound
+queue, it makes a dead-letter queue impossible to inspect, and it turns a broker
+into a filesystem with worse tools. What travels instead is a **claim check** —
+the payload goes to a store, and the message carries the key.
+
+**Only when it is worth it.** Below the threshold the payload travels inline,
+exactly as it would without this codec. Offloading a two-hundred-byte message
+turns one broker round trip into a store round trip *and* a broker round trip,
+so an unconditional claim check makes the common case slower to fix the rare
+one. The default threshold is `ClaimCheckCodec::DEFAULT_THRESHOLD`, 64 KiB —
+comfortably above an ordinary event and comfortably below the size at which a
+broker starts to care.
+
+```ruby
+Patterns::ClaimCheckCodec.wrapping(JSONCodec.new, store, threshold: 0)   # offload everything
+```
+
+### What is on the wire
+
+```
+0xAC  0x01  0x00  payload   inline, and identical to what the delegate wrote
+0xAC  0x01  0x01  key       a claim check
+```
+
+Three bytes, and **the third is how a consumer decides** whether it is holding a
+payload or a reference to one. The framing rather than a header carries that,
+because a header can be stripped by a shovel or a federation link and the body
+cannot. What follows the marker on a claim check is the store's key as bare
+UTF-8 — not a URI, no scheme, no length prefix — which is what a consumer hands
+straight back to its own store.
+
+These are the same three bytes and the same 64 KiB that the Java library writes,
+so a Ruby consumer pointed at the same store reads a document a Java publisher
+checked in. Get either wrong and the two cannot exchange a large message even
+though both "have claim check".
+
+A body with no framing is read as the delegate would read it. That is what makes
+it safe to put this codec in front of a queue that already has messages in it,
+and to change the threshold afterwards without a flag day.
+
+The **content type is the delegate's**, unchanged. Unlike encryption, where the
+bytes really are something else, a claim-checked message is still a document —
+it is a document that is somewhere else.
+
+### Reading a key without fetching it
+
+```ruby
+Patterns::ClaimCheckCodec.key_of(body)   # the key, or nil for an inline message
+```
+
+For the operator looking at a dead-letter queue: which object does this need,
+and is it still in the store? Answering that from the message alone is the
+difference between a five-minute check and restoring a backup.
+
+The `x-acemq-claim` header on the [envelope](envelope.md) is the application's
+own note about where a payload lives; the framing above is what the codec reads
+and writes. They are separate, and a codec only ever sees bytes.
+
+### Stores
+
+A store is anything answering `put(content)`, `get(key)` and `delete(key)`.
+`get` returns `nil` for a key it no longer holds — that is retention having
+expired, not a failure — and the codec turns it into a `DecodeError` that says
+so.
+
+| | |
+|---|---|
+| `Patterns::InMemoryClaimCheckStore` | tests, and nothing else |
+| `Patterns::FilesystemClaimCheckStore` | a shared, durable mount |
+
+`InMemoryClaimCheckStore` holds the payloads in the publisher's own memory,
+which is where they were going to be anyway — it takes them off the broker and
+does nothing else. A consumer in another process gets "the claim check is not in
+the store", and a restart loses every payload a queue still refers to.
+
+`FilesystemClaimCheckStore` writes to a temporary file and renames it into
+place, so a consumer fast enough to read the key before the writer finished sees
+the whole payload or no payload. It is worth having where the filesystem really
+is shared and durable — an NFS mount, a persistent volume. On a container's
+local disk it is the in-memory store with extra steps. Keys arriving from a
+message are **checked rather than trusted** before they become a path segment:
+`../../etc/passwd` is a key too, and one that is not a key this store issued
+raises a `FatalError` rather than being retried.
+
+Object storage is the usual right answer, and a store in front of S3 is three
+short methods.
+
+### Retention is the part that goes wrong
+
+The store and the queue have different lifetimes, and nothing enforces a
+relationship between them. A message replayed a month later carries a key, and
+if the store expired that key the replay produces a message nobody can read —
+**worse than a lost message, because it looks like a message**. The store's
+retention has to exceed every retention that could bring a message back: queue
+TTLs, dead-letter queues, and however long somebody might sit on a message
+before replaying it by hand.
+
+Nothing calls `delete` for you. Deleting on read would break the second consumer
+of the same message and deleting on acknowledgement would break a replay, so
+when a payload may be removed is a retention decision, and retention decisions
+belong to whoever owns the data.
 
 ## Request and reply
 

@@ -127,6 +127,14 @@ shared across every connection in the process. Registering a name twice replaces
 the first, which is what lets a test override a default rather than having to
 work around it.
 
+## A codec that wraps a codec
+
+`Patterns::ClaimCheckCodec` takes any of the above and puts a payload over 64
+KiB into a store, sending the key instead. It is a codec like the others —
+`Connection.open(url, codec: checked)` — and it keeps the delegate's content
+type, because a claim-checked document is still a document. See
+[the claim check](patterns.md#the-claim-check).
+
 ## What is not here
 
 No YAML, TOML, Avro or Protocol Buffers codec, which the Go library has as

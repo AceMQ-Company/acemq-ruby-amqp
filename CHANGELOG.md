@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## Unreleased
+
+### Added
+
+- **The claim check.** `Patterns::ClaimCheckCodec` wraps any codec and puts a
+  payload over 64 KiB into a store, sending the store's key instead;
+  `Patterns::InMemoryClaimCheckStore` and
+  `Patterns::FilesystemClaimCheckStore` are the two that ship. The framing —
+  `0xAC 0x01 0x00` for an inline payload, `0xAC 0x01 0x01` for a key — and the
+  64 KiB threshold are the ones the Java library writes, so a Ruby consumer
+  pointed at the same store reads what a Java publisher checked in. Until now
+  `x-acemq-claim` was a reserved header this library could read and never
+  produce.
+
 ## [0.2.0] — 2026-09-07
 
 > ### ⚠ Migrating: a retry rung now returns through `acemq.retry`

@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require "fileutils"
+require "tmpdir"
+
 require "acemq/amqp"
 require "acemq/amqp/patterns"
 
@@ -562,6 +565,71 @@ RSpec.describe "against a real broker", :integration do
       expect(headers[AceMQ::AMQP::Headers::VERSION]).to eq(4)
       expect(headers[AceMQ::AMQP::Headers::ORIGIN]).to eq("rspec@rbit")
       expect(headers[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
+    end
+  end
+
+  describe "a claim check" do
+    let(:queue) { queue_named("claims") }
+    let(:directory) { Dir.mktmpdir("acemq-claims") }
+    let(:store) { AceMQ::AMQP::Patterns::FilesystemClaimCheckStore.new(directory) }
+    let(:codec) do
+      AceMQ::AMQP::Patterns::ClaimCheckCodec.wrapping(AceMQ::AMQP::JSONCodec.new, store)
+    end
+    # A separate connection, so what the consumer gets is what the broker
+    # carried rather than an object the publisher still had a reference to.
+    let(:consumer) { AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", codec: codec) }
+    let(:report) { { "scan" => "x" * (256 * 1024) } }
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after do
+      consumer.close
+      scrub(queue)
+      FileUtils.remove_entry(directory)
+    end
+
+    it "puts the key on the broker and the payload in the store" do
+      # The claim being made: a quarter of a megabyte of scan does not go
+      # through RabbitMQ. Reading the body with basic_get rather than through
+      # the codec is the only way to see what the broker actually carried.
+      publisher = AceMQ::AMQP::Connection.new(transport: mq.transport, codec: codec,
+                                              origin: "rspec@rbit")
+      publisher.publish(report, to: queue, type: "document.stored")
+
+      _properties, body = take_one(queue)
+      expect(body.bytesize).to be < 100
+      expect(body.bytes.first(3)).to eq([0xAC, 0x01, 0x01])
+
+      key = AceMQ::AMQP::Patterns::ClaimCheckCodec.key_of(body)
+      expect(store.get(key).bytesize).to be > (256 * 1024)
+    end
+
+    it "hands a consumer the whole payload back" do
+      received = []
+      consumer.consume(queue) do |message|
+        received << message.payload
+        AceMQ::AMQP::Ack.accept
+      end
+
+      AceMQ::AMQP::Connection.new(transport: mq.transport, codec: codec, origin: "rspec@rbit")
+                             .publish(report, to: queue, type: "document.stored")
+
+      wait_for { received.any? }
+      expect(received.first).to eq(report)
+    end
+
+    it "leaves a small message inline, so the store is not on the common path" do
+      publisher = AceMQ::AMQP::Connection.new(transport: mq.transport, codec: codec,
+                                              origin: "rspec@rbit")
+      publisher.publish({ "order_id" => "A-9" }, to: queue)
+
+      _properties, body = take_one(queue)
+      expect(body.bytes.first(3)).to eq([0xAC, 0x01, 0x00])
+      expect(AceMQ::AMQP::Patterns::ClaimCheckCodec.key_of(body)).to be_nil
+      expect(Dir.children(directory)).to be_empty
     end
   end
 
