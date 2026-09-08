@@ -51,6 +51,17 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
       expect(ladder.queues).to eq(["orders.new.retry.30s", "orders.new.retry.1m"])
     end
 
+    it "gives no rung to anything when the threshold is zero" do
+      # Zero reads as "from zero, so everything" and means the opposite: it
+      # switches the broker off. Java, Go, .NET and Python all define it that
+      # way and the contract fixture records it, so a delay long enough to
+      # deserve a rung still waits in the consumer when the threshold is zero.
+      ladder = described_class.for("orders.new", RetryPolicy.fixed(4, 300), threshold: 0)
+
+      expect(ladder).to be_empty
+      expect(ladder.rung_for(300)).to be_nil
+    end
+
     it "never gives a rung to a delay of zero, however low the threshold" do
       # A queue whose time-to-live is zero expires on arrival, which is a round
       # trip through the broker to achieve nothing.

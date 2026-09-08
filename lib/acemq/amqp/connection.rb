@@ -579,7 +579,7 @@ module AceMQ
       # applied looks exactly like one that was until this happens.
       def rung_for(delay)
         rung = @ladder.rung_for(delay)
-        return nil if rung.nil? && delay < @ladder.threshold
+        return nil if rung.nil? && !RetryLadder.waits_in_broker?(delay, @ladder.threshold)
         return rung if rung && declared?(rung)
 
         @telemetry.count(Telemetry::RUNG_MISSING, 1, queue: @queue)

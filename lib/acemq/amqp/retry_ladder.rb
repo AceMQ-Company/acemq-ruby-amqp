@@ -66,17 +66,40 @@ module AceMQ
 
       attr_reader :source, :threshold, :rungs
 
+      # Whether a delay of this length belongs on a rung queue.
+      #
+      # Three conditions, and the first of them is the one that is easy to get
+      # wrong. A threshold of zero reads as "from zero, so everything" and means
+      # the opposite: it switches the broker off, and no rung queue is declared
+      # at all. That is what Java, Go, .NET and Python all say, it is what the
+      # contract fixture records, and it is the sense that leaves a caller a way
+      # to ask for the behaviour — "never use the broker" has no other spelling,
+      # whereas "always use the broker" is any threshold below the shortest
+      # delay in the schedule.
+      #
+      # The other two are the obvious ones: a delay shorter than the threshold
+      # waits here, and a delay of zero or less has nothing to wait for, so a
+      # rung would be a round trip through the broker to achieve nothing.
+      #
+      # @param delay [Numeric] seconds, unjittered as {RetryPolicy#schedule}
+      #   reports them
+      # @param threshold [Numeric] seconds
+      def self.waits_in_broker?(delay, threshold)
+        threshold.positive? && delay.positive? && delay >= threshold
+      end
+
       # Works out the ladder a policy needs, touching no broker.
       #
       # @param source [String] the queue being consumed
       # @param policy [RetryPolicy] whose schedule the rungs are
-      # @param threshold [Numeric] seconds; delays at or above it get a rung
+      # @param threshold [Numeric] seconds; delays at or above it get a rung,
+      #   and zero means no delay ever does
       # @return [RetryLadder]
       def self.for(source, policy, threshold: DEFAULT_THRESHOLD)
         source = source.to_s
         rungs = {}
         policy.schedule.each do |delay|
-          next unless delay.positive? && delay >= threshold
+          next unless waits_in_broker?(delay, threshold)
 
           # Keyed by name rather than by delay. Two delays inside the same
           # second render to the same name, and a second queue by the same name
@@ -152,9 +175,9 @@ module AceMQ
 
       # The rung a delay belongs in, or nil when the consumer should wait.
       #
-      # Nil is the answer for anything below the threshold, and it is the answer
-      # a caller acts on rather than a failure — waiting here is the other half
-      # of the design, not a fallback.
+      # Nil is the answer for anything {waits_in_broker?} says stays here, and
+      # it is the answer a caller acts on rather than a failure — waiting here
+      # is the other half of the design, not a fallback.
       #
       # A delay that is not exactly a rung is rounded up to the next one, which
       # cannot happen for a delay this ladder's own policy produced but can for
@@ -165,7 +188,8 @@ module AceMQ
       # @param delay [Numeric] seconds
       # @return [String, nil] the queue to publish into
       def rung_for(delay)
-        return nil if @rungs.empty? || delay < @threshold
+        return nil if @rungs.empty?
+        return nil unless RetryLadder.waits_in_broker?(delay, @threshold)
 
         longer = @rungs.select { |rung| rung.delay >= delay }
         (longer.min_by(&:delay) || @rungs.max_by(&:delay)).queue

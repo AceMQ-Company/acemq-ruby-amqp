@@ -1009,8 +1009,14 @@ ACEMQ_TEST_BROKER_CLIENT_KEY=certs/client.key \
 ```
 
 The fixtures under `spec/fixtures/` are produced by the Java implementation and
-shared with Go, .NET and Python. They are the definition of "the same wire
-contract", and they are checked here rather than assumed.
+shared with Go, .NET and Python. They are the definition of "the same contract",
+and they are checked here rather than assumed. `envelope-fixtures.json` pins the
+headers; `contract-fixtures.json` pins the retry schedules, the jitter bounds,
+where a wait is spent, the queue names, a rung's arguments, the declared topology
+and the queue types, and `spec/contract_spec.rb` holds this library to all of it
+— including the four places the five libraries do not yet agree, which it asserts
+as they stand rather than smoothing over. See [testing without a
+broker](docs/testing.md#the-cross-language-fixtures).
 
 ### The documentation site
 

@@ -96,9 +96,16 @@ The 10s and 20s delays get no rung; the consumer waits those. `retry_threshold:`
 moves the line, on both the topology and the consumer, **and the two have to
 agree**.
 
-Ruby keeps this threshold; Java does not have one and gives every delay in a
-schedule a rung. The rungs above the threshold are identical in both, which is
-what the contract requires.
+`retry_threshold: 0` reads as "from zero, so everything" and means the opposite:
+it switches the broker off, and no rung queue is declared at all. That is the
+sense Java, Go, .NET and Python all use, and it is the only spelling there is for
+"never use the broker" — "always use the broker" is any threshold below the
+shortest delay in the schedule. It is one of the rows in
+`spec/fixtures/contract-fixtures.json`, so all five libraries are held to it.
+
+Thirty seconds is the default in all five, and a delay is held on a rung when the
+threshold is above zero, the delay is above zero, and the delay is at or past the
+threshold. Nothing else about the schedule changes it.
 
 Jitter applies only below the threshold. Above it the spread comes free: each
 message's time-to-live starts when it enters the rung, so a fleet that failed
@@ -191,6 +198,12 @@ The dead-letter exchange can be pointed elsewhere per topology
 (`Topology.new(dead_letter_exchange: "team.dlx")`), because only this library's
 own queue arguments name it. The retry exchange cannot: it is written into the
 rung's argument table, which is the table everybody has to agree on.
+
+Every name here is pinned by `spec/fixtures/contract-fixtures.json`, along with
+the one place the five libraries do not yet agree: a sub-second rung is
+`orders.new.retry.0s` in Ruby, Go and Python and `orders.new.retry.500ms` in
+Java. It is unreachable behind the default threshold, and it is
+[recorded rather than resolved](testing.md#the-disagreements-it-records).
 
 ## Giving up
 
