@@ -1,35 +1,30 @@
-# Verify a tag, build the gem, and push it to RubyGems.
+# Verify a tag, build the gem, and add it to the AceMQ gem feed.
 #
-# Until this existed there was no way to publish at all, so v0.1.0 is a tag
-# nobody can install: `gem install acemq-amqp` finds nothing, because nothing
-# was ever pushed. This is what makes a tag into a release.
+# # Where this publishes, and why not rubygems.org
 #
-# A pushed gem version is permanent. RubyGems allows a yank, which removes it
-# from the index but does not free the version number and does not un-install it
-# from anybody who already has it, so the checks that matter run before the push
-# rather than after — a release that fails its own checks cannot be corrected in
-# place, only spent.
+# The gem goes to AceMQ-Company/gems, a static feed served at
+# https://acemq.org/gems/, alongside the Maven repository and the NuGet feed
+# that already work this way. It does not go to rubygems.org.
+#
+# That is deliberate and it is about reversibility. A gem name on rubygems.org
+# is permanent and a pushed version cannot really be withdrawn — a yank hides it
+# from the index but does not free the version number and does not remove it
+# from anybody who already has it. Publishing here first means a release can be
+# corrected by deleting a file and re-indexing, which is the property worth
+# having while the library is pre-1.0. Moving to rubygems.org later changes
+# nothing for consumers except the source line.
 #
 # # Publishing credentials
 #
-# This uses RubyGems trusted publishing (OIDC): the runner exchanges a GitHub
-# identity token for a short-lived RubyGems API key, so there is no long-lived
-# secret in this repository to leak, rotate or forget. Nothing here reads
-# RUBYGEMS_API_KEY and nothing should — a stored key is a key that outlives
-# whoever added it.
+# GEMS_REPO_DEPLOY_KEY: an SSH deploy key with write access to
+# AceMQ-Company/gems and to nothing else in the organisation. A deploy key
+# rather than a token because a token carries its owner's reach across every
+# repository they can see, and this job needs exactly one.
 #
-# It needs one piece of setup on rubygems.org, done once, before the first tag:
+# # No notification
 #
-#   1. Sign in as a gem owner, and go to the gem's page, or — because
-#      acemq-amqp does not exist yet — to Profile → Trusted publishers → Add,
-#      which creates a *pending* publisher for a gem that has never been pushed.
-#   2. Give it: repository owner AceMQ-Company, repository acemq-ruby-amqp,
-#      workflow filename release.yml, environment rubygems (the name below).
-#
-# Until that exists the publish job fails at the push with a 401 and nothing
-# else happens, which is the right way round: no gem is worse than the wrong
-# gem. The verify and integration jobs do not depend on it and prove a tag is
-# sound either way.
+# This workflow tells nobody. A release that is not on a public registry is not
+# news to announce, and the run itself is the record.
 name: release
 
 on:
@@ -188,15 +183,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
-      name: rubygems
-      url: https://rubygems.org/gems/acemq-amqp
-    permissions:
-      # id-token is what makes trusted publishing work: the runner mints a
-      # short-lived GitHub identity token and RubyGems exchanges it for an API
-      # key that expires in minutes. contents: write lets the release action
-      # attach the built gem to the GitHub release.
-      contents: write
-      id-token: write
+      name: gems
+      url: https://acemq.org/gems/
     steps:
       - uses: actions/checkout@v4
 
@@ -205,37 +193,78 @@ jobs:
           ruby-version: '3.1'
           bundler-cache: true
 
-      - name: Build and push to RubyGems
-        # The action builds from the gemspec and pushes over OIDC. It is
-        # RubyGems' own, and it is preferred to a hand-written `gem push`
-        # because the token exchange is the part worth not writing twice.
-        uses: rubygems/release-gem@v1
+      - name: Work out the version
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          declared=$(ruby -Ilib -racemq/amqp/version -e 'print AceMQ::AMQP::VERSION')
+          if [ "$VERSION" != "$declared" ]; then
+            echo "::error::the tag is $VERSION but AceMQ::AMQP::VERSION is $declared"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-  notify:
-    needs: [verify, integration, publish]
-    if: always()
-    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
-    with:
-      status: >-
-        ${{ (needs.publish.result == 'success') && 'success' || 'failure' }}
-      title: >-
-        ${{ (needs.publish.result == 'success')
-            && format('AceMQ for Ruby {0} released', github.ref_name)
-            || format('AceMQ for Ruby {0} was not published', github.ref_name) }}
-      message: >-
-        ${{ (needs.publish.result == 'success')
-            && 'The gem is on rubygems.org. Consumers need nothing but gem install acemq-amqp.'
-            || 'The tag exists but nothing was pushed to rubygems.org, so this version is not installable. Nothing has to be withdrawn — fix the cause and tag again.' }}
-      # A red dot rather than roadworks, and the wording says the same thing.
-      # Unlike Go, nothing is published by the tag alone here: a failed release
-      # leaves no artifact anywhere, so there is nothing half-finished to warn
-      # about, only something absent.
-      icon: >-
-        ${{ (needs.publish.result == 'success') && ':white_check_mark:' || ':x:' }}
-      url: https://rubygems.org/gems/acemq-amqp
-    secrets:
-      # Explicit, not `inherit`. A reusable workflow in another repository does
-      # not receive inherited secrets, and the shared workflow treats a missing
-      # webhook as "nothing to notify" and succeeds — so `inherit` here would be
-      # a green job that announced nothing.
-      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}
+      - name: Build the gem
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          gem build acemq-amqp.gemspec -o "$RUNNER_TEMP/acemq-amqp-$VERSION.gem"
+
+      - name: Check out the gem feed
+        uses: actions/checkout@v4
+        with:
+          repository: AceMQ-Company/gems
+          # A deploy key rather than a token: write access to that repository
+          # alone, and to nothing else in the organisation.
+          ssh-key: ${{ secrets.GEMS_REPO_DEPLOY_KEY }}
+          path: gem-feed
+
+      - name: Add the gem to it
+        # Cloned first, then added to, so the index is regenerated over
+        # everything already published. Building it from this release alone
+        # would leave earlier versions on disk and invisible to any client.
+        working-directory: gem-feed
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: ./scripts/publish.sh "$RUNNER_TEMP/acemq-amqp-$VERSION.gem"
+
+      # `published` is the line between "nothing happened" and "something is out
+      # there". Everything before this leaves the feed untouched; everything
+      # after operates on a version consumers can already resolve.
+      - name: Commit and push
+        working-directory: gem-feed
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          git config user.name "acemq-release"
+          git config user.email "noreply@acemq.org"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "nothing to publish; $VERSION may already be in the feed"
+            exit 0
+          fi
+          git add -A
+          git commit -m "Publish acemq-amqp $VERSION"
+          git push origin HEAD
+
+      - name: Install it back out of the feed
+        # The feed is only real if a client can resolve from it. GitHub Pages
+        # takes a moment to serve a new commit, so this retries rather than
+        # racing the deploy.
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          export GEM_HOME="$RUNNER_TEMP/verify-gems"
+          for attempt in $(seq 1 20); do
+            if gem install acemq-amqp -v "$VERSION" \
+                 --source https://acemq.org/gems/ --no-document >/dev/null 2>&1; then
+              ruby -e 'gem "acemq-amqp"; require "acemq/amqp"; puts AceMQ::AMQP::VERSION' \
+                | grep -qx "$VERSION"
+              echo "installed acemq-amqp $VERSION from the feed"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::the feed did not serve acemq-amqp $VERSION within five minutes"
+          exit 1
