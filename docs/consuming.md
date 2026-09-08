@@ -176,4 +176,4 @@ half way through a pass returns everything it was holding. It is what
   waited, and what happens when the attempts run out
 - [Patterns](patterns.md) — idempotency, ordering, consumer groups, pipelines
 - [Interceptors](interceptors.md) — running something around every handler
-- [Metrics and health](observability.md) — what a consumer counts
+- [Metrics, tracing and health](observability.md) — what a consumer counts

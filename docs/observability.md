@@ -1,4 +1,4 @@
-# Metrics and health
+# Metrics, tracing and health
 
 ```ruby
 metrics = Telemetry::Registry.new
@@ -146,6 +146,136 @@ lost; what is lost is the reason the rung exists, since a restart mid-wait now
 turns a five-minute backoff into none. The check is one round trip per rung for
 the life of a consumer, and only on the retry path. See
 [reliability](reliability.md#when-a-rung-is-missing).
+
+## Tracing
+
+Counters say how many messages failed. A trace says which one, and what it was
+waiting on.
+
+```ruby
+tracing = AceMQ::AMQP::Telemetry::OpenTelemetry.new
+tracing.install(mq)
+```
+
+That registers it on both sides of the connection — it is an
+[interceptor](interceptors.md), not a telemetry observer, because a span wraps a
+publish or a handler and so has to know when one starts and when it ends.
+Everything below could have been written outside this gem.
+
+### The join
+
+The point of tracing a message system is that the span covering a handler is a
+child of the span that published the message, even though the two ran in
+different processes minutes apart. The trace travels in the message:
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+`traceparent` and `tracestate` are the W3C names and are deliberately **not**
+`x-acemq-` prefixed. Other tooling already knows them, and a private name would
+make these traces invisible to everything that did not know to look for ours.
+The Java library writes the same two, so a Ruby consumer joins a Java producer's
+trace without either side being configured for the other.
+
+On the way in, the parent is read out of **the message's own headers**, not out
+of whatever this thread happened to be doing. Ambient context is the fallback,
+not the source — that join across processes and minutes is the entire point.
+
+### Spans
+
+| Span | Kind | When |
+| --- | --- | --- |
+| `<destination> publish` | PRODUCER | a publish |
+| `<queue> process` | CONSUMER | a handler running |
+| `<destination> request` | CLIENT | a request/reply round trip |
+
+CLIENT for a request rather than PRODUCER because that span waits for an answer,
+so its duration includes somebody else's work — a reader who cannot tell the two
+apart cannot tell a slow broker from a slow responder. It is the one span this
+library does not open for you, because request and reply is a call you make:
+
+```ruby
+tracing.request("pricing.quote") { requester.call(order) }
+```
+
+The publish inside it becomes its child, so one trace covers the question and
+the sending of it.
+
+### Attributes
+
+The OpenTelemetry messaging conventions, and the same set the Java adapter
+writes, so existing tooling recognises them without configuration:
+
+```
+messaging.system                             rabbitmq
+messaging.destination.name                   the exchange, or the queue
+messaging.operation                          publish | process | request
+messaging.message.id                         the envelope's id
+messaging.message.conversation_id            the envelope's correlation id
+messaging.rabbitmq.destination.routing_key   on a publish
+messaging.acemq.message_type                 the envelope's type
+messaging.acemq.attempt                      on a delivery
+messaging.acemq.outcome                      what happened
+```
+
+An attribute with nothing to say is left out rather than written empty.
+
+### Outcomes, and which of them are errors
+
+`unroutable`, `failed` and `dead_lettered` set the span status to error.
+`acked`, `retried`, `rejected`, `confirmed` and `answered` do not. A message
+that will be tried again has not failed yet, and a message a handler refused on
+purpose is the system working; marking either as an error is how a trace view
+fills with red and stops meaning anything.
+
+A retry the handler marked `FatalError` is reported as `dead_lettered` rather
+than `retried`, because that is what the consumer will actually do with it.
+
+### Events, not spans
+
+```
+outbox.publish_failed
+pipeline.run_finished
+message.retried
+message.dead_lettered
+```
+
+Events on the span that is already open. A zero-length span at the end of a
+trace adds a row and no information. The two the consume path knows about are
+raised for you; the other two are methods you call:
+
+```ruby
+tracing.outbox_publish_failed(exchange: "orders", reason: error.message)
+tracing.pipeline_run_finished(pipeline: "fulfilment", step: "pick",
+                              outcome: "completed", age: seconds)
+```
+
+Both do nothing when no span is open, which is a legitimate answer: an outbox
+relay on its own thread has nothing to hang an event on, and opening a span for
+the event alone would produce exactly the zero-length span this avoids.
+
+### Publishing outside the library
+
+```ruby
+tracing.propagation_headers   # => { "traceparent" => "00-…" }
+```
+
+For an outbox relay writing rows, or a job that hands work to something else,
+that still wants its messages to join the trace it is running in.
+
+### The gem
+
+`opentelemetry-api` is not a runtime dependency — this gem declares none — and
+is required at the moment one of these adapters is built, raising
+`DependencyMissing` naming the gem when it is absent:
+
+```ruby
+gem "opentelemetry-api", "~> 1.8"
+gem "opentelemetry-sdk", "~> 1.10"   # and something to export with
+```
+
+A process that counts messages and traces none of them installs neither.
 
 ## Health
 

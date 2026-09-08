@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require "stringio"
 require "tempfile"
 require "uri"
 
@@ -56,12 +57,20 @@ RSpec.describe "over TLS, against a real broker", :integration do
   # one, because a broker configured with fail_if_no_peer_cert refuses the
   # handshake without it and every example below would then be testing the same
   # refusal.
+  def development_reason = "a development broker, and this says so"
+
   def client_pair
     { certificate: client_certificate, key: client_key }
   end
 
+  # Every connection below opts in to development certificates, because the
+  # broker these run against is one scripts/tls-broker.sh stood up and
+  # everything it presents carries the marker. That opt-in is the subject of its
+  # own examples further down; here it is scaffolding, and without it every
+  # example in the file would be asserting the same refusal.
   def security(**overrides)
     AceMQ::AMQP::Security.verified(**client_pair, **overrides)
+                         .allowing_development_certificates
   end
 
   def connect(**overrides)
@@ -156,9 +165,63 @@ RSpec.describe "over TLS, against a real broker", :integration do
     # checked.
     it "cannot connect without it" do
       bare = AceMQ::AMQP::Security.verified(certificate_authority: authority)
+                                  .allowing_development_certificates
 
       expect { AceMQ::AMQP::Connection.open(broker, security: bare) }
         .to raise_error(AceMQ::AMQP::TransportError)
+    end
+  end
+
+  # The examples the opt-in above exists for. This broker's certificates were
+  # written by the AceMQ development tooling and carry
+  # ACEMQ DEVELOPMENT ONLY - DO NOT TRUST in their subject organisation, so it
+  # is exactly the broker a production process must not be able to reach — and
+  # the only place that claim can be tested is against a real handshake.
+  describe "development certificates" do
+    it "refuses the authority before a socket is opened" do
+      marked = AceMQ::AMQP::Security.verified(**client_pair, certificate_authority: authority)
+
+      expect { AceMQ::AMQP::Connection.open(broker, security: marked) }
+        .to raise_error(AceMQ::AMQP::ConfigurationError, /DEVELOPMENT ONLY/)
+    end
+
+    # The half that cannot be faked: no certificate authority is configured
+    # here, and no client certificate, so nothing local carries the marker.
+    # What refuses this connection is the certificate the broker itself
+    # presented, read during the handshake — and in unverified mode, which is
+    # the configuration a development certificate is likeliest to slip through
+    # because everything else has already been turned off.
+    it "refuses the broker's own certificate, even with verification off" do
+      insecure = AceMQ::AMQP::Security.without_verifying_the_broker(
+        because: "proving the development marker is refused even here"
+      )
+
+      # OpenSSL reports whatever the last chain error was, so the exception
+      # says "certificate verify failed" and not why anybody said no. The
+      # reason is on stderr, and asserting it is what distinguishes "refused
+      # because of the marker" from "refused because the chain was self-signed
+      # anyway", which is a distinction this example would otherwise not make.
+      said = capture_stderr do
+        expect { AceMQ::AMQP::Connection.open(broker, security: insecure) }
+          .to raise_error(AceMQ::AMQP::TransportError, /certificate verify failed/)
+      end
+
+      expect(said).to include(AceMQ::AMQP::Security::DEVELOPMENT_MARKER)
+      expect(said).to include("allowing_development_certificates")
+    end
+
+    it "connects once somebody has said it is a development broker" do
+      mq = AceMQ::AMQP::Connection.open(
+        broker, security: AceMQ::AMQP::Security
+                          .without_verifying_the_broker(because: development_reason,
+                                                        **client_pair)
+                          .allowing_development_certificates
+      )
+
+      expect(negotiated(mq).peer_cert.subject.to_s)
+        .to include(AceMQ::AMQP::Security::DEVELOPMENT_MARKER)
+    ensure
+      mq&.close
     end
   end
 
@@ -272,6 +335,17 @@ RSpec.describe "over TLS, against a real broker", :integration do
     certificate.not_after = Time.now + 3600
     certificate.sign(key, OpenSSL::Digest.new("SHA256"))
     certificate.to_pem
+  end
+
+  # bunny logs to stderr as well, so this returns everything said rather than
+  # only what the library said, and the examples look for their line in it.
+  def capture_stderr
+    was = $stderr
+    $stderr = StringIO.new
+    yield
+    $stderr.string
+  ensure
+    $stderr = was
   end
 
   def url_without_credentials(url)

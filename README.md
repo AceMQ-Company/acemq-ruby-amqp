@@ -20,7 +20,11 @@ produces pin that rather than leaving it to be discovered in production.
 > ordering, consumer groups, routing slips, sagas, scheduling, pipelines,
 > schemas and streams.
 > [TLS and credentials](#tls-and-credentials) are in, including a private
-> certificate authority and mutual TLS. Nothing is published to RubyGems yet.
+> certificate authority, mutual TLS and
+> [development certificates that cannot reach
+> production](#development-certificates-and-why-they-cannot-reach-production).
+> So are [encrypted bodies](#encrypted-bodies) and an
+> [OpenTelemetry adapter](#tracing). Nothing is published to RubyGems yet.
 
 ## What is here today
 
@@ -114,6 +118,40 @@ message body is untrusted input and `YAML.load` on one is remote code execution.
 write timestamps; `Symbol` and YAML aliases have to be asked for. **`XMLCodec`
 refuses a `<!DOCTYPE>` outright**, which is not configurable. See
 [docs/serialization.md](docs/serialization.md).
+
+### Encrypted bodies
+
+`EncryptedCodec` wraps any of the above and encrypts what it produced, so the
+broker, its disk, its backups and its management interface hold ciphertext:
+
+```ruby
+keys  = Keyring.of("orders-2026-09", Keys.from_base64(ENV["ACEMQ_KEY"]))
+codec = EncryptedCodec.wrapping(JSONCodec.new, keys)
+
+mq = Connection.open(url, codec: codec)
+
+EncryptedCodec.key_id_of(body)   # => "orders-2026-06", from the bytes, without the key
+```
+
+AES-GCM through Ruby's OpenSSL binding, a fresh nonce per message, and the
+framing the Java library writes:
+
+```
+0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
+```
+
+The key identifier is in the clear in front of the ciphertext, which is what
+makes rotation possible — a consumer reads which key a message needs rather than
+assuming the current one — and the header is the GCM associated data, so an
+identifier altered in flight makes the message fail to open rather than opening
+as something else. A `Keyring` holds the key that writes and every key that
+still has to read.
+
+**Go and .NET write different bytes under the same content type.** Go omits the
+magic byte and uses a two-byte length; .NET omits it too and uses AES-CBC with
+an HMAC tag. This library interoperates with Java and with nothing else yet.
+[docs/serialization.md](docs/serialization.md#the-other-libraries-do-not-agree-about-this-yet)
+has the table.
 
 ## What is identical, and what is not
 
@@ -431,6 +469,44 @@ caller should be able to learn.
 Anything an observer raises is swallowed and reported once per metric on stderr.
 A metrics backend that is down is not a reason to stop delivering messages.
 
+### Tracing
+
+Counters say how many messages failed. A trace says which one:
+
+```ruby
+tracing = Telemetry::OpenTelemetry.new
+tracing.install(mq)                      # registers on both sides of the connection
+
+tracing.request("pricing.quote") { requester.call(order) }
+```
+
+Spans are `<destination> publish` (PRODUCER), `<queue> process` (CONSUMER) and
+`<destination> request` (CLIENT — that span waits for an answer, so its duration
+means something different), with the OpenTelemetry messaging attributes the Java
+adapter writes. The trace travels in `traceparent` and `tracestate`, the W3C
+names, deliberately **not** `x-acemq-` prefixed: other tooling already knows
+them, and the Java library writes the same two, so a Ruby consumer joins a Java
+producer's trace with neither side configured for the other.
+
+The consumer span's parent comes out of **the message's own headers**, not out
+of ambient context. That join, across processes and minutes, is the entire point
+of tracing a message system.
+
+`unroutable`, `failed` and `dead_lettered` make a span an error; `acked`,
+`retried` and `rejected` do not — a message that will be tried again has not
+failed yet. Retries, dead letters, outbox failures and finished pipeline runs
+are *events* on the span already open, because a zero-length span at the end of a
+trace adds a row and no information.
+
+`opentelemetry-api` is not a runtime dependency. It is required at the moment an
+adapter is built and names itself when it is absent, the way bunny does:
+
+```ruby
+gem "opentelemetry-api", "~> 1.8"
+```
+
+See [docs/observability.md](docs/observability.md#tracing).
+
 **`acemq.retry.rung.missing` is worth an alert.** A retry long enough to be
 handed to the broker checks that its rung queue is really there before
 publishing into it — a publish into a queue nobody declared is dropped without a
@@ -548,6 +624,38 @@ The same reach fixes a quieter one. bunny pins its TLS context's minimum and
 maximum version to the same constant, defaulting both to TLS 1.2, so a broker and
 a client that could have agreed on 1.3 settle for 1.2; `Security#configure` lifts
 the ceiling before the session starts.
+
+### Development certificates, and why they cannot reach production
+
+```console
+$ ./scripts/acemq-certs.rb --out .tls --broker localhost --days 30
+```
+
+Writes a certificate authority, a broker certificate and a client certificate,
+under the same names Go's `acemq-certs` and .NET's `AceMq.Amqp.DevCerts` write,
+plus a `rabbitmq.conf` that serves TLS from them. `DevelopmentCertificates`
+is the same thing from Ruby. Keys are `0600` and everything is short-lived,
+because a development certificate that never expires is one that outlives the
+reason it was created.
+
+Every certificate they generate carries `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST`
+in its subject organisation, and **this library refuses one that does, however
+trust is configured — unverified mode included**. A self-signed authority that
+drifts into production is *worse* than no encryption, because everything looks
+protected and nothing is verified. Both halves are checked: an authority or
+client certificate configured in this process is refused when the connection is
+made, and one the broker presents is refused during the handshake. Java, Go and
+.NET refuse the same marker.
+
+```ruby
+Security.verified(certificate_authority: ".tls/ca.crt")
+        .allowing_development_certificates
+```
+
+A separate, visible step rather than a keyword, for the same reason
+`without_verifying_the_broker` has a long name: it has to be legible in a diff.
+It weakens nothing else — verification stays on and a certificate that does not
+verify is still refused. See [docs/security.md](docs/security.md#development-certificates).
 
 ## Patterns
 
@@ -1098,8 +1206,11 @@ method, `confirm`, that `Patterns.idempotent` calls after a handler accepts.
 
 Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport. Nothing
 else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
-`google-protobuf`, `avro` — and each of those says so by name when it is
-missing.
+`google-protobuf`, `avro` — or the [tracing adapter](#tracing), which wants
+`opentelemetry-api`. Each of those says so by name when it is missing.
+
+Encryption and the development certificates need nothing at all: both are
+written against Ruby's own OpenSSL binding.
 
 ## Development
 
@@ -1134,6 +1245,11 @@ ACEMQ_TEST_BROKER_CLIENT_CERT=certs/client.crt \
 ACEMQ_TEST_BROKER_CLIENT_KEY=certs/client.key \
 ...
 ```
+
+If you have no such broker, `./scripts/acemq-certs.rb` writes the certificates
+and a `rabbitmq.conf` that serves TLS from them. The examples that matter there
+are the ones asserting a refusal, so they need a broker presenting a certificate
+that carries the development marker — which is exactly what that command writes.
 
 The fixtures under `spec/fixtures/` are produced by the Java implementation and
 shared with Go, .NET and Python. They are the definition of "the same contract",

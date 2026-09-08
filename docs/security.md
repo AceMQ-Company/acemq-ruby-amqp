@@ -143,6 +143,78 @@ machine where being wrong costs nothing. Even there,
 `certificate_authority:` on `verified` is about four seconds more work and is
 correct.
 
+## Development certificates
+
+Running with TLS on your own machine needs a certificate authority, a broker
+certificate and a client certificate, and generating them by hand with `openssl`
+is an afternoon nobody has. This writes them:
+
+```console
+$ ./scripts/acemq-certs.rb --out .tls --broker localhost --days 30
+```
+
+or from Ruby:
+
+```ruby
+AceMQ::AMQP::DevelopmentCertificates.generate(directory: ".tls", broker_host: "localhost")
+```
+
+Seven files, under the same names Go's `acemq-certs` and .NET's
+`AceMq.Amqp.DevCerts` write, so the three generators are interchangeable:
+`ca.crt`, `ca.key`, `server.crt`, `server.key`, `client.crt`, `client.key`, and
+a `rabbitmq.conf` that serves TLS from them. Keys are written `0600`.
+Certificates are short-lived by default, because one that never expires is one
+that outlives the reason it was created.
+
+### They cannot reach production
+
+Every certificate these generate carries
+
+```
+ACEMQ DEVELOPMENT ONLY - DO NOT TRUST
+```
+
+in its subject organisation, and **this library refuses one that does, however
+trust is configured — unverified mode included**. That is the point: a
+self-signed authority that drifts into production is *worse* than no
+encryption, because everything looks protected and nothing is verified. These
+fail closed instead. Java, Go and .NET all refuse the same marker.
+
+Both halves are checked, because they are different mistakes:
+
+- **What this process was configured with.** A certificate authority or client
+  certificate carrying the marker is refused when the connection is made,
+  before a socket is opened. A deployment pointed at `certs/ca.crt` from
+  somebody's laptop is a deployment that trusts an authority anybody can
+  regenerate.
+- **What the broker presented.** Read during the handshake and refused there.
+  In unverified mode this takes some doing: bunny sets the context to
+  `VERIFY_NONE`, and OpenSSL does not act on a verify callback's answer in that
+  mode at all — so the mode is raised to `VERIFY_PEER` and the callback then
+  accepts everything `VERIFY_NONE` did, everything except the marker.
+  Hostname checking is turned off explicitly so that raising the mode does not
+  quietly change what unverified means. Go does the same thing with
+  `InsecureSkipVerify` and a `VerifyPeerCertificate`, and for the same reason:
+  unverified is the configuration a development certificate is likeliest to
+  slip through, because everything else has already been turned off.
+
+OpenSSL reports whatever the last chain error was, so the exception says
+`certificate verify failed` and not why anybody said no. The reason is written
+to stderr immediately above it, naming the marker and what to do about it.
+
+### Saying that is what you meant
+
+```ruby
+security = Security.verified(certificate_authority: ".tls/ca.crt")
+                   .allowing_development_certificates
+```
+
+A separate, visible step rather than a keyword on the constructors, for the same
+reason `without_verifying_the_broker` has a long name: it has to be legible in a
+diff. It weakens nothing else — verification stays on, the authority stays
+whatever it was, and a certificate that does not verify is still refused. This
+only stops the marker itself being the reason.
+
 ## Credentials
 
 `Credentials` exists so the password does not have to be in the URL.
@@ -260,6 +332,6 @@ are the only place that proves a connection which should fail does.
 
 - [Getting started](getting-started.md) — where `security:` and `credentials:`
   are passed
-- [Metrics and health](observability.md) — serve them on a port the ingress does
+- [Metrics, tracing and health](observability.md) — serve them on a port the ingress does
   not publish
 - [Licence](licence.md) — provided without warranty, this page included

@@ -10,6 +10,70 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **Payload encryption.** `EncryptedCodec` wraps any other codec and encrypts
+  what it produced with AES-GCM, so the broker, its disk, its backups and its
+  management interface hold ciphertext. `Keyring` holds more than one key so a
+  key can be rotated while messages written with the old one are still queued,
+  and `EncryptedCodec.key_id_of` tells an operator which key a message needs
+  without holding any of them.
+
+  The framing is the Java library's, byte for byte:
+
+  ```
+  0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
+  ```
+
+  The header is the GCM associated data, so a key identifier altered in flight
+  makes the message fail to open rather than opening as something else. The
+  content type is `application/vnd.acemq.encrypted`, deliberately not a `+json`
+  type whatever the plaintext underneath is. `spec/crypto_spec.rb` pins the
+  layout against a fixed key, a fixed nonce and a fixed plaintext, and reads a
+  body produced by the Java library's own `EncryptedCodec`.
+
+  **The other libraries do not agree with each other about this format yet.**
+  Go writes no magic byte and a two-byte big-endian key identifier length;
+  .NET writes no magic byte, a 16-byte IV, AES-256-CBC and a 32-byte
+  HMAC-SHA-256 tag. All three put the same content type on the message. This
+  library reads and writes Java's, which is the only one of the three whose
+  first byte identifies the format at all.
+- **Development certificates, and a refusal to trust one.** `Security` now
+  refuses any certificate carrying `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST`,
+  however trust is configured — unverified mode included, which is the
+  configuration one is likeliest to slip through. Both halves are checked: a
+  certificate authority or client certificate configured in this process is
+  refused when the connection is made, and one the broker presents is refused
+  during the handshake. `Security#allowing_development_certificates` is the
+  visible, deliberate opt-in, and it weakens nothing else.
+
+  `DevelopmentCertificates.generate` writes the authority, broker certificate
+  and client certificate a local TLS broker needs, under the same six filenames
+  as Go's `acemq-certs` and .NET's `AceMq.Amqp.DevCerts`, plus a
+  `rabbitmq.conf` that serves TLS from them. `./scripts/acemq-certs.rb` is the
+  command-line form. Nothing is added to the gem: Ruby's OpenSSL binding writes
+  the certificates and the script is not installed on anybody's PATH.
+- **An OpenTelemetry adapter.** `Telemetry::OpenTelemetry` emits spans for
+  publishes and deliveries and joins them across the broker:
+  `tracing.install(mq)` registers it on both sides of a connection. The trace
+  travels in `traceparent` and `tracestate` — the W3C names, deliberately not
+  `x-acemq-` prefixed, because other tooling already recognises them and the
+  Java library writes the same two.
+
+  Spans are named `<destination> publish`, `<queue> process` and
+  `<destination> request`, with PRODUCER, CONSUMER and CLIENT kinds; CLIENT for
+  a request because that span waits for an answer and its duration means
+  something different as a result. The consumer span's parent is extracted from
+  the message's own headers rather than from ambient context, which is the
+  entire point of tracing a message system. `unroutable`, `failed` and
+  `dead_lettered` set the span status to error; `acked`, `retried` and
+  `rejected` do not. A retry, a dead letter, an outbox failure and a finished
+  pipeline run are events on the span already open rather than spans of their
+  own.
+
+  `opentelemetry-api` is a development dependency, required lazily, and raises
+  `DependencyMissing` naming the gem when it is absent. The gemspec still
+  declares no runtime dependencies. The specs assert on spans emitted through
+  the SDK's in-memory exporter rather than on doubles.
+
 - **Five more codecs: YAML, TOML, XML, Protocol Buffers and Avro.** The gem
   shipped JSON, string and bytes, while Java and Go both shipped all five of
   these — so a Java or Go service publishing any of them produced a message

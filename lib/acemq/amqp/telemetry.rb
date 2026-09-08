@@ -14,6 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The OpenTelemetry adapter, in a file of its own because it is a page of
+# reasoning rather than a method. Loading it costs nothing that is not already
+# paid for: it reaches for the opentelemetry-api gem when one is built, not when
+# this file is read, so a process counting messages and tracing none of them
+# installs nothing.
+require_relative "telemetry/open_telemetry"
+
 module AceMQ
   module AMQP
     # What the library counts, and where it sends the numbers.
@@ -34,9 +41,10 @@ module AceMQ
     #
     # Three methods and no dependency, deliberately. Depending on a metrics gem
     # would put every service using this library on the same one, and the choice
-    # between Prometheus, OpenTelemetry, statsd and a log line belongs to the
-    # application. {Registry} is here for when the numbers themselves are all
-    # that is wanted.
+    # between Prometheus, statsd and a log line belongs to the application.
+    # {Registry} is here for when the numbers themselves are all that is
+    # wanted, and {OpenTelemetry} for spans, which are a different shape
+    # again and live in an interceptor rather than in an observer.
     #
     # Every method is called on the path a message takes, from whatever thread
     # is publishing or handling, so an observer has to be safe to call from

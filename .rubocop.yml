@@ -36,6 +36,15 @@ Metrics/MethodLength:
 # mapping, in one place, next to the names it maps.
 Metrics/AbcSize:
   Max: 35
+Metrics/ModuleLength:
+  Exclude:
+    # Generating a certificate is a fixed list of fields, extensions and files,
+    # and the list is the contract: the subject alternative names, the key
+    # usages and the six filenames all have to match what the Go, Java and .NET
+    # generators write or the certificates are not interchangeable. Splitting it
+    # to score under a hundred twice would put half that list in each half.
+    - lib/acemq/amqp/dev_certificates.rb
+
 Metrics/ClassLength:
   Max: 200
   Exclude:

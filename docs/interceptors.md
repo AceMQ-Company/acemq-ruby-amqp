@@ -171,5 +171,5 @@ meant to take four minutes.
   left
 - [Patterns: pipelines](patterns.md#pipelines-and-middleware) — the per-handler
   version
-- [Metrics and health](observability.md) — the metrics you would otherwise write
+- [Metrics, tracing and health](observability.md) — the metrics you would otherwise write
   an interceptor for

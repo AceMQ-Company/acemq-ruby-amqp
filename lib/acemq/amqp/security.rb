@@ -68,6 +68,17 @@ module AceMQ
       # Do not encrypt.
       DISABLED = :disabled
 
+      # What every certificate the AceMQ development tooling generates carries
+      # in its subject.
+      #
+      # A certificate holding it is refused on every path, including
+      # {UNVERIFIED}, unless {#allowing_development_certificates} says
+      # otherwise. The point is that a development certificate reaching a
+      # production broker should be an error rather than a thing that quietly
+      # works because somebody turned verification off to get past a different
+      # problem. The same string in Java, Go, .NET and here.
+      DEVELOPMENT_MARKER = "ACEMQ DEVELOPMENT ONLY - DO NOT TRUST"
+
       # The lowest version this library will negotiate.
       #
       # 1.0 and 1.1 have been deprecated since 2021 and RabbitMQ turns them off
@@ -99,14 +110,18 @@ module AceMQ
       # @param key [String, nil] path to that certificate's private key, PEM
       # @param credentials [Credentials, #call, nil] the broker login
       # @param reason [String, nil] why verification is off, when it is
+      # @param allow_development_certificates [Boolean] whether a certificate
+      #   carrying {DEVELOPMENT_MARKER} is acceptable here. See
+      #   {#allowing_development_certificates}, which is how it is normally set
       def initialize(mode:, certificate_authority: nil, certificate: nil, key: nil,
-                     credentials: nil, reason: nil)
+                     credentials: nil, reason: nil, allow_development_certificates: false)
         @mode = mode
         @certificate_authority = readable_files(certificate_authority, "certificate authority")
         @certificate = readable_file(certificate, "client certificate")
         @key = readable_file(key, "client private key")
         @credentials = credentials
         @reason = reason
+        @allow_development_certificates = allow_development_certificates
         check_client_certificate_is_a_pair!
         freeze
       end
@@ -239,6 +254,51 @@ module AceMQ
       # Whether a client certificate is presented.
       def client_certificate? = !certificate.nil?
 
+      # Whether a certificate carrying {DEVELOPMENT_MARKER} is acceptable.
+      def allowing_development_certificates? = @allow_development_certificates
+
+      # A copy that accepts the certificates the AceMQ development tooling
+      # generates.
+      #
+      #   security = Security.verified(certificate_authority: ".tls/ca.crt")
+      #                      .allowing_development_certificates
+      #
+      # A separate, visible step rather than a keyword on the constructors, and
+      # for the same reason {without_verifying_the_broker} has a long name: it
+      # has to be legible in a diff. Turning it on is saying "the broker this
+      # process reaches is a development broker", and the whole value of the
+      # marker is that saying so is a decision somebody made on purpose.
+      #
+      # It does not weaken anything else. Verification stays on, the authority
+      # stays whatever it was, and a certificate that does not verify is still
+      # refused — this only stops the marker itself being the reason.
+      #
+      # @return [Security]
+      def allowing_development_certificates
+        copy(allow_development_certificates: true)
+      end
+
+      # Whether a certificate is one the AceMQ development tooling generated.
+      #
+      # The subject *and* the issuer, because a leaf signed by a marked
+      # authority is a development certificate whether or not it says so
+      # itself — and in a chain where only the leaf is presented, the issuer is
+      # the only place the marker appears.
+      #
+      # @param certificate [OpenSSL::X509::Certificate, nil]
+      # @return [Boolean]
+      def self.development_certificate?(certificate)
+        return false if certificate.nil?
+
+        marker = DEVELOPMENT_MARKER.upcase
+        [certificate.subject, certificate.issuer]
+          .any? { |name| name.to_s.upcase.include?(marker) }
+      rescue StandardError
+        # A certificate that will not describe itself is not evidence of the
+        # marker. Whatever else is wrong with it, the handshake will say so.
+        false
+      end
+
       # The login, resolved now.
       #
       # Resolution happens here rather than in the constructor so a block that
@@ -249,10 +309,7 @@ module AceMQ
       def resolved_credentials = Credentials.resolve(credentials)
 
       # A copy with a different login.
-      def with_credentials(other)
-        self.class.new(mode: mode, certificate_authority: certificate_authority,
-                       certificate: certificate, key: key, credentials: other, reason: reason)
-      end
+      def with_credentials(other) = copy(credentials: other)
 
       # The bunny options this describes.
       #
@@ -262,7 +319,10 @@ module AceMQ
       # opinion from a URL as an instruction not to verify.
       #
       # @return [Hash]
+      # @raise [ConfigurationError] when this process was configured with a
+      #   development certificate and has not said that is what it meant
       def to_transport_options
+        check_development_certificates!
         options = { tls: encrypted? }
         options[:verify_peer] = verifying? if encrypted?
         options[:tls_ca_certificates] = certificate_authority if certificate_authority
@@ -273,7 +333,8 @@ module AceMQ
         options.merge(resolved_credentials&.to_transport_options || {})
       end
 
-      # Settles the TLS versions on a session that has not started yet.
+      # Settles the TLS versions, and the refusal of development certificates,
+      # on a session that has not started yet.
       #
       # Everything else this class configures goes through the options hash;
       # this cannot, because bunny builds its SSL context from that hash and
@@ -299,6 +360,7 @@ module AceMQ
         transport.configure_tls_context do |context|
           context.min_version = MINIMUM_TLS_VERSION
           context.max_version = MAXIMUM_TLS_VERSION
+          refuse_development_certificates(context)
         end
         nil
       end
@@ -313,6 +375,7 @@ module AceMQ
         parts << "clientCertificate=#{certificate}" if client_certificate?
         parts << "credentials=(#{credentials_description})" unless credentials.nil?
         parts << "because=#{reason.inspect}" if reason
+        parts << "developmentCertificates=allowed" if allowing_development_certificates?
         parts.join(" ")
       end
 
@@ -320,7 +383,137 @@ module AceMQ
         "#<AceMQ::AMQP::Security #{self}>"
       end
 
+      # The verify callback that refuses the marker and decides nothing else.
+      #
+      # In verifying mode OpenSSL's own verdict stands for everything that is
+      # not marked; in unverified mode everything that is not marked is
+      # accepted, which is what unverified meant before this existed.
+      #
+      # It never raises. An exception from inside a verify callback is caught by
+      # OpenSSL and turned into a bare "certificate verify failed", so the
+      # reason is written to stderr instead, immediately above the failure.
+      #
+      # @param verifying [Boolean] whether the chain is being checked as well
+      # @return [Proc]
+      # @api private
+      def self.marker_refusing_callback(verifying)
+        lambda do |trusted, store|
+          certificate = store.current_cert
+          if development_certificate?(certificate)
+            complain_about(certificate)
+            next false
+          end
+
+          verifying ? trusted : true
+        rescue StandardError
+          # A callback that raises is a callback whose answer OpenSSL cannot
+          # read, and the safe reading of "I do not know" is no.
+          false
+        end
+      end
+
+      # @api private
+      def self.complain_about(certificate)
+        warn("acemq: the broker presented a certificate marked " \
+             "#{DEVELOPMENT_MARKER.inspect} (subject #{certificate.subject}). It was " \
+             "generated for development and is not trusted, however this connection is " \
+             "otherwise configured. If this really is a development broker, say so with " \
+             "Security#allowing_development_certificates.")
+      end
+
+      # Whether a PEM file holds a certificate carrying the marker.
+      #
+      # @api private
+      def self.development_certificate_file?(path)
+        return false if path.nil?
+
+        File.read(path)
+            .scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m)
+            .any? { |pem| development_certificate?(OpenSSL::X509::Certificate.new(pem)) }
+      rescue StandardError
+        # Unreadable, or not a certificate at all. Neither is the marker, and
+        # both are reported by something better placed to explain them.
+        false
+      end
+
       private
+
+      # A copy of this one with some fields replaced.
+      def copy(**changes)
+        self.class.new(
+          mode: changes.fetch(:mode, mode),
+          certificate_authority: changes.fetch(:certificate_authority, certificate_authority),
+          certificate: changes.fetch(:certificate, certificate),
+          key: changes.fetch(:key, key),
+          credentials: changes.fetch(:credentials, credentials),
+          reason: changes.fetch(:reason, reason),
+          allow_development_certificates: changes.fetch(:allow_development_certificates,
+                                                        allowing_development_certificates?)
+        )
+      end
+
+      # Refuses, at the handshake, a broker whose certificate carries the
+      # marker — in every mode, which is the part that takes some doing.
+      #
+      # In {UNVERIFIED} mode bunny sets the context to +VERIFY_NONE+, and
+      # OpenSSL does not consult a verify callback's answer at all in that mode:
+      # "the handshake will be continued regardless of the verification result".
+      # So the mode is raised to +VERIFY_PEER+ here and the callback then
+      # accepts everything the way +VERIFY_NONE+ did — everything except the
+      # marker. Hostname checking is turned off explicitly, because raising the
+      # mode would otherwise switch it on and change what unverified means.
+      #
+      # This is the same shape Go uses: +InsecureSkipVerify+ with a
+      # +VerifyPeerCertificate+ that refuses the marker, for exactly the reason
+      # that unverified is the configuration a development certificate is most
+      # likely to slip through.
+      def refuse_development_certificates(context)
+        return if allowing_development_certificates?
+
+        unless verifying?
+          context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+          context.verify_hostname = false if context.respond_to?(:verify_hostname=)
+        end
+
+        # Read once rather than per certificate: the callback runs on the
+        # handshake's thread and must be cheap and must not reach for anything
+        # that could have changed underneath it.
+        verifying = verifying?
+        context.verify_callback = self.class.marker_refusing_callback(verifying)
+      end
+
+      # Refuses a certificate authority or a client certificate that was
+      # generated for development, before anything opens a socket.
+      #
+      # The handshake check above covers what the *broker* presents. This covers
+      # what this process was configured with, and it is the half that can be
+      # caught without a broker in the room: a deployment pointed at
+      # +certs/ca.crt+ from somebody's laptop is a deployment that trusts an
+      # authority anybody can regenerate.
+      #
+      # At {#to_transport_options} rather than in the constructor, unlike the
+      # file readability checks. A constructor that refused would make
+      # +Security.verified(ca).allowing_development_certificates+ impossible to
+      # write, because the refusal would happen before the sentence finished.
+      # This is the moment a connection is being made, which is the moment the
+      # question is actually being asked.
+      def check_development_certificates!
+        return if allowing_development_certificates?
+
+        offending = [[certificate_authority, "certificate authority"],
+                     [certificate, "client certificate"]].flat_map do |paths, what|
+          Array(paths).select { |path| self.class.development_certificate_file?(path) }
+                      .map { |path| "the #{what} #{path}" }
+        end
+        return if offending.empty?
+
+        raise ConfigurationError,
+              "#{offending.join(" and ")} carries #{DEVELOPMENT_MARKER.inspect}. It was " \
+              "generated by the AceMQ development tooling and is refused here, because an " \
+              "authority anybody can regenerate is not one to verify a production broker " \
+              "against. If this really is a development broker, say so with " \
+              "Security#allowing_development_certificates."
+      end
 
       # Says a login is configured without asking for it. Resolving a block
       # here would run somebody's secret-fetching code because a logger dumped

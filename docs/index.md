@@ -82,10 +82,23 @@ queue is a quorum queue, because `x-queue-type` is part of a queue's identity to
 the broker and the second service to declare `orders` differently cannot consume
 at all. See [queue types](topology.md#queue-types).
 
-**Numbers and an honest readiness answer.** Metric names shared with the other
-four libraries, an in-memory registry with a Prometheus renderer, and a health
-report that calls a stopped consumer under a live connection *degraded* rather
-than down. See [metrics and health](observability.md).
+**Numbers, traces and an honest readiness answer.** Metric names shared with the
+other four libraries, an in-memory registry with a Prometheus renderer, an
+OpenTelemetry adapter that joins a handler's span to the publish that caused it
+across processes and minutes, and a health report that calls a stopped consumer
+under a live connection *degraded* rather than down. See
+[metrics, tracing and health](observability.md).
+
+**A body the broker cannot read.** `EncryptedCodec` wraps whichever codec you
+already use and encrypts what it produced with AES-GCM, with a keyring so a key
+can be rotated while messages written with the old one are still queued. See
+[encrypting the body](serialization.md#encrypting-the-body).
+
+**Development certificates that cannot reach production.** One command writes
+the authority and certificates a local TLS broker needs, and every one of them
+is stamped so that this library refuses it however trust is configured —
+unverified mode included. See
+[development certificates](security.md#development-certificates).
 
 **The things everybody writes anyway, written once.** Idempotency, the outbox,
 request and reply, replay, ordering, consumer groups, routing slips, pipelines,
@@ -149,6 +162,7 @@ gem "rexml", "~> 3.3"             # XMLCodec. Ships with Ruby, but is a bundled
                                   # gem since 3.4, so Bundler needs it named.
 gem "google-protobuf", "~> 4.29"  # ProtobufCodec
 gem "avro", "~> 1.12"             # AvroCodec
+gem "opentelemetry-api", "~> 1.8" # Telemetry::OpenTelemetry
 ```
 
 Nothing is published to rubygems.org yet, so for now this is a git or path
@@ -163,12 +177,16 @@ has to happen before it is.
 - [Exchanges, queues and bindings](topology.md)
 - [The envelope](envelope.md) — what travels with a message
 - [Codecs](serialization.md) — turning a payload into bytes and back, in JSON,
-  YAML, TOML, XML, Protobuf, Avro, text or raw bytes
+  YAML, TOML, XML, Protobuf, Avro, text or raw bytes, and
+  [encrypted](serialization.md#encrypting-the-body) with AES-GCM
 - [Interceptors](interceptors.md) — the seam around publish and handle
-- [Security](security.md) — TLS, trust and credentials
+- [Security](security.md) — TLS, trust, credentials and
+  [development certificates](security.md#development-certificates) that cannot
+  reach production
 - [Retries, dead letters and shutdown](reliability.md)
 - [Patterns](patterns.md) — idempotency, outbox, request-reply, replay and nine more
-- [Metrics and health](observability.md)
+- [Metrics, tracing and health](observability.md) — including the
+  [OpenTelemetry adapter](observability.md#tracing)
 - [Testing without a broker](testing.md)
 - [API reference](api/index.html) — every public class and method, from YARD
 

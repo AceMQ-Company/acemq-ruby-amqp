@@ -229,15 +229,19 @@ RSpec.describe AceMQ::AMQP::Security do
 
   describe "#configure" do
     # A context that remembers what was set on it, because OpenSSL's own has
-    # writers for these two and no readers, so there is no way to ask a real one
-    # what it was told. That it works on a real one is proved by the integration
-    # spec, which reads the version off a socket that actually negotiated.
+    # writers for these and mostly no readers, so there is no way to ask a real
+    # one what it was told. That it works on a real one is proved by the
+    # integration spec, which reads the version off a socket that actually
+    # negotiated and watches a marked certificate be refused by a real broker.
     def recording_context
       context = Object.new
       context.instance_variable_set(:@versions, {})
       context.define_singleton_method(:versions) { @versions }
       context.define_singleton_method(:min_version=) { |v| @versions[:min] = v }
       context.define_singleton_method(:max_version=) { |v| @versions[:max] = v }
+      context.define_singleton_method(:verify_mode=) { |v| @versions[:verify_mode] = v }
+      context.define_singleton_method(:verify_hostname=) { |v| @versions[:verify_hostname] = v }
+      context.define_singleton_method(:verify_callback=) { |v| @versions[:verify_callback] = v }
       context
     end
 
@@ -276,6 +280,49 @@ RSpec.describe AceMQ::AMQP::Security do
     # it must leave a working connection rather than an exception.
     it "does nothing when bunny offers no such hook" do
       expect { described_class.verified.configure(Object.new) }.not_to raise_error
+    end
+
+    it "installs the check that refuses a development certificate" do
+      context = recording_context
+
+      described_class.verified.configure(session_holding(context))
+
+      expect(context.versions[:verify_callback]).to respond_to(:call)
+    end
+
+    # The awkward case, and the one worth spelling out. bunny sets VERIFY_NONE
+    # for an unverified connection, and OpenSSL does not act on a verify
+    # callback's answer in that mode — "the handshake will be continued
+    # regardless of the verification result" — so the mode has to be raised for
+    # the callback to be consulted at all. Hostname checking is then turned off
+    # explicitly, because raising the mode would otherwise switch it on and
+    # quietly change what unverified means.
+    it "raises the verify mode in unverified mode, and turns hostname checking off" do
+      context = recording_context
+
+      described_class.without_verifying_the_broker(because: "a spec")
+                     .configure(session_holding(context))
+
+      expect(context.versions[:verify_mode]).to eq(OpenSSL::SSL::VERIFY_PEER)
+      expect(context.versions[:verify_hostname]).to be(false)
+      expect(context.versions[:verify_callback]).to respond_to(:call)
+    end
+
+    it "leaves the mode alone when verifying, because bunny already set it" do
+      context = recording_context
+
+      described_class.verified.configure(session_holding(context))
+
+      expect(context.versions).not_to have_key(:verify_mode)
+    end
+
+    it "installs nothing once somebody has said it is a development broker" do
+      context = recording_context
+
+      described_class.verified.allowing_development_certificates
+                     .configure(session_holding(context))
+
+      expect(context.versions).not_to have_key(:verify_callback)
     end
   end
 end

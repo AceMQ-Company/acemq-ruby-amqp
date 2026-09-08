@@ -272,10 +272,116 @@ One thing it does **not** rewrite: a symbol key goes on the wire as `:name`,
 because that is how YAML spells a Ruby symbol and this library does not quietly
 rename keys. No other language reads `:name` as `name` — spell keys as strings.
 
-## What is not here
+## Encrypting the body
 
-Encryption of message bodies. There is no cross-language contract for it yet,
-and one invented here would be one the other AceMQ libraries could not read.
+`EncryptedCodec` wraps any of the codecs above and encrypts what it produced,
+so the broker, its disk, its backups and everybody who can read its management
+interface see ciphertext:
+
+```ruby
+keys = AceMQ::AMQP::Keyring.of("orders-2026-09", AceMQ::AMQP::Keys.from_base64(ENV["KEY"]))
+codec = AceMQ::AMQP::EncryptedCodec.wrapping(AceMQ::AMQP::JSONCodec.new, keys)
+
+mq = AceMQ::AMQP::Connection.open(url, codec: codec)
+```
+
+It wraps a delegate rather than serialising anything itself, so choosing a
+format and choosing to encrypt stay independent: JSON in, AES-GCM out, and Avro
+just as well. AES-GCM through Ruby's OpenSSL binding — nothing here hand-rolls a
+cipher — with a fresh nonce per message from OpenSSL's own source. Reusing a
+nonce under GCM does not weaken the encryption, it forfeits it, so a counter is
+not an option however tempting it looks.
+
+### What is on the wire
+
+```
+0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
+```
+
+**The key identifier travels in the clear**, and that is what makes rotation
+possible: a consumer reads which key a message needs rather than assuming the
+current one, so a new key can be introduced while messages written with the old
+one are still queued. Putting it in an AMQP header instead would have been
+tidier and would have lost it — headers are dropped by shovels, rewritten by
+federation, and absent from a message recovered out of a backup, and a
+ciphertext whose key nobody can name is gone.
+
+The header is authenticated but not encrypted: GCM binds it as associated data,
+so an altered key identifier makes the message fail to open rather than quietly
+opening as something else.
+
+The content type is `application/vnd.acemq.encrypted`, deliberately not
+`…+json` whatever the plaintext underneath is. A `+json` suffix is a promise
+that the bytes on the wire are JSON, and every JSON-aware consumer reads it that
+way; these bytes are ciphertext.
+
+### Rotating a key
+
+A keyring writes with one key and reads with all of them:
+
+```ruby
+keys = AceMQ::AMQP::Keyring.new(
+  AceMQ::AMQP::EncryptionKey.new("orders-2026-09", september),  # writes
+  AceMQ::AMQP::EncryptionKey.new("orders-2026-06", june)        # still on some queue
+)
+
+keys.use("orders-2026-09")   # change what writes
+keys.ids                     # => ["orders-2026-06", "orders-2026-09"]; never the keys
+```
+
+Add the new key everywhere first, so every consumer can read it, and only then
+make it current somewhere. A keyring is anything answering `current` and
+`key_for`, so one backed by a key management service is a small class rather
+than a fork of this one — cache in it, because `key_for` is called for every
+message decoded.
+
+### Reading a queue you can no longer read
+
+```ruby
+AceMQ::AMQP::EncryptedCodec.key_id_of(body)   # => "orders-2026-06"
+```
+
+From the bytes alone, without the key. A dead-letter queue full of ciphertext is
+normally a key that was retired too early rather than anything wrong with the
+messages, and this answers that question for an operator who holds none of them.
+
+### What it does not do
+
+- **The broker can no longer read the message, and neither can the people who
+  operate it.** Decide what they do instead before turning this on: the answer
+  is usually a small internal tool holding the keyring rather than the
+  management interface.
+- **Encryption is not authorisation.** Every service holding the keyring can
+  read every message encrypted with those keys. The granularity is the key, so
+  separate audiences mean separate keys.
+- **It does not authenticate the sender.** Anybody holding the key can write a
+  message this codec will happily decrypt.
+- **It does not hide the routing.** Exchange, routing key, headers and message
+  size stay in the clear, and for many systems the routing key is the sensitive
+  part.
+
+A body that will not decrypt raises `DecodeError`, which is fatal — the same
+bytes fail the same way next time — and the message says which key it named and
+nothing else. It never contains the plaintext or the key, and it says the same
+thing for a wrong key as for a tampered message, because GCM cannot tell them
+apart and an error that could would be an oracle.
+
+### The other libraries do not agree about this yet
+
+Java, Go and .NET all write `application/vnd.acemq.encrypted` and all three
+write different bytes:
+
+| | magic | key id length | IV / nonce | cipher | tag |
+| --- | --- | --- | --- | --- | --- |
+| **Java, Ruby** | `0xAE` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes, AAD = header |
+| Go | none | 2 bytes, big-endian | 12-byte nonce | AES-GCM | 16 bytes, AAD = header |
+| .NET | none | 1 byte | 16-byte IV | AES-256-CBC | 32-byte HMAC-SHA-256 |
+
+This library writes Java's, which is the only one of the three whose first byte
+identifies the format at all. A Ruby consumer reads a Java producer's encrypted
+messages and neither reads Go's or .NET's, and `spec/crypto_spec.rb` pins the
+exact layout so that whoever converges the other two has something to converge
+against.
 
 ## Next
 

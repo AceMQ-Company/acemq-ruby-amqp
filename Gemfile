@@ -36,6 +36,23 @@ group :development, :test do
   # google-protobuf: 1.20 raised its floor to Ruby 3.2, and this gem still
   # promises 3.1. Only on 3.1, because 1.17 does not work with Ruby 4's json.
   gem "multi_json", "~> 1.17.0" if RUBY_VERSION < "3.2"
+  # The OpenTelemetry adapter requires this lazily and names it when it is
+  # missing, the way the transport does with bunny and the codecs do with avro.
+  # Not in the gemspec: a service that publishes messages and traces nothing
+  # should not be made to install a tracing API to do it.
+  #
+  # Held back below Ruby 3.3, for the same reason as google-protobuf above:
+  # opentelemetry-api raised its floor to 3.3 at 1.9 and the SDK did at 1.11,
+  # while this gem still promises 3.1 and CI still builds on it. The adapter
+  # itself is pure Ruby and runs on 3.1 perfectly well. Both lines go when 3.1
+  # does.
+  gem "opentelemetry-api", RUBY_VERSION < "3.3" ? "~> 1.8.0" : "~> 1.8"
+  # Only for the specs. The adapter needs the API and nothing else; the SDK is
+  # here because its in-memory span exporter is the only way to assert on the
+  # spans that were actually emitted rather than on a double's having been
+  # called, and a tracing adapter tested against doubles proves that it calls
+  # methods, not that anything reaches a collector.
+  gem "opentelemetry-sdk", RUBY_VERSION < "3.3" ? "~> 1.10.0" : "~> 1.10"
   # The database-backed stores are written against a connection seam rather
   # than against a driver, and neither of these is a runtime dependency: the
   # gem still declares none, and a process that never opens a database never

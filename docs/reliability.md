@@ -368,5 +368,5 @@ is at-least-once with a guard against duplicates; see
 - [Consuming](consuming.md) — where `retry_policy:` is passed
 - [Exchanges, queues and bindings](topology.md) — declaring the rungs
 - [Patterns: replay](patterns.md#replay) — putting dead letters back
-- [Metrics and health](observability.md) — `acemq.retry.rung.missing` and the
+- [Metrics, tracing and health](observability.md) — `acemq.retry.rung.missing` and the
   dead-letter counters
