@@ -70,11 +70,27 @@ RSpec.describe "against a real broker", :integration do
     channel&.close
   end
 
+  # Removes a queue and the two this library hangs off it.
+  #
+  # The dead-letter and parking queues go with the name rather than being
+  # listed at every call site, because a consumer declares them at start-up
+  # whether the test asked for them or not: the point of ADR-032 is that a
+  # message that cannot be handled always has somewhere to land. A suite that
+  # scrubbed only the queue it named would leave two behind per test and the
+  # broker would end a run holding queues nobody declared on purpose.
+  #
+  # Rescued per name and not once around the loop, so a queue that was never
+  # there does not stop the two after it being removed.
   def scrub(*queues)
-    queues.each { |name| mq.delete_queue(name) }
-  rescue StandardError
-    # A queue that is not there is the state this wanted anyway.
-    nil
+    targets = queues.flat_map do |name|
+      [name, AceMQ::AMQP::Naming.dead_letter_queue(name), AceMQ::AMQP::Naming.parked_queue(name)]
+    end
+    targets.each do |name|
+      mq.delete_queue(name)
+    rescue StandardError
+      # A queue that is not there is the state this wanted anyway.
+      nil
+    end
   end
 
   # One argument to a line, sorted by name, which is what makes a printed table

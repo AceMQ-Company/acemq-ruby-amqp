@@ -42,7 +42,12 @@ RSpec.describe AceMQ::AMQP::Patterns::ConsumerGroup do
     # Four identical rows in a management interface tell nobody anything.
     described_class.new(mq, "orders.new", size: 3) { AceMQ::AMQP::Ack.accept }
 
-    expect(transport.declared_queues).to be_empty
+    # The queue being consumed is somebody else's, and a group of three does
+    # not get three votes on what kind of queue it is. What each member does
+    # declare is its own dead-letter half, which is idempotent and names no
+    # queue but the two it owns.
+    expect(transport.declared_queues.map(&:first).uniq)
+      .to eq(["orders.new.dlq", "orders.new.parked"])
     tags = transport.instance_variable_get(:@subscribers)["orders.new"].size
     expect(tags).to eq(3)
   end

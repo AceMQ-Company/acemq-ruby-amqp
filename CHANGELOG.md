@@ -42,6 +42,20 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **A consumer declares its dead-letter queues at start-up** — `acemq.dlx`,
+  `{queue}.dlq`, `{queue}.parked` and the two bindings that reach them — in
+  addition to the retry exchange, the rungs and the binding home it already
+  declared. A consumer that gives up republishes to `{queue}.dlq` through the
+  default exchange, which drops what it cannot route without a word, so on a
+  broker where the topology was never applied the dead letter that would have
+  reported the mistake was the thing that vanished. The dead-letter half goes
+  out whether or not there is a retry policy, since `RetryPolicy.none` gives up
+  on the first failure; the retry exchange is still declared only when there
+  are rungs to reach through it. Applying a `Topology` first and then starting
+  a consumer, or the other way round, declares the same queues with the same
+  arguments and is not a `PRECONDITION_FAILED` either way. Java has always done
+  this; ADR-032 brought the other four libraries into line, and the contract
+  fixture already marked these five entries `both`.
 - **`retry_threshold: 0` now means no rung queue at all**, where it previously
   sent every retry to the broker. Zero reads as "from zero, so everything" and
   is defined the other way round in Java, Go, .NET and Python: it switches the

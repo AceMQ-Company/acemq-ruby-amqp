@@ -48,6 +48,12 @@ module AceMQ
     # The rungs are exactly {RetryPolicy#schedule}, which is a finite list known
     # before anything is published — which is what makes them declarable up
     # front, by {Topology}, rather than discovered one failure at a time.
+    #
+    # {#declare} reaches one step past the ladder itself, to +{source}.dlq+ and
+    # +{source}.parked+ and the exchange they hang off. A ladder is where a
+    # message waits between attempts and those two are where it stops waiting,
+    # so a consumer that declares the one without the other has somewhere to
+    # retry and nowhere to give up — see {#declare_dead_letters}.
     class RetryLadder
       # Delays at or above this go to the broker; anything shorter waits here.
       #
@@ -198,35 +204,103 @@ module AceMQ
       # The rung queue names, in schedule order.
       def queues = @rungs.map(&:queue)
 
-      # Declares the rungs, and everything that brings an expired one home.
+      # Declares everywhere a message this consumer cannot handle is going to
+      # end up: the rungs and the way home from them, and the two queues a
+      # message lands in when there is no way home left.
       #
       # {Topology} declares the same thing up front, which is where it belongs:
       # a queue that appears in a plan somebody reviewed. This exists because
       # the cost of any of it being absent is silent — a publish into a queue
       # nobody declared is dropped, and so is an expired message with nothing
-      # bound to route it — so a retry that goes missing leaves no trace at all.
-      # Declaring is idempotent, and a duplicate declaration is a great deal
-      # cheaper than a lost message.
+      # bound to route it — so a retry or a dead letter that goes missing leaves
+      # no trace at all. Declaring is idempotent, and a duplicate declaration is
+      # a great deal cheaper than a lost message.
       #
-      # Three things, in the order the broker needs them: the exchange, then the
-      # rungs that dead-letter to it, then the one binding that carries every
-      # expired message back to the queue it came from. The binding is not
-      # optional and is not deferred until something first expires. A rung
-      # without it looks entirely healthy — the queue is there, the message goes
-      # in, the time-to-live runs out — and then the message is dropped, because
-      # an unroutable dead letter goes nowhere and says nothing.
+      # The retry half is three things, in the order the broker needs them: the
+      # exchange, then the rungs that dead-letter to it, then the one binding
+      # that carries every expired message back to the queue it came from. The
+      # binding is not optional and is not deferred until something first
+      # expires. A rung without it looks entirely healthy — the queue is there,
+      # the message goes in, the time-to-live runs out — and then the message is
+      # dropped, because an unroutable dead letter goes nowhere and says
+      # nothing.
+      #
+      # The dead-letter half is {#declare_dead_letters}, and unlike the retry
+      # half it is declared whether or not this ladder has a single rung.
       #
       # The source queue itself is not declared here. It belongs to the caller,
       # it usually has arguments of its own, and creating it as a side effect of
       # setting up its retries would be this library guessing at somebody else's
-      # queue.
+      # queue. Nothing declared here is bound to it either, except the one
+      # binding that brings an expired message home — which is the same
+      # binding a topology adds, and a binding the broker accepts against a
+      # queue this call did not create.
       #
       # @param connection [Connection, Transport] anything answering
       #   declare_exchange, declare_queue and bind
       # @return [RetryLadder] self
       def declare(connection)
-        return self if empty?
+        declare_rungs(connection) unless empty?
+        declare_dead_letters(connection)
+        self
+      end
 
+      # Declares +acemq.dlx+, +{source}.dlq+, +{source}.parked+ and the two
+      # bindings that reach them.
+      #
+      # Separate from the rungs and not conditional on them, which is the whole
+      # point of it. A consumer with no retry policy at all still dead-letters
+      # — {RetryPolicy.none} is the default, and it gives up on the first
+      # failure — so the dead-letter half is needed by every consumer this
+      # library starts, while the retry exchange is needed only by one that has
+      # somewhere to retry. Making the two conditional on the same thing would
+      # leave the commonest consumer in the library the one with nowhere to put
+      # a message it could not handle.
+      #
+      # A consumer that gives up republishes to +{source}.dlq+ through the
+      # default exchange, and the default exchange drops what it cannot route
+      # without a word: no return, no confirm failure, no log. If no topology
+      # was ever applied, that message is gone. Java's RetryTopology.declare has
+      # always closed this and the other four libraries now do too — the union
+      # of the two halves is identical on a broker somebody set up properly, and
+      # the difference only shows on one where a step was missed, which is
+      # exactly when losing the evidence costs most.
+      #
+      # Classic and durable with an empty argument table, which is what
+      # {Topology#dead_letter_queue} and {Topology#parked_queue} declare and
+      # what Java declares. Same arguments both ways round: a service that
+      # applied its topology first and then started a consumer gets a duplicate
+      # declaration rather than a PRECONDITION_FAILED, and so does one that did
+      # it the other way round.
+      #
+      # +acemq.dlx+ by name, even for a {Topology} that renamed its dead-letter
+      # exchange. The rename is a per-topology courtesy for a shared vhost; a
+      # consumer has not been shown the topology and cannot know about it, and
+      # the shared name is the one every library binds these two queues under.
+      #
+      # @param connection [Connection, Transport] anything answering
+      #   declare_exchange, declare_queue and bind
+      # @return [RetryLadder] self
+      def declare_dead_letters(connection)
+        connection.declare_exchange(Naming::DEAD_LETTER_EXCHANGE, kind: :direct, durable: true)
+        [Naming.dead_letter_queue(@source), Naming.parked_queue(@source)].each do |queue|
+          connection.declare_queue(queue, queue_type: QueueType::CLASSIC, durable: true,
+                                          arguments: {})
+          connection.bind(queue: queue, exchange: Naming::DEAD_LETTER_EXCHANGE,
+                          routing_key: queue)
+        end
+        self
+      end
+
+      def to_s
+        return "no retry rungs for #{@source}" if empty?
+
+        "retry rungs for #{@source}: #{@rungs.join(", ")}"
+      end
+
+      private
+
+      def declare_rungs(connection)
         connection.declare_exchange(Naming::RETRY_EXCHANGE, kind: :direct, durable: true)
         # Classic, said out loud rather than left to the default, which is
         # quorum. A rung is a queue the Java, Go, .NET and Python libraries
@@ -238,13 +312,6 @@ module AceMQ
                                                durable: true, arguments: rung.arguments)
         end
         connection.bind(queue: @source, exchange: Naming::RETRY_EXCHANGE, routing_key: @source)
-        self
-      end
-
-      def to_s
-        return "no retry rungs for #{@source}" if empty?
-
-        "retry rungs for #{@source}: #{@rungs.join(", ")}"
       end
     end
   end

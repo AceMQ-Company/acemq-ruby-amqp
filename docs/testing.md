@@ -252,11 +252,18 @@ as they actually stand rather than smoothed over:
 - **The jitter floor.** Java floors a jittered wait at one millisecond; the other
   four floor at zero. It only shows for a delay of a millisecond or two at a
   jitter factor near one.
-- **Who declares the dead-letter queues.** Java's consumer declares
-  `acemq.dlx`, `{queue}.dlq` and `{queue}.parked` as it starts, which is why the
-  fixture marks them `both`. Ruby's consumer declares the retry exchange, the
-  rungs and the one binding that brings an expired message home, and nothing
-  else — as Go's and .NET's do. Applying a `Topology` is what creates the rest.
+
+Who declares the dead-letter queues used to be a fourth entry here. The fixture
+marks `acemq.dlx`, `{queue}.dlq`, `{queue}.parked` and the two bindings that
+reach them `both`, meaning a topology declares them before anything runs and a
+consumer declares them again as it starts. Ruby declared only the retry half,
+as Go and .NET did. **ADR-032** settled it in Java's favour and all five
+libraries now declare both halves: the union is identical on a broker somebody
+set up properly, and the difference only shows on one where a step was missed —
+a consumer that gives up republishes to `{queue}.dlq` through the default
+exchange, which drops what it cannot route without a word. Losing the evidence
+is worst exactly when there is a mistake to find. See
+[Reliability](reliability.md#who-declares-what) for the split as it now stands.
 
 ### Keeping the copies identical
 

@@ -196,10 +196,16 @@ RSpec.describe "over TLS, against a real broker", :integration do
     let(:mq) { connect(certificate_authority: authority) }
     let(:queue) { "rbit.tls.round-trip" }
 
-    # Declared here and deleted here, and asserted absent on both sides, so a
-    # run of this file leaves the broker holding exactly what it held before.
-    # A spec that leaves a queue behind is a spec that passes on a broker it has
-    # already changed.
+    # The queue, plus the two a consumer declares for itself at start-up so
+    # that a message it cannot handle has somewhere to land. All three are
+    # removed and asserted absent, so a run of this file leaves the broker
+    # holding exactly what it held before. A spec that leaves a queue behind is
+    # a spec that passes on a broker it has already changed.
+    let(:queues) do
+      [queue, AceMQ::AMQP::Naming.dead_letter_queue(queue),
+       AceMQ::AMQP::Naming.parked_queue(queue)]
+    end
+
     before do
       next if broker.nil?
 
@@ -212,8 +218,13 @@ RSpec.describe "over TLS, against a real broker", :integration do
     after do
       next if broker.nil?
 
-      mq.transport.delete_queue(queue)
-      expect(mq.transport.queue_exists?(queue)).to be(false)
+      queues.each do |name|
+        mq.transport.delete_queue(name)
+      rescue AceMQ::AMQP::TransportError
+        # Not there is the state this wanted anyway.
+        nil
+      end
+      expect(queues.map { |name| mq.transport.queue_exists?(name) }).to all(be(false))
       mq.close
     end
 

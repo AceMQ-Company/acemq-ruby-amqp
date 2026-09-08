@@ -517,8 +517,8 @@ RSpec.describe "the cross-language contract" do
       recorder
     end
 
-    # The half a consumer declares as it starts, which is the retry ladder and
-    # nothing else.
+    # The half a consumer declares as it starts: the retry ladder, and the
+    # dead-letter wiring it republishes into when the ladder runs out.
     let(:by_consumer) do
       recorder = DeclarationRecorder.new
       ladder.declare(recorder)
@@ -579,9 +579,8 @@ RSpec.describe "the cross-language contract" do
     end
 
     it "leaves the retry exchange, the rungs and the way home to the consumer" do
-      # "consumer" and not "not topology". The entries marked "both" are the
-      # one place Ruby's split differs from Java's, and they have a section of
-      # their own below rather than a looser condition here.
+      # "consumer" and not "not topology". The entries marked "both" are
+      # declared by each half independently and are checked as such below.
       section["queues"].select { |row| row["declaredBy"] == "consumer" }.each do |row|
         expect(by_consumer.queues).to have_key(row["name"])
       end
@@ -595,14 +594,12 @@ RSpec.describe "the cross-language contract" do
   end
 
   describe "the entries the fixture says both halves declare" do
-    # A fifth divergence, and the reason the previous example says "consumer" of
-    # the rungs and stops there. Java's RetryTopology.declare also declares
-    # acemq.dlx, {queue}.dlq and {queue}.parked with their bindings, so the
-    # fixture marks those "both". Ruby's RetryLadder declares the retry
-    # exchange, the rungs and the one binding that brings an expired message
-    # home, and nothing else — which is what Go's Declare and .NET's
-    # DeclareAsync do too. Java is the odd one out; this records where Ruby
-    # actually stands rather than asserting a "both" that is not true here.
+    # ADR-032, and the reason the previous example says "consumer" of the rungs
+    # and stops there. acemq.dlx, {queue}.dlq and {queue}.parked are declared by
+    # a topology before anything runs and again by every consumer as it starts,
+    # which is what the fixture means by "both". The union is the same either
+    # way on a broker somebody set up properly; the second declaration is what
+    # stands between a dead letter and a broker where a step was missed.
     let(:shared) do
       CONTRACT["topology"].values_at("exchanges", "queues").flatten
                           .select { |row| row["declaredBy"] == "both" }
@@ -613,30 +610,48 @@ RSpec.describe "the cross-language contract" do
       expect(shared).to eq(["acemq.dlx", "orders.new.dlq", "orders.new.parked"])
     end
 
-    it "declares them from the topology, and not a second time from the consumer" do
-      recorder = DeclarationRecorder.new
-      policy = AceMQ::AMQP::RetryPolicy.exponential(6, 10.0, 300.0)
-      AceMQ::AMQP::RetryLadder.for("orders.new", policy).declare(recorder)
+    it "declares them from the topology and a second time from the consumer" do
+      # The example that fails if the split ever reopens. Each name the fixture
+      # marks "both" has to be declared by each half on its own, without the
+      # other having run.
+      by_topology = DeclarationRecorder.new
+      AceMQ::AMQP::Topology.new
+                           .queue("orders.new", dead_letter: true)
+                           .parked_queue("orders.new")
+                           .apply(by_topology)
 
-      expect(recorder.names).to eq(["acemq.retry", "orders.new.retry.40s",
-                                    "orders.new.retry.80s", "orders.new.retry.160s"])
-      expect(recorder.names & shared).to be_empty
-      # The one binding a consumer adds is the one that brings an expired
-      # message home. The dead-letter bindings are the topology's.
-      expect(recorder.bindings.map(&:exchange).uniq).to eq([AceMQ::AMQP::Naming::RETRY_EXCHANGE])
+      by_consumer = DeclarationRecorder.new
+      policy = AceMQ::AMQP::RetryPolicy.exponential(6, 10.0, 300.0)
+      AceMQ::AMQP::RetryLadder.for("orders.new", policy).declare(by_consumer)
+
+      expect(by_topology.names & shared).to eq(shared)
+      expect(by_consumer.names & shared).to eq(shared)
+      expect(by_consumer.names).to eq(["acemq.retry", "acemq.dlx",
+                                       "orders.new.retry.40s", "orders.new.retry.80s",
+                                       "orders.new.retry.160s",
+                                       "orders.new.dlq", "orders.new.parked"])
     end
 
-    it "means a dead letter goes nowhere if no topology was ever applied" do
-      # The cost of the difference, stated rather than implied. A consumer that
-      # gives up republishes through the default exchange to {queue}.dlq, and an
-      # undeclared queue swallows that publish without a word. Java's consumer
-      # declares the queue itself and cannot lose it this way; Ruby, Go and .NET
-      # all depend on the topology having been applied first. Of the two, Java's
-      # is the safer behaviour and this is the one worth changing — but changing
-      # what a consumer does to a broker on startup is a decision, not a
-      # conformance fix, so it is recorded here and left alone.
+    it "declares the same bindings from either half" do
+      CONTRACT["topology"]["bindings"].select { |row| row["declaredBy"] == "both" }
+                                      .each do |row|
+        by_consumer = DeclarationRecorder.new
+        AceMQ::AMQP::RetryLadder.for(CONTRACT["topology"]["sourceQueue"],
+                                     AceMQ::AMQP::RetryPolicy.none).declare(by_consumer)
+
+        expect(by_consumer.bound?(row["queue"], row["exchange"], row["routingKey"])).to be(true)
+      end
+    end
+
+    it "means a dead letter has somewhere to land even if no topology was applied" do
+      # The hole ADR-032 closed, kept open as an example. A consumer that gives
+      # up republishes through the default exchange to {queue}.dlq, and an
+      # undeclared queue swallows that publish without a word: no return, no
+      # confirm failure, nothing in a log. Declaring the queue at start-up is
+      # what makes the message findable afterwards, and it is declared for a
+      # consumer with RetryPolicy.none — one that gives up on the first failure
+      # and so has no rung to hang the declaration off.
       transport = FakeTransport.new
-      transport.missing!("orders.new.dlq")
       consumer = AceMQ::AMQP::Consumer.new(
         transport: transport, queue: "orders.new", codec: AceMQ::AMQP::JSONCodec.new,
         retry_policy: AceMQ::AMQP::RetryPolicy.none,
@@ -644,7 +659,13 @@ RSpec.describe "the cross-language contract" do
       )
       consumer.start(prefetch: 1, concurrency: 1, tag: nil, arguments: {})
 
-      expect(transport.declared_queues.map(&:first)).not_to include("orders.new.dlq")
+      expect(transport.declared_queues.map(&:first))
+        .to include("orders.new.dlq", "orders.new.parked")
+
+      delivery, = FakeDelivery.build(body: '{"id":1}')
+      consumer.handle(delivery)
+
+      expect(transport.published_to("orders.new.dlq").size).to eq(1)
     end
   end
 

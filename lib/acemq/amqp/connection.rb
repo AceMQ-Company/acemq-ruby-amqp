@@ -394,9 +394,16 @@ module AceMQ
       # @api private
       def start(prefetch:, concurrency:, tag:, arguments:)
         # Declared before anything is subscribed, and not on the failure path.
-        # A rung that does not exist loses the message rather than reporting
-        # anything — the default exchange drops what it cannot route — so the
-        # moment to find out is the one where nothing has failed yet.
+        # A rung, a dead-letter queue or a parking queue that does not exist
+        # loses the message rather than reporting anything — the default
+        # exchange drops what it cannot route — so the moment to find out is the
+        # one where nothing has failed yet.
+        #
+        # Both halves, and the dead-letter half even for a consumer with no
+        # retry policy: this consumer republishes to +{queue}.dlq+ and
+        # +{queue}.parked+ by name whatever its policy says, and a topology
+        # nobody remembered to apply must not be the difference between a dead
+        # letter somebody can read and one that never existed.
         @ladder.declare(@transport)
         @subscription = @transport.subscribe(
           @queue, prefetch: prefetch, concurrency: concurrency, tag: tag, arguments: arguments

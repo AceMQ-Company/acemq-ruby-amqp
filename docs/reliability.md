@@ -205,6 +205,68 @@ the one place the five libraries do not yet agree: a sub-second rung is
 Java. It is unreachable behind the default threshold, and it is
 [recorded rather than resolved](testing.md#the-disagreements-it-records).
 
+## Who declares what
+
+Two halves, and they overlap on purpose.
+
+A **`Topology`** is the half a deployment applies before anything runs: the
+exchange a service reads from, its queue, the queue's dead-letter arguments, and
+the retry ladder when the queue is declared with a policy. It is a plan somebody
+reviewed, and it is where all of this belongs.
+
+A **consumer** declares its own share of it again as it starts, through
+`RetryLadder#declare`:
+
+| | `Topology` | consumer |
+|---|---|---|
+| `orders` (the exchange it reads from) | yes | no |
+| `orders.new` (the source queue) | yes | no |
+| `orders.new` bound to `orders` | yes | no |
+| `acemq.retry` | yes | yes, when there are rungs |
+| `orders.new.retry.40s` and the rest | yes | yes, when there are rungs |
+| `orders.new` bound to `acemq.retry` | yes | yes, when there are rungs |
+| `acemq.dlx` | yes | **always** |
+| `orders.new.dlq`, `orders.new.parked` | yes | **always** |
+| both bound to `acemq.dlx` | yes | **always** |
+
+The overlap costs nothing: declaring a queue that already exists with the same
+arguments is how AMQP is meant to be used, and the arguments are the same
+arguments — classic, durable, empty table — so a service that applied its
+topology first and then started a consumer gets a duplicate declaration rather
+than a `PRECONDITION_FAILED`, and so does one that did it the other way round.
+
+What the overlap buys is the case where the topology was never applied. **A
+consumer that gives up republishes to `{queue}.dlq` through the default
+exchange, and the default exchange drops what it cannot route without a word** —
+no return, no failed confirm, nothing in a log. On a broker where a deployment
+step was missed, the dead letter that would have told you so is the thing that
+disappears. Declaring the queue at start-up is what makes it findable.
+
+The dead-letter half is declared **whether or not there is a retry policy**, and
+the retry half only when there are rungs. `RetryPolicy.none` is the library
+default and gives up on the first failure, so a consumer with no policy at all
+is the one that dead-letters soonest; hanging the declaration off having
+somewhere to retry would leave exactly that consumer with nowhere to give up. A
+retry exchange, on the other hand, is of no use to a consumer with no rung to
+publish into, so it is not declared for one.
+
+Two things a consumer does **not** declare: the source queue, which belongs to
+whoever set the service up and whose type and arguments this library would have
+to guess at — a guess of classic against a quorum queue is a `PRECONDITION_FAILED`
+that stops the consumer starting at all — and anything bound to it beyond the
+one binding that brings an expired message home. The two dead-letter bindings
+are to queues the consumer declared itself, so nothing here needs the source
+queue to have been declared by the same call.
+
+`acemq.dlx` goes out under its shared name even for a `Topology` that renamed
+its dead-letter exchange. The rename is a per-topology courtesy for a shared
+vhost; a consumer has not been shown the topology and has no way to know.
+
+This is **ADR-032**, and it brought Ruby into line with Java, which had always
+done it this way. All five libraries now agree; the fixture marks the shared
+entries `both`, and `spec/contract_spec.rb` fails if either half stops
+declaring them.
+
 ## Giving up
 
 A message is dead-lettered when the policy has no attempt left, or the message

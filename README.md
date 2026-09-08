@@ -196,6 +196,19 @@ deferred — `RetryLadder#declare` and `Topology#retry_ladder` each declare the
 exchange, the rungs and the binding together, and a consumer declares them again
 before it subscribes.
 
+A consumer declares `acemq.dlx`, `{queue}.dlq`, `{queue}.parked` and the two
+bindings to them as well, and does so whether or not it has a retry policy. It
+republishes to `{queue}.dlq` through the default exchange when it gives up, and
+the default exchange drops what it cannot route without a word, so on a broker
+where the topology was never applied the dead letter that would have reported
+the mistake is the thing that disappears. Everything in the table above except
+`orders.new` itself is therefore declared twice on a properly deployed broker,
+with the same arguments both times, which is a duplicate declaration and not a
+`PRECONDITION_FAILED`. The source queue is the one thing a consumer never
+declares: it belongs to whoever set the service up, and guessing its type wrong
+is a `PRECONDITION_FAILED` that stops the consumer starting at all. See
+[who declares what](docs/reliability.md#who-declares-what).
+
 The names live in `Naming::RETRY_EXCHANGE` and `Naming::DEAD_LETTER_EXCHANGE`.
 The dead-letter exchange can be pointed elsewhere per topology
 (`Topology.new(dead_letter_exchange: "team.dlx")`), because only this library's

@@ -131,16 +131,18 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
 
   describe "declaring" do
     let(:transport) { FakeTransport.new }
+    let(:retry_exchange) { AceMQ::AMQP::Naming::RETRY_EXCHANGE }
+    let(:dead_letter_exchange) { AceMQ::AMQP::Naming::DEAD_LETTER_EXCHANGE }
 
     it "declares the exchange, the rungs and the binding that brings them home" do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
       ladder.declare(transport)
 
       expect(transport.declared_exchanges)
-        .to eq([[AceMQ::AMQP::Naming::RETRY_EXCHANGE, { kind: :direct, durable: true }]])
-      expect(transport.declared_queues.map(&:first)).to eq(["orders.new.retry.1m"])
+        .to include([AceMQ::AMQP::Naming::RETRY_EXCHANGE, { kind: :direct, durable: true }])
+      expect(transport.declared_queues.map(&:first)).to include("orders.new.retry.1m")
       expect(transport.bindings)
-        .to eq([["orders.new", AceMQ::AMQP::Naming::RETRY_EXCHANGE, "orders.new"]])
+        .to include(["orders.new", AceMQ::AMQP::Naming::RETRY_EXCHANGE, "orders.new"])
     end
 
     it "never declares a rung without the binding that carries it home" do
@@ -151,20 +153,77 @@ RSpec.describe AceMQ::AMQP::RetryLadder do
       ladder = described_class.for("orders.new", RetryPolicy.fixed(4, 90), threshold: 30)
       ladder.declare(transport)
 
-      expect(transport.declared_queues).not_to be_empty
-      expect(transport.bindings.size).to eq(1)
-      queue, exchange, key = transport.bindings.first
+      expect(transport.declared_queues.map(&:first)).to include("orders.new.retry.90s")
+      home = transport.bindings.select { |_queue, exchange, _key| exchange == retry_exchange }
+      expect(home.size).to eq(1)
+      queue, exchange, key = home.first
       expect(queue).to eq("orders.new")
       expect(exchange).to eq(ladder.rungs.first.arguments["x-dead-letter-exchange"])
       expect(key).to eq(ladder.rungs.first.arguments["x-dead-letter-routing-key"])
     end
 
-    it "declares nothing at all when no delay needs a queue" do
+    it "declares no rung and no retry exchange when no delay needs a queue" do
       described_class.for("orders.new", RetryPolicy.fixed(3, 1)).declare(transport)
 
-      expect(transport.declared_queues).to be_empty
-      expect(transport.declared_exchanges).to be_empty
-      expect(transport.bindings).to be_empty
+      declared = transport.declared_queues.map(&:first)
+
+      expect(declared).to all(satisfy { |name| !name.include?(".retry.") })
+      expect(transport.declared_exchanges.map(&:first)).not_to include(retry_exchange)
+      expect(transport.bindings.map { |binding| binding[1] }).not_to include(retry_exchange)
+    end
+
+    # ADR-032. The half of this that a consumer needs whether or not it has a
+    # single rung, because giving up does not depend on having somewhere to
+    # retry — RetryPolicy.none is the library default and gives up on the first
+    # failure.
+    describe "the dead-letter half" do
+      it "declares the exchange, the two queues and their bindings" do
+        described_class.for("orders.new", RetryPolicy.fixed(3, 60), threshold: 30)
+                       .declare(transport)
+
+        expect(transport.declared_exchanges)
+          .to include([dead_letter_exchange, { kind: :direct, durable: true }])
+        expect(transport.declared_queues.map(&:first))
+          .to include("orders.new.dlq", "orders.new.parked")
+        expect(transport.bindings)
+          .to include(["orders.new.dlq", dead_letter_exchange, "orders.new.dlq"],
+                      ["orders.new.parked", dead_letter_exchange, "orders.new.parked"])
+      end
+
+      it "declares it for a policy with no rungs at all" do
+        # The case that used to declare nothing, which is also the commonest
+        # consumer in the library: no retry policy, so every failure is a dead
+        # letter and there is no rung to hang the declaration off.
+        described_class.for("orders.new", RetryPolicy.none).declare(transport)
+
+        expect(transport.declared_queues.map(&:first))
+          .to eq(["orders.new.dlq", "orders.new.parked"])
+        expect(transport.declared_exchanges.map(&:first)).to eq([dead_letter_exchange])
+      end
+
+      it "declares the two queues classic, durable and with no arguments" do
+        # The argument table Topology#dead_letter_queue and Java both use. It
+        # has to be that table and not merely a working one: a service that
+        # applied its topology first and then started a consumer would be
+        # refused PRECONDITION_FAILED by anything else.
+        described_class.for("orders.new", RetryPolicy.none).declare(transport)
+
+        transport.declared_queues.map(&:last).each do |options|
+          expect(options[:queue_type]).to eq(AceMQ::AMQP::QueueType::CLASSIC)
+          expect(options[:durable]).to be(true)
+          expect(options[:arguments]).to eq({})
+        end
+      end
+
+      it "binds nothing to the source queue, which a consumer does not declare" do
+        # Topology#retry_ladder needs the source queue in the same topology
+        # because it binds to it. The dead-letter half must not pick up that
+        # requirement: the only two queues it binds are the two it declares
+        # itself.
+        described_class.for("orders.new", RetryPolicy.none).declare(transport)
+
+        expect(transport.bindings.map(&:first)).to eq(["orders.new.dlq", "orders.new.parked"])
+      end
     end
   end
 end
