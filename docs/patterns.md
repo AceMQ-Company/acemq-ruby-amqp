@@ -23,6 +23,8 @@ to reimplement them, and then there would be two retry engines to keep in step.
 | [Ordering](#ordering) | keep some messages in order without serialising all of them |
 | [Consumer groups](#consumer-groups) | start a set of workers together, and stop them together |
 | [Routing slips](#routing-slips) | let the message carry its own itinerary |
+| [Sagas](#sagas) | undo the steps that worked when a later one does not |
+| [Scheduling](#scheduling) | deliver a message later, without a scheduler |
 | [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
 | [Schemas](#schemas) | remember what a message used to look like |
 | [Streams](#streams) | a queue that keeps what it has delivered |
@@ -468,6 +470,193 @@ The message is accepted only once the next one is out, so a failure to publish
 retries the step — which is why a step that changes anything should be
 [idempotent](#idempotency). A slip that will not parse is fatal rather than
 retried: it will not parse next time either.
+
+## Sagas
+
+```ruby
+booking = Patterns::Saga.named("place-order") do |saga|
+  saga.step("take-payment") { |order| payments.charge(order) }
+      .compensate_with      { |order| payments.refund(order) }
+  saga.step("reserve-stock") { |order| inventory.reserve(order) }
+      .compensate_with       { |order| inventory.release(order) }
+  saga.step("book-courier") { |order| couriers.book(order) }
+end
+
+result = booking.run(order)
+```
+
+A sequence of steps where each one knows how to undo itself. If `book-courier`
+raises, the stock is released and the payment refunded, **in that order**, and
+the result says so. Reverse order because that is the order the world was
+changed in, and a compensation often depends on state a later step has not yet
+altered.
+
+Nothing here touches a broker: no message is published and no header is set. It
+is in `patterns` because the work a saga sequences is usually the work a message
+asked for.
+
+**A step with no compensation is skipped, not an error.** `book-courier` above
+has none — a step that only read something, or one whose effect is harmless,
+needs no undoing. There is no warning for the step that should have had one,
+because a library cannot tell the two apart, which is the argument for writing
+the compensation first and the action second.
+
+**It returns a result rather than raising.** A failed saga is not an exceptional
+condition to a caller that has to decide what happens next:
+
+```ruby
+result.complete?     # every step ran
+result.compensated?  # a step failed and the earlier ones were undone
+result.failed_at     # "book-courier"
+result.failure       # what it raised
+result.completed     # ["take-payment", "reserve-stock"], in order
+result.unresolved    # the steps that could not be undone
+result.unresolved?   # the flag to alert on
+```
+
+**When a compensation itself fails, the remaining ones still run.** It is
+collected into `unresolved` and the next compensation is attempted anyway,
+because stopping leaves more undone than continuing does. `unresolved?` is the
+thing to alert on: everything else a saga reports is recoverable by
+construction, and these are real-world effects that happened, were meant to be
+undone, and were not. No retry will resolve them — a person has to. Java spells
+it `hasUnresolved()`; the `has_` is dropped here because Ruby says the same
+thing with the question mark.
+
+The result is frozen, because it describes something that has already happened.
+
+### What a saga is not
+
+**Not a distributed transaction.** Nothing is isolated: after `take-payment` the
+customer's money really has moved, and anybody looking sees that it has. If
+`book-courier` then fails, the refund is a *new* fact rather than an erasure of
+the old one, and for a few seconds the world contained a charge that should not
+have happened. That is what compensating a real-world action means, and a saga
+is honest about it where a two-phase commit pretends otherwise.
+
+So the steps must be things that can be undone by doing something else. Sending
+an email cannot be compensated — the apology is a second email, not an unsend —
+and a step that sends one should be the last step, after everything that can
+still fail.
+
+**Not durable.** This runs in one process and its state is on the stack. A crash
+midway leaves the saga half-applied with nothing to resume it. Where a saga must
+survive the process, the steps have to be messages and the state has to be in a
+database, which is a much larger thing and is not this. For most systems the
+in-process form is the right one: it turns "remember to undo the three things
+you already did" from a comment into something the code can see.
+
+Anything that is not a `StandardError` — an `Interrupt`, a `SignalException` —
+goes straight through and nothing is compensated. The process is going away, and
+a compensation running on the way out of a SIGTERM is one nobody can be sure
+finished.
+
+## Scheduling
+
+```ruby
+Patterns::Scheduler.on(mq) do |scheduler|
+  scheduler.in(4 * 3600, invoice, to: "invoice.due", exchange: "billing")
+  scheduler.at(renewal_date, policy, to: "policy.renew", exchange: "policies")
+end
+```
+
+Delivering a message later, with no scheduler process and no plugin. `in` takes
+seconds and `at` takes a `Time`; anything already due is delivered at once.
+
+### Why not a per-message time to live
+
+The obvious implementation is to set `expiration` on the message, drop it in a
+queue nobody consumes, and let it dead-letter to its destination. It is what
+most articles suggest and it is wrong for anything but a single fixed delay,
+because **a classic queue expires messages only at its head**.
+
+Put a four-hour message in, then a one-minute message behind it, and the
+one-minute message is delivered in four hours. Nothing reports this: the queue
+looks healthy, the message is not lost, it is simply late by a factor nobody
+predicted. It fails in production under mixed load rather than in testing under
+uniform load.
+
+### What it does instead
+
+A ladder of queues, each with a *uniform* time to live, and a message hops
+through them until it is due:
+
+```
+acemq.schedule.1h   ttl 1h  -> acemq.schedule -> acemq.schedule.due
+acemq.schedule.10m  ttl 10m -> acemq.schedule -> acemq.schedule.due
+acemq.schedule.1m   ttl 1m  -> acemq.schedule -> acemq.schedule.due
+acemq.schedule.10s  ttl 10s -> acemq.schedule -> acemq.schedule.due
+acemq.schedule.1s   ttl 1s  -> acemq.schedule -> acemq.schedule.due
+```
+
+Every message in a rung has the same delay, so head-of-line expiry is harmless:
+the head is always the message due soonest. Each expiry returns the message to
+`acemq.schedule.due`, where the scheduler either delivers it or puts it in the
+largest rung that does not overshoot. A four-hour delay is four one-hour hops; a
+ninety-second delay is one minute and then three tens. A one-day message costs
+twenty-four hops and a one-minute message costs one, which is the right way
+round — short delays are common and want to be cheap.
+
+The cost is honest and worth stating: a long delay is several broker round trips
+rather than one, and delivery is accurate to about the smallest rung rather than
+to the second. A scheduler that must fire at 09:00:00.000 exactly is a
+scheduler, not a message broker. The alternative is RabbitMQ's
+delayed-message-exchange plugin, which does this properly and is a plugin — so
+it is not available everywhere, and a library that silently required it would be
+a library that works on your laptop.
+
+### The names are the contract
+
+Every name, argument and header is shared with the Java, Go, .NET and Python
+libraries, because a Ruby service and a Java service scheduling on one broker
+declare the same queues. A rung already there with a different table answers
+`PRECONDITION_FAILED` to whichever declares second, and a header spelled
+differently is a message that reaches the control queue and cannot be routed.
+
+| | |
+|---|---|
+| `acemq.schedule` | direct, durable |
+| `acemq.schedule.{1h,10m,1m,10s,1s}` | classic, durable, `x-message-ttl` = the rung, dead-lettering to `acemq.schedule` / `acemq.schedule.due` |
+| `acemq.schedule.due` | classic, durable, no arguments |
+
+Every queue is bound to `acemq.schedule` under its own name. The four headers a
+scheduled message carries are `x-schedule-exchange`, `x-schedule-routing-key`,
+`x-schedule-due-at` (epoch milliseconds, the integer `x-acemq-first-seen` is
+also written as) and `x-schedule-content-type`. They deliberately do **not** use
+the `x-acemq-` prefix: that one is reserved, and the envelope refuses an
+application header carrying it outright.
+
+`Patterns::Scheduler.declare(mq)` declares all of it without starting a
+consumer, for a deployment that applies its topology up front.
+
+### What it will not do
+
+**It does not decode your payload.** The payload is encoded once, when it is
+scheduled, and carried as bytes from then on; the content type travels with it
+in `x-schedule-content-type` and is put back on the message that is finally
+delivered. A scheduler that decoded would acquire opinions about message formats
+it has no business having, and one that republished under
+`application/octet-stream` would deliver the right bytes to a consumer that
+cannot read them.
+
+**It does not pass its own headers on.** What arrives at the target is a
+message, not a message about scheduling.
+
+**Its control queue has no dead-letter queue.** Every consumer this library
+starts declares `{queue}.dlq` and `{queue}.parked`; the scheduler's control
+consumer is subscribed on the transport instead, precisely so that it does not.
+Two queues in every deployment that nothing writes to and nobody reads is a poor
+trade for a queue whose messages the scheduler put there itself. A message that
+reaches `acemq.schedule.due` without the headers a scheduled message carries is
+dropped and counted in `malformed`, which is not zero only when something other
+than a scheduler is publishing into `acemq.schedule`.
+
+```ruby
+scheduler.scheduled   # messages handed to it
+scheduler.delivered   # messages that reached their destination
+scheduler.hops        # times a message moved between rungs; / delivered is the average
+scheduler.malformed   # messages in the control queue that no scheduler put there
+```
 
 ## Pipelines and middleware
 

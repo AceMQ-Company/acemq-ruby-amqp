@@ -118,7 +118,7 @@ second `require`:
 | | |
 |---|---|
 | `acemq/amqp` | envelopes, headers, codecs, retry policy, topology, the connection and the transport |
-| `acemq/amqp/patterns` | idempotency, outbox, request-reply, replay, ordering, consumer groups, routing slips, pipelines, schemas, streams |
+| `acemq/amqp/patterns` | idempotency, outbox, request-reply, replay, ordering, consumer groups, routing slips, sagas, scheduling, pipelines, schemas, streams |
 
 ```ruby
 require "acemq/amqp"
@@ -155,7 +155,7 @@ has to happen before it is.
 - [Interceptors](interceptors.md) — the seam around publish and handle
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, dead letters and shutdown](reliability.md)
-- [Patterns](patterns.md) — idempotency, outbox, request-reply, replay and seven more
+- [Patterns](patterns.md) — idempotency, outbox, request-reply, replay and nine more
 - [Metrics and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](api/index.html) — every public class and method, from YARD

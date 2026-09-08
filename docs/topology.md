@@ -229,6 +229,21 @@ kills the channel it was made on. Sharing one would mean a single
 `PRECONDITION_FAILED` took every later declaration down with it, and the error
 nobody could then explain is the second one.
 
+## Queues this library declares on its own
+
+Three sets, and none of them are yours to name:
+
+| | |
+|---|---|
+| `acemq.retry` and `{queue}.retry.{delay}` | where a long retry waits; see [reliability](reliability.md) |
+| `acemq.dlx`, `{queue}.dlq`, `{queue}.parked` | where a message stops waiting; declared by every consumer at start-up |
+| `acemq.schedule` and its six queues | only when something calls [`Patterns::Scheduler`](patterns.md#scheduling) |
+
+The scheduler's are the only ones that are opt-in, and the only ones shared by
+every service on the vhost rather than named after a queue of yours.
+`Patterns::Scheduler.declare(mq)` puts them in a deployment's own topology step
+without starting a consumer, which is where a queue somebody reviewed belongs.
+
 ## Next
 
 - [Retries, dead letters and shutdown](reliability.md) — rungs, the retry

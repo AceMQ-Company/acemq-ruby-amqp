@@ -17,7 +17,8 @@ produces pin that rather than leaving it to be discovered in production.
 > publish, consume, retry, dead-letter — are implemented and tested, against
 > the shared fixtures and against a real broker, and so are the [patterns
 > above it](#patterns): idempotency, the outbox, request and reply, replay,
-> ordering, consumer groups, routing slips, pipelines, schemas and streams.
+> ordering, consumer groups, routing slips, sagas, scheduling, pipelines,
+> schemas and streams.
 > [TLS and credentials](#tls-and-credentials) are in, including a private
 > certificate authority and mutual TLS. Nothing is published to RubyGems yet.
 
@@ -531,6 +532,8 @@ to reimplement them, and then there would be two retry engines to keep in step.
 | [Ordering](#ordering) | keep some messages in order without serialising all of them |
 | [Consumer groups](#consumer-groups) | start a set of workers together, and stop them together |
 | [Routing slips](#routing-slips) | let the message carry its own itinerary |
+| [Sagas](#sagas) | undo the steps that worked when a later one does not |
+| [Scheduling](#scheduling) | deliver a message later, without a scheduler |
 | [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
 | [Schemas](#schemas) | remember what a message used to look like |
 | [Streams](#streams) | a queue that keeps what it has delivered |
@@ -835,6 +838,72 @@ queue is asking. The message is accepted only once the next one is out, so a
 failure to publish retries the step — which is why a step that changes anything
 should be idempotent. A slip that will not parse is fatal rather than retried:
 it will not parse next time either.
+
+### Sagas
+
+```ruby
+booking = Patterns::Saga.named("place-order") do |saga|
+  saga.step("take-payment") { |order| payments.charge(order) }
+      .compensate_with      { |order| payments.refund(order) }
+  saga.step("reserve-stock") { |order| inventory.reserve(order) }
+      .compensate_with       { |order| inventory.release(order) }
+  saga.step("book-courier") { |order| couriers.book(order) }
+end
+
+result = booking.run(order)
+result.compensated?   # a step failed and the earlier ones were undone
+result.failed_at      # "book-courier"
+result.unresolved?    # something could not be undone -- alert on this
+```
+
+A sequence of steps where each one knows how to undo itself. If `book-courier`
+raises, the stock is released and the payment refunded, in that order, and the
+result says so. Reverse order because that is the order the world was changed
+in. A step with no compensation is skipped rather than refused: one that only
+read something needs no undoing.
+
+Nothing here touches a broker. It returns a result rather than raising, because
+a failed saga is not an exceptional condition to a caller that has to decide
+what happens next. When a compensation itself fails the remaining ones still
+run — stopping leaves more undone than continuing — and the step is collected
+into `unresolved`, which is the set of real-world effects a person now has to
+reconcile.
+
+Not a distributed transaction: after `take-payment` the money really has moved,
+and the refund is a new fact rather than an erasure of the old one. And not
+durable — a crash midway leaves it half-applied with nothing to resume it.
+
+### Scheduling
+
+```ruby
+Patterns::Scheduler.on(mq) do |scheduler|
+  scheduler.in(4 * 3600, invoice, to: "invoice.due", exchange: "billing")
+  scheduler.at(renewal_date, policy, to: "policy.renew", exchange: "policies")
+end
+```
+
+Delivering a message later, with no scheduler process and no plugin. Not a
+per-message time to live, because a classic queue expires messages only at its
+head: put a four-hour message in and a one-minute message behind it, and the
+one-minute message is delivered in four hours, with nothing reporting it.
+
+Instead, a ladder of queues each with a uniform time to live —
+`acemq.schedule.{1h,10m,1m,10s,1s}` — dead-lettering into `acemq.schedule.due`,
+where the scheduler either delivers the message or puts it in the largest rung
+that does not overshoot. Every message in a rung has the same delay, so
+head-of-line expiry is harmless. A one-day delay costs twenty-four hops and a
+one-minute delay costs one.
+
+Every name, argument and header is shared with the Java, Go, .NET and Python
+libraries, because two services scheduling on one broker declare the same
+queues. The payload is encoded once and carried as bytes from then on, with its
+content type in `x-schedule-content-type` and put back on the message that is
+finally delivered: a scheduler that decoded would acquire opinions about message
+formats it has no business having.
+
+The control consumer is subscribed on the transport rather than through
+`consume`, so it does not declare `acemq.schedule.due.dlq` and `.parked` — two
+queues in every deployment that nothing writes to and nobody reads.
 
 ### Pipelines and middleware
 

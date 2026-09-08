@@ -6,6 +6,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- **Sagas.** `Patterns::Saga` runs an ordered set of steps, each with an
+  optional compensation, and compensates the completed ones in reverse when a
+  later step raises. Nothing is published and no header is set — only the
+  semantics are shared with Java. A completed step with no compensation is
+  skipped rather than treated as a failure; a compensation that itself raises
+  does not stop the others, and its step name is collected into
+  `SagaResult#unresolved`, which `unresolved?` reports and which is the list to
+  alert on. It returns a frozen `SagaResult` rather than raising, because a
+  caller needs the compensation report more than a backtrace.
+- **A scheduler.** `Patterns::Scheduler` delivers a message later, as a ladder
+  of uniform time-to-live queues rather than a per-message expiration — a
+  classic queue expires messages only at its head, so one long wait at the
+  front holds back every shorter one behind it. The exchange `acemq.schedule`,
+  the five rungs `acemq.schedule.{1h,10m,1m,10s,1s}` with exactly
+  `x-message-ttl`, `x-dead-letter-exchange` and `x-dead-letter-routing-key`,
+  the control queue `acemq.schedule.due`, and the four headers
+  `x-schedule-exchange`, `x-schedule-routing-key`, `x-schedule-due-at` (epoch
+  milliseconds) and `x-schedule-content-type` are the ones Java writes, so a
+  Ruby service and a Java service scheduling on one broker declare the same
+  topology instead of refusing each other's. The headers deliberately avoid the
+  reserved `x-acemq-` prefix, which the envelope refuses outright.
+  `Scheduler.declare(mq)` declares the topology without starting a consumer.
+- The scheduler's control consumer is subscribed on the transport rather than
+  through `Connection#consume`, so that it does **not** declare
+  `acemq.schedule.due.dlq` and `acemq.schedule.due.parked` — a consumer
+  declares its dead-letter queues at start-up, and every service running a
+  scheduler would otherwise leak two queues nothing writes to and nobody reads.
+  It reads raw bytes and never decodes a payload; a message reaching the
+  control queue without a scheduler's headers is dropped and counted in
+  `Scheduler#malformed`.
+
 ## [0.3.0] - 2026-09-08
 
 ### Added
