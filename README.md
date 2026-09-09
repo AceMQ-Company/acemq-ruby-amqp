@@ -463,12 +463,20 @@ alert written for one service reads the same against the next:
 | `acemq.messages.published` | by `exchange` |
 | `acemq.messages.publish.failed` | including a publish an interceptor refused |
 | `acemq.messages.consumed` | by `queue`, counted on the way in |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | what handlers decided |
-| `acemq.messages.dead.lettered` | out of attempts, too old, or refused fatally |
+| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` | what the consumer decided, one of the four per delivery |
 | `acemq.messages.parked` | nothing could decode it |
 | `acemq.handler.duration` | seconds, handler and interceptors together |
 | `acemq.messages.in.flight` | a gauge, per queue |
 | `acemq.retry.rung.missing` | see below |
+
+The four outcome counters are the four
+[`Settlement`](docs/interceptors.md#the-settlement) outcomes and **exactly one
+goes up per delivery** — read off the same decision the span's
+`messaging.acemq.outcome` attribute is, so the two cannot disagree. A handler
+asking for a retry on its last attempt is counted `dead.lettered` and not also
+`retried`. See
+[observability](docs/observability.md#the-four-outcome-counters-are-what-the-consumer-decided)
+for what that changes on an existing dashboard.
 
 **No dependency on a metrics gem.** An observer is anything answering `count`,
 `observe` and `gauge`; depending on one would put every service using this
@@ -507,8 +515,10 @@ of ambient context. That join, across processes and minutes, is the entire point
 of tracing a message system.
 
 `unroutable`, `failed` and `dead_lettered` make a span an error; `acked`,
-`retried` and `rejected` do not — a message that will be tried again has not
-failed yet. Retries, dead letters, outbox failures and finished pipeline runs
+`retried`, `rejected`, `answered` and `timed_out` do not — a message that will be
+tried again has not failed yet, and a request nobody answered in time is the
+absence of a reply rather than a failure of this process. Retries, dead letters,
+outbox failures and finished pipeline runs
 are *events* on the span already open, because a zero-length span at the end of a
 trace adds a row and no information.
 
@@ -518,7 +528,15 @@ retry on its last one is reported `dead_lettered` and its message.dead_lettered
 event carries the reason written onto the dead letter. `message.retried` carries
 `messaging.acemq.retry_delay_ms`, the delay the retry policy really chose. Both
 come off the `Settlement` the consumer puts on the context before `after_handle`
-runs, which any interceptor can read.
+runs, which any interceptor can read — and so do the outcome counters, so the
+word on a span and the counter that moved for the same delivery agree.
+
+`outbox_published(lag:)` writes `messaging.acemq.outbox_lag_ms` as an attribute
+rather than an event: it measures the publish that is happening, not something
+that happened during it. `pipeline_run_finished` is a method you call and
+nothing here calls it — Ruby has composed middleware and routing slips rather
+than a pipeline object with a name, so the library has no honest value for the
+event's `pipeline` and `step`.
 
 `opentelemetry-api` is not a runtime dependency. It is required at the moment an
 adapter is built and names itself when it is absent, the way bunny does:
@@ -778,6 +796,18 @@ without waiting for a tick. A store is anything answering `add`, `pending` and
 `mark_published`, and it is only worth having if `add` can join the caller's
 transaction — a store that opens its own connection has the gap back, in a
 place that looks like it has been dealt with.
+
+A relay whose sweeps are all failing is an outbox filling up, so pass
+`on_error:`. A one-argument callback is given the exception; one that also
+declares `exchange:` and `routing_key:` is told where the record was going,
+which is what an alert is worth routing by and what the
+`outbox.publish_failed` trace event needs:
+
+```ruby
+Patterns::OutboxRelay.new(mq, store, on_error: lambda { |error, exchange:, routing_key:|
+  logger.warn("the outbox cannot reach #{exchange}/#{routing_key}: #{error.message}")
+})
+```
 
 ### Claim check
 

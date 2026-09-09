@@ -22,8 +22,7 @@ written for one reads the same against another:
 | `acemq.messages.published` | by `exchange` |
 | `acemq.messages.publish.failed` | by `exchange`, including a publish an interceptor refused |
 | `acemq.messages.consumed` | by `queue`, counted on the way **in** |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | by `queue` — what handlers decided |
-| `acemq.messages.dead.lettered` | out of attempts, too old, or refused fatally |
+| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` | by `queue` — what the consumer decided, one of the four per delivery |
 | `acemq.messages.parked` | nothing could decode it |
 | `acemq.handler.duration` | seconds; handler and interceptors together |
 | `acemq.messages.in.flight` | a gauge, per queue |
@@ -37,6 +36,37 @@ you want when the question is why a queue is not draining.
 number worth having: it is how long a message occupied one of this consumer's
 prefetch slots, and an interceptor that is slow costs exactly as much as a
 handler that is.
+
+### The four outcome counters are what the consumer decided
+
+`accepted`, `retried`, `rejected` and `dead.lettered` are the four
+[`Settlement`](interceptors.md#the-settlement) outcomes, one counter each, and
+**exactly one of them goes up per delivery**. They are read off the same
+decision the span's `messaging.acemq.outcome` attribute is read off, so a
+delivery counted as `dead.lettered` has a span saying `dead_lettered`, and the
+two cannot drift.
+
+That is worth saying because it used to be otherwise: the counters classified by
+the `Ack` the handler returned, and an `Ack` cannot know whether there is an
+attempt left to spend. A handler asking for a retry on its last attempt
+incremented `retried` on its way to the dead-letter queue and was counted again
+as `dead.lettered`, so `consumed` never equalled the sum of the four and the
+retry rate included messages that were never retried.
+
+**What a dashboard will show after upgrading**: `acemq.messages.retried` falls
+and `acemq.messages.dead.lettered` rises, by the same amount — the give-ups that
+were being counted in both. `acemq.messages.dead.lettered` also stops counting
+handler rejections, which are now only `rejected`; if you were alerting on
+dead letters and meant "something is broken", that alert gets quieter and more
+accurate, because a message a handler refused on purpose is the system working.
+The service behaves identically — nothing about where a message goes has
+changed, only which counter names it — so a step in these two series at deploy
+time is the upgrade and not an incident. A panel that added `retried` and
+`dead.lettered` together to get "failures" was double-counting and should be
+rebuilt on `dead.lettered` alone.
+
+The .NET, Go and Python libraries make the same correction, so a shared
+dashboard moves once rather than four times.
 
 ## No dependency on a metrics gem
 
@@ -217,6 +247,7 @@ messaging.rabbitmq.destination.routing_key   on a publish
 messaging.acemq.message_type                 the envelope's type
 messaging.acemq.attempt                      on a delivery
 messaging.acemq.outcome                      what happened
+messaging.acemq.outbox_lag_ms                how far behind an outbox relay is
 ```
 
 An attribute with nothing to say is left out rather than written empty.
@@ -224,10 +255,20 @@ An attribute with nothing to say is left out rather than written empty.
 ### Outcomes, and which of them are errors
 
 `unroutable`, `failed` and `dead_lettered` set the span status to error.
-`acked`, `retried`, `rejected`, `confirmed` and `answered` do not. A message
-that will be tried again has not failed yet, and a message a handler refused on
-purpose is the system working; marking either as an error is how a trace view
-fills with red and stops meaning anything.
+`acked`, `retried`, `rejected`, `confirmed`, `answered` and `timed_out` do not.
+A message that will be tried again has not failed yet, and a message a handler
+refused on purpose is the system working; marking either as an error is how a
+trace view fills with red and stops meaning anything.
+
+A request that nobody answered in time is `timed_out` rather than `failed`, and
+for the same reason: a timeout is the absence of a reply, usually a responder's
+queue being long, and it is not evidence that anything went wrong here. Java and
+Go write the same word without marking the span red. Anything else raised inside
+`tracing.request` is `failed` and *is* an error.
+
+`unroutable` is the one word in the shared vocabulary this library never writes:
+it needs a mandatory publish and the broker's basic.return, which this
+transport does not use. See [the divergences it leaves](#what-is-not-raised-for-you).
 
 A retry the handler marked `FatalError` is reported as `dead_lettered` rather
 than `retried`, because that is what the consumer will actually do with it.
@@ -240,6 +281,12 @@ send whoever is looking for it to the wrong queue. The consumer works the
 decision out before the interceptors run and puts it on the context as a
 [`Settlement`](interceptors.md#the-settlement), which is where the adapter reads
 it.
+
+**The counters read it from there too.** The word on the span and the counter
+that went up are the same decision said twice, so
+`acemq.messages.dead.lettered` and `outcome=dead_lettered` always name the same
+deliveries. See [the four outcome
+counters](#the-four-outcome-counters-are-what-the-consumer-decided).
 
 ### Events, not spans
 
@@ -273,7 +320,49 @@ tracing.pipeline_run_finished(pipeline: "fulfilment", step: "pick",
 
 Both do nothing when no span is open, which is a legitimate answer: an outbox
 relay on its own thread has nothing to hang an event on, and opening a span for
-the event alone would produce exactly the zero-length span this avoids.
+the event alone would produce exactly the zero-length span this avoids. The Java
+and Go adapters drop them under the same condition.
+
+`outbox_publish_failed` wants a destination, and the outbox relay's `on_error:`
+callback can now supply one — see
+[patterns](patterns.md#reporting-what-a-relay-could-not-publish):
+
+```ruby
+relay = Patterns::OutboxRelay.new(mq, store, on_error: lambda { |error, exchange:, routing_key:|
+  tracing.outbox_publish_failed(exchange: exchange, reason: error.message)
+})
+```
+
+There is a third, which is an attribute rather than an event:
+
+```ruby
+tracing.outbox_published(lag: seconds)
+```
+
+`messaging.acemq.outbox_lag_ms` on whatever span is open, the same attribute
+Java, Go and Python write. An attribute and not an event because it measures the
+publish that is happening rather than something that happened during it: it is
+how long the record sat between being committed and going out, which is the
+number that says whether a relay is keeping up.
+
+### What is not raised for you
+
+`unroutable` is never written. It is the outcome for a message the broker
+accepted and then routed to no queue at all, which is only visible through a
+mandatory publish and a `basic.return` handler; this library publishes with
+confirms and not with `mandatory`, so it never learns that a message went
+nowhere. The word stays in the error list so that a span written by a Java or Go
+service reads correctly here.
+
+`pipeline.run_finished` is a method you call and nothing in this library calls
+it. Java has a `Pipeline` object that owns a name and a list of steps, so it
+knows when a run ended and on which step. Ruby has
+[`Patterns.chain`](patterns.md), `Patterns.then_publish` and
+`Patterns.follow_slip` instead — composed lambdas and a routing slip, none of
+which owns a pipeline name, and only one of which can tell a run that finished
+from a run that stopped early. Raising the event from any of them would fill the
+`pipeline` and `step` attributes with something invented. It is left to the
+caller, who knows both, until there is a pipeline object to hang it on.
 
 ### Publishing outside the library
 

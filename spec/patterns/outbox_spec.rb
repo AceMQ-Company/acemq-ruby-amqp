@@ -167,6 +167,43 @@ RSpec.describe AceMQ::AMQP::Patterns::OutboxRelay do
       expect(store.size).to eq(1)
     end
 
+    # "A sweep failed" is not something anybody can route an alert on. "The
+    # outbox cannot reach orders-events" is, and it is also what the
+    # +outbox.publish_failed+ event wants for its
+    # +messaging.destination.name+ — which the callback could not fill while it
+    # was handed the exception and nothing else.
+    it "tells a callback that asks where the record was going" do
+      store.add(recorded)
+      seen = Queue.new
+      allow(transport).to receive(:publish).and_raise(AceMQ::AMQP::PublishError, "no confirm")
+
+      report = lambda do |error, exchange:, routing_key:|
+        seen << [error.class, exchange, routing_key]
+      end
+      relay = described_class.new(mq, store, interval: 0.01, on_error: report).start
+      first = seen.pop
+      relay.close
+
+      expect(first).to eq([AceMQ::AMQP::PublishError, "orders-events", "order.placed"])
+    end
+
+    # The store raising is a failure with no record in hand. Empty strings
+    # rather than a nil the callback has to guard: there is no destination,
+    # because nothing had been claimed yet.
+    it "reports an empty destination when the store itself failed" do
+      seen = Queue.new
+      allow(store).to receive(:pending).and_raise("the database is down")
+
+      report = lambda do |error, exchange:, routing_key:|
+        seen << [error.message, exchange, routing_key]
+      end
+      relay = described_class.new(mq, store, interval: 0.01, on_error: report).start
+      first = seen.pop
+      relay.close
+
+      expect(first).to eq(["the database is down", "", ""])
+    end
+
     it "closes quickly even with a long interval" do
       # Waiting on a condition rather than sleeping, so shutting down a relay
       # that sweeps every thirty seconds does not take thirty seconds.

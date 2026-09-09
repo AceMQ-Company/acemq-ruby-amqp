@@ -362,6 +362,17 @@ module AceMQ
     # waited by the broker, in a rung queue; see {RetryLadder} for why the two
     # are not the same choice.
     class Consumer
+      # One counter per outcome, keyed by the word the {Settlement} carries — so
+      # the counter that goes up and the +messaging.acemq.outcome+ attribute on
+      # the span for the same delivery are read off the same decision and cannot
+      # disagree.
+      COUNTER_FOR = {
+        Settlement::ACKED => Telemetry::ACCEPTED,
+        Settlement::RETRIED => Telemetry::RETRIED,
+        Settlement::REJECTED => Telemetry::REJECTED,
+        Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED
+      }.freeze
+
       attr_reader :queue, :retry_policy, :codec, :ladder
 
       def initialize(transport:, queue:, handler:, codec:, retry_policy:,
@@ -421,7 +432,7 @@ module AceMQ
         context = context_for(delivery, envelope, decode(delivery))
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         ack = invoke(context, delivery)
-        observe(ack, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+        took = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
         # Decided before the interceptors are told rather than after, because
         # the decision is the thing worth telling them: an ack asking for a
         # retry on the last attempt is a dead letter, and a retry that will
@@ -429,6 +440,7 @@ module AceMQ
         # policy has been asked. An interceptor left to infer it from the ack
         # reports the message as retried and the delay as nothing.
         context.settlement = decide(context.envelope, ack)
+        observe(context.settlement, took)
         # After the handler and before the delivery is settled, so an
         # interceptor can still see how it went and still undo whatever it set
         # up on the way in. The envelope read back off the context is the one an
@@ -494,13 +506,16 @@ module AceMQ
       # the number worth having: it is how long a message occupied one of this
       # consumer's prefetch slots, and an interceptor that is slow costs exactly
       # as much as a handler that is.
-      def observe(ack, seconds)
+      #
+      # Counted by the {Settlement} rather than by the ack, and that is the
+      # whole point: an ack cannot know whether there is an attempt left to
+      # spend, so a handler asking for a retry on its last attempt used to
+      # increment +retried+ on its way to the dead-letter queue and be counted
+      # again as +dead.lettered+. Exactly one counter goes up per delivery now,
+      # and it is the one naming what the consumer really did.
+      def observe(settlement, seconds)
         @telemetry.observe(Telemetry::HANDLER_DURATION, seconds, queue: @queue)
-        outcome = if ack.accept? then Telemetry::ACCEPTED
-                  elsif ack.reject? then Telemetry::REJECTED
-                  else Telemetry::RETRIED
-                  end
-        @telemetry.count(outcome, 1, queue: @queue)
+        @telemetry.count(COUNTER_FOR.fetch(settlement.outcome), 1, queue: @queue)
       end
 
       # What an interceptor sees, and what the handler is built from.
@@ -676,8 +691,12 @@ module AceMQ
       # the queue happens to be declared with — and neither of those can write
       # +x-acemq-error+ onto it, which is the one thing whoever finds it in the
       # dead-letter queue actually needs.
+      #
+      # Nothing is counted here. Both a rejection and a give-up land in this
+      # method, and counting them together would put +dead.lettered+ back on top
+      # of +rejected+ for the same delivery. {#observe} counts the decision, by
+      # its own name, once.
       def dead_letter(delivery, envelope, reason)
-        @telemetry.count(Telemetry::DEAD_LETTERED, 1, queue: @queue)
         republish(@dead_letter_queue, delivery, envelope.with(error: reason))
         delivery.ack
       end

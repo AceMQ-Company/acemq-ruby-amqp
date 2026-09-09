@@ -171,6 +171,20 @@ module AceMQ
         # @param on_error [#call, nil] handed anything a sweep raised. Worth
         #   passing: a relay whose sweeps are all failing is an outbox filling
         #   up, and without this the only symptom is messages that never arrive.
+        #
+        #   A one-argument callable is given the exception, as it always was. One
+        #   that also declares +exchange:+ and +routing_key:+ is given where the
+        #   record was going as well:
+        #
+        #     on_error: lambda { |error, exchange:, routing_key:|
+        #       tracing.outbox_publish_failed(exchange: exchange, reason: error.message)
+        #       logger.warn("outbox stuck on #{exchange}/#{routing_key}: #{error.message}")
+        #     }
+        #
+        #   The destination is what the telemetry event wants and what an alert
+        #   is worth routing by — "the outbox cannot reach +orders-events+" is
+        #   actionable in a way that "a sweep failed" is not. Both are empty
+        #   strings when the store itself raised, since no record was in hand.
         def initialize(connection, store, interval: DEFAULT_INTERVAL, batch: DEFAULT_BATCH,
                        on_error: nil)
           # A record already holds encoded bytes and rendered headers, so what
@@ -182,6 +196,7 @@ module AceMQ
           @interval = interval.to_f
           @batch = batch
           @on_error = on_error
+          @on_error_wants_destination = destination_wanted?(on_error)
           @lock = Mutex.new
           @wake = ConditionVariable.new
           @stopped = false
@@ -202,16 +217,7 @@ module AceMQ
         # @return [Integer] records published
         # @raise [StandardError] whatever the broker or the store raised
         def sweep
-          published = 0
-          @store.pending(@batch).each do |record|
-            publish(record)
-            # Marked after the confirm, never before. A crash in this gap
-            # republishes the record, which is the at-least-once this pattern
-            # promises; marking first would lose it instead.
-            @store.mark_published(record.id)
-            published += 1
-          end
-          published
+          drain { |error, _record| raise error }
         end
 
         # Whether the sweeping thread is running.
@@ -229,6 +235,62 @@ module AceMQ
         end
 
         private
+
+        # Publishes one batch, handing whatever went wrong — and the record it
+        # went wrong on — to the block rather than raising.
+        #
+        # One code path for both callers. {#sweep} re-raises from the block and
+        # so still raises exactly what the broker or the store raised; the
+        # sweeping thread reports instead. Keeping the record in a local is what
+        # lets the report name a destination: the callback used to be handed a
+        # bare exception, which cannot say which exchange an outbox is stuck on.
+        #
+        # A failing record stops the batch rather than being skipped. The
+        # records were written in an order somebody meant, and stepping over one
+        # to publish the next invents a reordering; the next sweep tries again
+        # from the same place.
+        #
+        # @return [Integer] records published before it stopped
+        def drain
+          published = 0
+          record = nil
+          begin
+            @store.pending(@batch).each do |pending|
+              record = pending
+              publish(pending)
+              # Marked after the confirm, never before. A crash in this gap
+              # republishes the record, which is the at-least-once this pattern
+              # promises; marking first would lose it instead.
+              @store.mark_published(pending.id)
+              published += 1
+            end
+          rescue StandardError => e
+            yield e, record
+          end
+          published
+        end
+
+        # Tells whoever asked, in as much detail as they asked for.
+        def report(error, record)
+          return if @on_error.nil?
+          return @on_error.call(error) unless @on_error_wants_destination
+
+          @on_error.call(error, exchange: record ? record.exchange.to_s : "",
+                                routing_key: record ? record.routing_key.to_s : "")
+        end
+
+        # Whether a callback wants the destination as well as the exception.
+        #
+        # Asked of the callable rather than versioned into two constructors, so
+        # a relay built the way every existing one is built keeps working and a
+        # callback that declares the keywords starts receiving them.
+        def destination_wanted?(callback)
+          return false if callback.nil?
+
+          callable = callback if callback.is_a?(Proc) || callback.is_a?(Method)
+          callable ||= callback.method(:call)
+          callable.parameters.any? { |kind, _name| %i[key keyreq keyrest].include?(kind) }
+        end
 
         # Publishes one record, telling the store when that failed.
         #
@@ -251,14 +313,10 @@ module AceMQ
 
         def run
           until stopped?
-            begin
-              sweep
-            rescue StandardError => e
-              # A failed sweep is not fatal, and that is the whole point of an
-              # outbox: the records are still there, and the next tick tries
-              # again. Nothing is lost by the relay being down, only delayed.
-              @on_error&.call(e)
-            end
+            # A failed sweep is not fatal, and that is the whole point of an
+            # outbox: the records are still there, and the next tick tries
+            # again. Nothing is lost by the relay being down, only delayed.
+            drain { |error, record| report(error, record) }
             pause
           end
         end

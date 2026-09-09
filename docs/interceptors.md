@@ -84,6 +84,12 @@ end
 dead-letter queue: a message the handler refused on purpose is the system
 working, and one that ran out of attempts is not.
 
+The library reads it from the same place. The four outcomes are the four
+[outcome counters](observability.md#the-four-outcome-counters-are-what-the-consumer-decided)
+and the four values of the span's `messaging.acemq.outcome` attribute, so a
+counter, a span and an interceptor looking at one delivery all say the same
+word.
+
 ## Blocks and objects
 
 A block is the common case: one hook, on the way in. An object is the full case,

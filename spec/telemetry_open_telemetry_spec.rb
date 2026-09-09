@@ -325,6 +325,81 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     end
   end
 
+  # The property the counters and the spans are meant to have: for one
+  # delivery, the counter that goes up and the word on its span are the same
+  # decision, said twice. They are both read off the {Settlement} the consumer
+  # produced, which is what makes it true; these examples are what keeps it
+  # true.
+  #
+  # The pairs are written out here rather than taken from the constant the
+  # consumer maps with, because a test that reuses the map cannot fail when the
+  # map is wrong.
+  describe "the counter and the span, for one delivery" do
+    let(:interceptors) { AceMQ::AMQP::Interceptors.new.add_consume(tracing) }
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:retrying) { AceMQ::AMQP::RetryPolicy.fixed(5, 0.05) }
+    let(:giving_up) { AceMQ::AMQP::RetryPolicy.none }
+
+    # Every counter a delivery could land on, so "exactly one went up" is a
+    # thing an example can assert rather than a thing it has to trust.
+    OUTCOME_COUNTERS = ["acemq.messages.accepted", "acemq.messages.retried",
+                        "acemq.messages.rejected",
+                        "acemq.messages.dead.lettered"].freeze
+
+    def counted
+      OUTCOME_COUNTERS.to_h { |name| [name, metrics[name, queue: "orders.new"]] }
+                      .reject { |_name, value| value.zero? }
+    end
+
+    def deliver(retry_policy, &handler)
+      AceMQ::AMQP::Consumer.new(
+        transport: transport, queue: "orders.new", codec: AceMQ::AMQP::JSONCodec.new,
+        retry_policy: retry_policy, interceptors: interceptors, telemetry: metrics,
+        handler: handler
+      ).handle(
+        Struct.new(:body, :headers, :routing_key, :content_type, :redelivered,
+                   keyword_init: true) do
+          def redelivered? = false
+          def ack = nil
+        end.new(body: '{"a":1}', headers: {}, routing_key: "orders.new",
+                content_type: "application/json")
+      )
+      span_named("orders.new process").attributes["messaging.acemq.outcome"]
+    end
+
+    it "agrees on acked" do
+      outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.accept }
+
+      expect(outcome).to eq("acked")
+      expect(counted).to eq("acemq.messages.accepted" => 1)
+    end
+
+    it "agrees on retried" do
+      outcome = deliver(retrying) { |_m| AceMQ::AMQP::Ack.retry("no stock") }
+
+      expect(outcome).to eq("retried")
+      expect(counted).to eq("acemq.messages.retried" => 1)
+    end
+
+    it "agrees on rejected, and does not also count it as a dead letter" do
+      outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.reject("not ours") }
+
+      expect(outcome).to eq("rejected")
+      expect(counted).to eq("acemq.messages.rejected" => 1)
+    end
+
+    # The one this change is for. The handler asked for a retry and had no
+    # attempt left to spend, so the message is dead-lettered — and used to be
+    # counted as retried on the way there, which is why a dashboard's retry rate
+    # and its dead-letter rate never added up.
+    it "agrees on dead_lettered, and does not also count it as a retry" do
+      outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.retry("the warehouse said no") }
+
+      expect(outcome).to eq("dead_lettered")
+      expect(counted).to eq("acemq.messages.dead.lettered" => 1)
+    end
+  end
+
   describe "a request" do
     # CLIENT rather than PRODUCER: this span waits for an answer, so its
     # duration includes somebody else's work, and a reader who cannot tell the
@@ -343,10 +418,28 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     end
 
     it "records a failure and lets it out" do
-      expect { tracing.request("pricing.quote") { raise "timed out" } }
-        .to raise_error("timed out")
-      expect(span_named("pricing.quote request").status.code)
-        .to eq(OpenTelemetry::Trace::Status::ERROR)
+      expect { tracing.request("pricing.quote") { raise "no route to the broker" } }
+        .to raise_error("no route to the broker")
+      span = span_named("pricing.quote request")
+
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("failed")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+    end
+
+    # A request nobody answered in time is the absence of a reply rather than a
+    # failure of this process — usually a responder's queue being long. Java and
+    # Go both name it and neither marks the span red; a trace view that fills
+    # with red for slow responders stops meaning anything.
+    it "calls an unanswered request timed_out, and does not call it an error" do
+      expect do
+        tracing.request("pricing.quote") do
+          raise AceMQ::AMQP::Patterns::RequestTimedOut, "no reply within 5 seconds"
+        end
+      end.to raise_error(AceMQ::AMQP::Patterns::RequestTimedOut)
+      span = span_named("pricing.quote request")
+
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("timed_out")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::UNSET)
     end
 
     # The publish inside a request is a child of it, so one trace covers the
@@ -382,6 +475,28 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     # this avoids.
     it "says nothing at all when no span is open" do
       tracing.outbox_publish_failed(exchange: "orders", reason: "the broker refused it")
+
+      expect(spans).to be_empty
+    end
+
+    # An attribute rather than an event, and the same one the Java, Go and
+    # Python adapters write: the lag measures the publish that is happening, not
+    # something that happened during it.
+    it "puts the outbox lag on the span as an attribute" do
+      scope = tracing.publish_started(exchange: "orders", routing_key: "order.placed",
+                                      envelope: AceMQ::AMQP::Envelope.new)
+      tracing.outbox_published(lag: 2.5)
+      scope.close
+
+      span = span_named("orders publish")
+      expect(span.attributes["messaging.acemq.outbox_lag_ms"]).to eq(2500)
+      # An attribute and not an event: a span with no events at all is what the
+      # SDK reports as nil here, and that is the point being made.
+      expect(span.events.to_a).to be_empty
+    end
+
+    it "records no lag when no span is open" do
+      tracing.outbox_published(lag: 2.5)
 
       expect(spans).to be_empty
     end

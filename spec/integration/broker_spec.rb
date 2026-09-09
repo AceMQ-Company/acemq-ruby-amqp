@@ -926,7 +926,11 @@ RSpec.describe "against a real broker", :integration do
         .to be(true)
       expect(metrics[AceMQ::AMQP::Telemetry::PUBLISHED, exchange: ""]).to be >= 1
       expect(metrics[AceMQ::AMQP::Telemetry::CONSUMED, queue: queue]).to eq(2)
-      expect(metrics[AceMQ::AMQP::Telemetry::RETRIED, queue: queue]).to eq(2)
+      # Two deliveries, two retry acks, and one retry: the handler asked for a
+      # retry both times and only the first attempt had one left to spend. The
+      # counters classify by what the consumer did, so the second delivery is
+      # the dead letter and is not also a retry.
+      expect(metrics[AceMQ::AMQP::Telemetry::RETRIED, queue: queue]).to eq(1)
       expect(metrics.to_prometheus).to include("acemq_messages_dead_lettered")
     end
   end

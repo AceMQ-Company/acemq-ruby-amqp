@@ -142,6 +142,41 @@ in a place that looks like it has been dealt with. `InMemoryOutboxStore` does
 not close that gap and says so;
 [`SQLOutboxStore`](#the-outbox-add-takes-your-connection) is the one that does.
 
+### Reporting what a relay could not publish
+
+A relay whose sweeps are all failing is an outbox filling up, and without
+somewhere to report that the only symptom is messages that never arrive. That is
+what `on_error:` is for:
+
+```ruby
+relay = Patterns::OutboxRelay.new(mq, store, on_error: ->(error) { logger.warn(error) })
+```
+
+A callback that also declares `exchange:` and `routing_key:` is told **where the
+record was going**:
+
+```ruby
+relay = Patterns::OutboxRelay.new(mq, store, on_error: lambda { |error, exchange:, routing_key:|
+  tracing.outbox_publish_failed(exchange: exchange, reason: error.message)
+  logger.warn("the outbox cannot reach #{exchange}/#{routing_key}: #{error.message}")
+})
+```
+
+Which one you get is worked out from the callback itself, so an existing
+one-argument callback keeps working unchanged. The destination is what an alert
+is worth routing by — "the outbox cannot reach `orders-events`" is actionable
+where "a sweep failed" is not — and it is what the
+[`outbox.publish_failed`](observability.md#events-not-spans) event needs for its
+`messaging.destination.name`, which a callback handed a bare exception had no way
+to fill. Both are empty strings when the store itself raised, because nothing had
+been claimed and there is no destination to name.
+
+A failing record **stops the batch** rather than being skipped. The records were
+written in an order somebody meant, and stepping over one to publish the next
+invents a reordering nobody asked for; the next sweep starts again from the same
+place. `sweep` still raises what the broker or the store raised, so a flush
+called from a request handler fails loudly rather than silently.
+
 ## The claim check
 
 ```ruby

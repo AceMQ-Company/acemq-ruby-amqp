@@ -54,6 +54,13 @@ Metrics/ClassLength:
     # it in two to score 114 twice would put half a grammar in each half and
     # make it harder, not easier, to check against the specification.
     - lib/acemq/amqp/codec/toml/reader.rb
+    # The tracing adapter is a surface, not a class that grew: three spans, four
+    # events, thirteen attributes, six interceptor hooks and a scope, every one
+    # of them named identically in the Java, Go, .NET and Python adapters
+    # because a polyglot estate is watched on one dashboard. Splitting it would
+    # put half of that contract in another file without removing a line of it,
+    # and the one place to read "what does this library emit" would become two.
+    - lib/acemq/amqp/telemetry/open_telemetry.rb
 
 # The specs name the fixtures at the top level on purpose: they are the
 # contract, and reading them should not require unpicking a let block.

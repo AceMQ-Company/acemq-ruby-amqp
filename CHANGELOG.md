@@ -111,6 +111,13 @@ While the version is `0.x` the public API may change in any release.
 - `DependencyMissing` has moved from `transport.rb` to `ack.rb`, beside
   `FatalError`, because it is no longer only the transport's. The constant is
   unchanged: `AceMQ::AMQP::DependencyMissing`.
+- **`Telemetry::OpenTelemetry#outbox_published(lag:)`**, which writes
+  `messaging.acemq.outbox_lag_ms` onto whatever span is open. An attribute rather
+  than an event, because it measures the publish that is happening rather than
+  something that happened during it, and nothing at all when no span is open —
+  the same shape and the same attribute name the Java, Go and Python adapters
+  use. Ruby was the only library without it, so a lag panel built on the others
+  had a hole where the Ruby services should have been.
 
 ### Changed
 
@@ -147,6 +154,49 @@ While the version is `0.x` the public API may change in any release.
   both. Nothing about this is OpenTelemetry-specific and nothing is required
   until an adapter is built: `opentelemetry-api` remains a lazily required
   optional gem, and the gemspec still declares no runtime dependencies.
+- **The outcome counters classify by the `Settlement` too, so a counter and a
+  span for the same delivery agree.** They classified by the `Ack` the handler
+  returned, one layer below the fix above and with the same fault: an `Ack`
+  cannot know whether there is an attempt left to spend. A message that ran out
+  of attempts incremented `acemq.messages.retried` on its way to the dead-letter
+  queue and was counted again as `acemq.messages.dead.lettered`, and a rejection
+  was counted as both `rejected` and `dead.lettered`.
+
+  `acemq.messages.accepted`, `.retried`, `.rejected` and `.dead.lettered` are now
+  the four `Settlement` outcomes, one counter each, and **exactly one goes up per
+  delivery** — read off the same decision the span's `messaging.acemq.outcome`
+  attribute is read off. `spec/telemetry_open_telemetry_spec.rb` runs each of the
+  four outcomes through a real consumer with a registry and the tracing adapter
+  both attached, and asserts the word on the span and the single counter that
+  moved name the same thing.
+
+  **On an existing dashboard** `acemq.messages.retried` falls and
+  `acemq.messages.dead.lettered` rises by the same amount, and `dead.lettered`
+  stops counting handler rejections. Nothing about where a message goes has
+  changed, so a step in those series at deploy time is the upgrade and not an
+  incident. A panel adding `retried` and `dead.lettered` together to get
+  "failures" was double-counting and should be rebuilt on `dead.lettered` alone.
+  .NET, Go and Python make the same correction.
+- **The outbox relay's `on_error:` can be told where the record was going.** It
+  was handed the exception and nothing else, so a callback could not say which
+  exchange an outbox was stuck on and could not fill the
+  `messaging.destination.name` the `outbox.publish_failed` event wants. A
+  callback declaring `exchange:` and `routing_key:` now receives them; a
+  one-argument callback is called exactly as before, decided from the callable
+  itself, so nothing existing has to change. Both are empty strings when the
+  store itself raised and no record had been claimed. `sweep` still raises
+  whatever the broker or the store raised.
+- **A request that went unanswered is `timed_out` on its span, not nothing.**
+  `Telemetry::OpenTelemetry#request` set no `messaging.acemq.outcome` at all when
+  its block raised and marked every failure an error, so a timed-out request and
+  a broken connection were indistinguishable on a trace and both were red. A
+  `Patterns::RequestTimedOut` now writes `timed_out` and leaves the status unset
+  — a timeout is the absence of a reply rather than a failure of this process,
+  which is how Java and Go report it — and anything else writes `failed` and is
+  an error. `timed_out` was already in the shared vocabulary and was the only
+  word in it Ruby could reach and did not write. (`unroutable` remains
+  unreachable: it needs a mandatory publish and `basic.return`, which this
+  transport does not use.)
 
 ### Security
 

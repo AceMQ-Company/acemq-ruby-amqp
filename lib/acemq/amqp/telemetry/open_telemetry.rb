@@ -99,6 +99,7 @@ module AceMQ
         ATTEMPT = "messaging.acemq.attempt"
         OUTCOME = "messaging.acemq.outcome"
         REASON = "messaging.acemq.reason"
+        OUTBOX_LAG = "messaging.acemq.outbox_lag_ms"
 
         # The outcomes that make a span an error, and the ones that do not.
         #
@@ -212,7 +213,19 @@ module AceMQ
           scope.outcome("answered")
           answer
         rescue StandardError => e
-          scope&.failed(e)
+          # +timed_out+ rather than +failed+ for a request nobody answered in
+          # time, and deliberately not an error: that is the absence of a reply
+          # rather than a failure of this process — usually a responder's queue
+          # being long — and the Java and Go adapters both write it without
+          # marking the span red, because a trace view that fills with red for
+          # slow responders stops meaning anything. The exception still reaches
+          # the caller, who is free to decide it was one.
+          if self.class.timed_out?(e)
+            scope&.outcome("timed_out")
+          else
+            scope&.outcome("failed")
+            scope&.failed(e)
+          end
           raise
         ensure
           scope&.close
@@ -238,6 +251,23 @@ module AceMQ
         def outbox_publish_failed(exchange:, reason:)
           record("outbox.publish_failed",
                  { DESTINATION => exchange.to_s, REASON => reason.to_s })
+        end
+
+        # Records how far behind the outbox relay is running.
+        #
+        # An attribute on the current span rather than an event, and the Java,
+        # Go and Python adapters write the same one: it measures the publish
+        # that is happening, not something that happened during it. Nothing when
+        # no span is open, for the same reason
+        # {#outbox_publish_failed} records nothing then.
+        #
+        # @param lag [Numeric] seconds the record sat before it was published
+        def outbox_published(lag:)
+          span = ::OpenTelemetry::Trace.current_span
+          return unless span.recording?
+
+          span.set_attribute(OUTBOX_LAG, (lag * 1000).to_i)
+          nil
         end
 
         # @param pipeline [String]
@@ -334,6 +364,22 @@ module AceMQ
             peek(@consuming)&.failed(failure)
           end
           context
+        end
+
+        # Whether a failure is a request that went unanswered.
+        #
+        # Asked with +defined?+ rather than named in a +rescue+ clause, because
+        # {Patterns::RequestTimedOut} lives in the patterns file and a process
+        # that traces without ever asking anybody a question need not have
+        # loaded it — and a +rescue+ naming a constant that is not there raises
+        # a +NameError+ in place of the exception the caller threw.
+        #
+        # @param failure [Exception]
+        # @return [Boolean]
+        def self.timed_out?(failure)
+          return false unless defined?(Patterns::RequestTimedOut)
+
+          failure.is_a?(Patterns::RequestTimedOut)
         end
 
         # What an ack alone is called on a span.

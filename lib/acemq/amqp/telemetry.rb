@@ -62,13 +62,20 @@ module AceMQ
       # Messages delivered to a handler.
       CONSUMED = "acemq.messages.consumed"
 
-      # What handlers decided.
+      # What the consumer decided — not what the handler asked for. These four
+      # are the {Settlement} outcomes, one counter each, and exactly one of them
+      # goes up per delivery. A handler asking for a retry on its last attempt
+      # counts as +dead.lettered+ and not as +retried+, because that is what the
+      # consumer will really do with the message, and it is the word its span
+      # carries too.
       ACCEPTED = "acemq.messages.accepted"
       RETRIED = "acemq.messages.retried"
       REJECTED = "acemq.messages.rejected"
 
       # Messages that ran out of attempts, or were refused for a reason
-      # retrying cannot fix.
+      # retrying cannot fix. A message the handler rejected on purpose is
+      # counted as +rejected+ rather than here: both end in the dead-letter
+      # queue, and only the word keeps them apart.
       DEAD_LETTERED = "acemq.messages.dead.lettered"
 
       # Messages nothing could decode, which go somewhere a person looks.

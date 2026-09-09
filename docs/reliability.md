@@ -283,6 +283,11 @@ Honouring the mark rather than the request is the entire point of having it.
 The message is **republished** to `{queue}.dlq` with the reason in
 `x-acemq-error`, and the original is then acknowledged.
 
+All four routes end in the same queue, and the counters keep them apart:
+`Ack.reject` counts as `acemq.messages.rejected`, the other three as
+`acemq.messages.dead.lettered`, and neither is also counted as a retry. See
+[observability](observability.md#the-four-outcome-counters-are-what-the-consumer-decided).
+
 Acknowledging a failure looks wrong and is what makes it reliable: the message
 is already safely somewhere else, so the original is a copy that has been dealt
 with. Rejecting it instead would either requeue it into a hot loop or hand it to
