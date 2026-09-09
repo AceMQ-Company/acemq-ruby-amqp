@@ -218,6 +218,22 @@ module AceMQ
         ALL = [CONFIRMED, UNROUTABLE, FAILED, ACKED, RETRIED, DEAD_LETTERED,
                REJECTED, PARKED, ANSWERED, TIMED_OUT, PUBLISHED, COMPLETED,
                ENDED_EARLY].freeze
+
+        # Which word a publish that raised should be counted and traced under.
+        #
+        # Here rather than in either caller because both of them ask: the
+        # counter in {Connection#publish} and the span in
+        # {OpenTelemetry#on_error} have to reach the same answer about the same
+        # failure, and two copies of this line is exactly how they would stop.
+        #
+        # Asked with +respond_to?+ so that anything raised on the publish path
+        # can go through it, not only a {PublishError}.
+        #
+        # @param failure [Exception]
+        # @return [String] +unroutable+ or +failed+
+        def self.of_publish_failure(failure)
+          failure.respond_to?(:unroutable?) && failure.unroutable? ? UNROUTABLE : FAILED
+        end
       end
 
       # Ignores everything, and is what a connection uses until it is given

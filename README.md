@@ -385,12 +385,12 @@ times and a message nothing could read are different problems, and mixing them
 means somebody sorts them by hand — which is what a handler had to cause before
 `Ack.park` existed, by rejecting an unreadable message into the dead letters.
 
-When the republish to `{queue}.dlq` or `{queue}.parked` is itself refused —
-usually a queue nobody declared — the failure escapes the handler, the delivery
-is never settled, and the broker redelivers it. Nothing is lost, but it looks
-from outside like a handler failing forever on one message;
-`acemq.messages.set.aside.failed` is what tells the two apart and is worth an
-alert.
+The republish to `{queue}.dlq` or `{queue}.parked` is mandatory, so a queue
+nobody declared is heard rather than swallowed by the default exchange. When it
+fails, **the message is rejected to the broker** — settled once, not redelivered
+forever — and `acemq.messages.set.aside.failed` goes up, labelled with the queue
+that could not be reached. It is the only sign this path leaves and is worth an
+alert. Go and Python do the same.
 
 Without a policy, `Connection` uses `RetryPolicy.none` — one delivery — so a
 retry against an unconfigured connection dead-letters immediately. That is a
@@ -478,7 +478,7 @@ alert written for one service reads the same against the next:
 
 | | |
 |---|---|
-| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, or `failed` for anything that did not reach the broker, an interceptor's refusal included |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`; `unroutable` for a [mandatory](docs/publishing.md#when-reaching-no-queue-should-be-an-error) message the broker had nowhere to route; `failed` for anything that did not reach the broker, an interceptor's refusal included |
 | `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
 | `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
 | `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way in |

@@ -360,16 +360,27 @@ module AceMQ
           context
         end
 
-        # A publish that never reached the broker, or a handler that raised.
+        # A publish that never reached the broker or reached no queue, or a
+        # handler that raised.
         #
         # On the publish side this is the only hook that runs, so the span is
         # closed here. On the consume side +after_handle+ still runs afterwards
         # and closes it, so this records the exception and leaves it open.
+        #
+        # A message the broker took and could not route is +unroutable+ rather
+        # than +failed+, and carries the broker's own words as the reason. Both
+        # are errors — a publish that went nowhere is not a success — but they
+        # send whoever is reading the trace to two different places, and Go
+        # splits its publish span the same way for the same reason.
         def on_error(context, failure)
           if context.is_a?(PublishContext)
             scope = pop(@publishing)
+            outcome = Telemetry::Outcome.of_publish_failure(failure)
+            if scope && outcome == Telemetry::Outcome::UNROUTABLE
+              scope.span.set_attribute(REASON, failure.message.to_s)
+            end
             scope&.failed(failure)
-            finish(scope, "failed")
+            finish(scope, outcome)
           else
             peek(@consuming)&.failed(failure)
           end

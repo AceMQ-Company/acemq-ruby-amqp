@@ -38,12 +38,22 @@ module AceMQ
       # of them; {Patterns::Requester} is what usually sets it.
       attr_accessor :reply_to
 
-      def initialize(exchange:, routing_key:, envelope:, payload:, reply_to: nil)
+      # Whether the broker must hand this message back rather than drop it when
+      # it reaches no queue.
+      #
+      # Readable and writable, so an interceptor that redirects a message can
+      # also decide whether reaching nothing is allowed to be a silence. False
+      # unless the caller asked, which is what Go and Python default to as well.
+      attr_accessor :mandatory
+
+      def initialize(exchange:, routing_key:, envelope:, payload:, reply_to: nil,
+                     mandatory: false)
         @exchange = exchange
         @routing_key = routing_key
         @envelope = envelope
         @payload = payload
         @reply_to = reply_to
+        @mandatory = mandatory
       end
 
       # Adds an application header to the message about to be sent.

@@ -6,6 +6,100 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Changed
+
+- **A message that cannot be set aside is now rejected to the broker rather than
+  left unsettled.** This changes what happens to a message, so it is worth
+  reading rather than skimming.
+
+  When the republish to `{queue}.dlq` or `{queue}.parked` fails, the delivery is
+  now settled with a reject and no requeue. It used to be settled with nothing at
+  all: the `PublishError` escaped `handle`, the broker redelivered the message
+  when the channel closed, and it came back for as long as the queue was missing.
+
+  Nothing was lost that way, which is why it was left alone — but nothing drained
+  either. An unbounded redelivery loop on a message that cannot be set aside is a
+  queue that never empties and a handler that runs forever, and from outside it
+  looked exactly like a handler failing forever on the same message rather than
+  like a dead-letter queue nobody declared. A rejection is bounded and visible:
+  it happens once, and whatever dead-lettering the queue itself was declared with
+  is the last thing between the message and nothing.
+
+  Go and Python have always rejected here, and the divergence was documented
+  rather than closed because changing what happens to a message is not a call to
+  make in one library. It has been made: all three now do the same thing.
+
+  `acemq.messages.set.aside.failed` is unchanged, still labelled with `queue` and
+  `target`, and is now the *only* sign this path leaves — an unsettled delivery
+  used to be the other one. It is worth an alert.
+
+  **If you relied on the redelivery**, the message no longer comes back on its
+  own. Declare the queue — a consumer declares its own dead-letter and parking
+  queues at start-up, so this is a queue deleted underneath a running consumer or
+  a topology nobody applied — and replay from wherever the queue's own
+  dead-lettering put it.
+
+- **The set-aside republish is mandatory**, which is what makes that failure
+  visible at all. The default exchange drops what it cannot route without a word,
+  so a set-aside into a queue nobody declared used to be confirmed, acknowledged
+  and gone — the counter above never moved, because nothing had failed. It is now
+  a returned message, counted and rejected like any other failure to move one.
+  Go and Python publish this one mandatory for the same reason. Retries are
+  unaffected: a rung is checked by name before it is used, and asking the broker
+  the same question twice would buy nothing.
+
+### Added
+
+- **`mandatory:` on `publish`, and the `unroutable` outcome behind it.** A
+  confirm says the broker has the message; it does not say the message reached a
+  queue. An exchange with no matching binding, a typo in a routing key, a
+  consumer's queue that was never declared — all of them are confirmed and
+  dropped in the same breath. It is the quietest failure AMQP has: the publisher
+  succeeds, the consumer waits, and nothing anywhere says why.
+
+  ```ruby
+  begin
+    mq.publish(event, to: "order.placed", exchange: "orders-events", mandatory: true)
+  rescue AceMQ::AMQP::PublishError => e
+    raise unless e.unroutable?
+
+    logger.error("nothing is bound to order.placed: #{e.message}")
+  end
+  ```
+
+  **Off by default and per publish**, so nothing existing changes: turning it on
+  for everybody would turn a message nobody happens to be listening for *yet*
+  into an exception in code that has never seen one. It costs a round trip only
+  when a message really is unroutable — the broker's return arrives ahead of the
+  confirm the publish was already waiting for.
+
+- **`PublishError#unroutable?`.** `false` is a message the broker would not take,
+  `true` is one it took and could not route. One class with a flag rather than
+  two classes, so a caller who only wants to know the message did not arrive
+  still rescues one thing. Go and Python split the same failure the same way;
+  Java has it as `PublishOptions.allowUnroutable()`, the same choice made the
+  other way up. `PublishError.new("...")` and `raise PublishError, "..."` are
+  unchanged.
+
+- **`acemq.publish.total{outcome="unroutable"}`**, and `unroutable` on the publish
+  span with the broker's own reply text as `messaging.acemq.reason`. `unroutable`
+  was already in the shared outcome vocabulary and already in the list of
+  outcomes that make a span an error; it was the one word all five libraries
+  claimed to speak that Ruby could not write. It now writes it, off the same
+  failure the counter is read off, so the metric and the trace cannot disagree
+  about which of `unroutable` and `failed` happened.
+
+  Kept apart from `failed` deliberately: `failed` is a broker or a network,
+  `unroutable` is a binding nobody made, and an operator told `failed` goes
+  looking in the wrong place. The series stays at zero until something asks for a
+  mandatory publish.
+
+- **`PublishContext#mandatory`**, readable and writable, so an interceptor that
+  redirects a message can also decide whether reaching nothing is allowed to be a
+  silence.
+
 ## [0.5.0] - 2026-09-09
 
 ### Added

@@ -69,6 +69,43 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       expect(metrics[Telemetry::PUBLISH_TOTAL,
                      exchange: "", outcome: Telemetry::Outcome::CONFIRMED]).to eq(0)
     end
+
+    # The quietest failure AMQP has: the publish is confirmed, the consumer
+    # waits, and nothing anywhere says why. Only a mandatory publish is told,
+    # which is why the outcome is a different word from `failed` — an operator
+    # told `failed` goes looking at the broker, and the answer is a binding
+    # nobody made.
+    it "counts a mandatory publish the broker had nowhere to route as unroutable" do
+      transport.unroutable!("order.placed")
+
+      expect do
+        mq.publish({ "order_id" => "A-1" }, to: "order.placed",
+                                            exchange: "orders-events", mandatory: true)
+      end.to raise_error(AceMQ::AMQP::PublishError) { |e| expect(e.unroutable?).to be(true) }
+
+      events = { exchange: "orders-events" }
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **events,
+                     outcome: Telemetry::Outcome::UNROUTABLE]).to eq(1)
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **events,
+                     outcome: Telemetry::Outcome::FAILED]).to eq(0)
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **events,
+                     outcome: Telemetry::Outcome::CONFIRMED]).to eq(0)
+    end
+
+    # The default, and it has to stay the default: turning it on for everybody
+    # would turn a message nobody happens to be listening for yet into an
+    # exception in code that has never seen one.
+    it "does not ask for a return unless the caller did, and confirms as before" do
+      transport.unroutable!("order.placed")
+      mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders-events")
+
+      events = { exchange: "orders-events" }
+      expect(transport.published.map(&:mandatory)).to eq([false])
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **events,
+                     outcome: Telemetry::Outcome::CONFIRMED]).to eq(1)
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **events,
+                     outcome: Telemetry::Outcome::UNROUTABLE]).to eq(0)
+    end
   end
 
   describe "consuming" do

@@ -334,6 +334,35 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       expect(span_named("orders.new publish").status.code)
         .to eq(OpenTelemetry::Trace::Status::ERROR)
     end
+
+    # A message the broker took and could not route is not the same problem as
+    # one it would not take, and the span has to say which: `failed` sends
+    # whoever reads it to the broker, and the answer is a binding nobody made.
+    # Go splits its publish span the same way.
+    it "calls a message that reached no queue unroutable, and does call that an error" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      routing = AceMQ::AMQP::Connection.new(transport: transport, origin: "rspec@otel",
+                                            telemetry: metrics)
+      tracing.install(routing)
+      # Declared, so the exchange exists; bound to nothing, so nothing is
+      # listening. That is the shape the counter and the span are about.
+      routing.declare_exchange("orders", kind: "topic")
+
+      expect do
+        routing.publish({ "a" => 1 }, to: "order.placed", exchange: "orders", mandatory: true)
+      end.to raise_error(AceMQ::AMQP::PublishError)
+
+      span = span_named("orders publish")
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("unroutable")
+      expect(span.attributes["messaging.acemq.reason"]).to include("NO_ROUTE")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+      # The counter and the span, read off the one failure. This is the property
+      # every other outcome in this file is checked for.
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "orders", outcome: "unroutable"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "orders", outcome: "failed"]).to eq(0)
+    end
   end
 
   # The property the counters and the spans are meant to have: for one

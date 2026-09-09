@@ -118,3 +118,28 @@ RSpec.describe AceMQ::AMQP::Transport do
       .to eq("amqps://svc:***@broker:5671/prod")
   end
 end
+
+# One flag rather than two exception classes, so a caller who only wants to know
+# that the message did not arrive rescues one thing. Go and Python split the same
+# failure the same way, and the telemetry reads the word off this.
+RSpec.describe AceMQ::AMQP::PublishError do
+  it "is not unroutable unless it says so" do
+    expect(described_class.new("no confirm").unroutable?).to be(false)
+    # Raised with the two-argument form `raise Class, "message"` all over this
+    # library, which has to keep working.
+    error = begin
+      raise described_class, "no confirm"
+    rescue described_class => e
+      e
+    end
+    expect(error.unroutable?).to be(false)
+    expect(error.message).to eq("no confirm")
+  end
+
+  it "is a TransportError either way, so one rescue still catches both" do
+    unroutable = described_class.new("nowhere to route it", unroutable: true)
+
+    expect(unroutable.unroutable?).to be(true)
+    expect(unroutable).to be_a(AceMQ::AMQP::TransportError)
+  end
+end

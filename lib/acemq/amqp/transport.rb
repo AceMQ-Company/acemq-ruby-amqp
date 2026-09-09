@@ -27,8 +27,29 @@ module AceMQ
     # message: the same one may well go through once the broker is back.
     class TransportError < StandardError; end
 
-    # A message the broker would not take.
-    class PublishError < TransportError; end
+    # A message the broker would not take, or took and could not route.
+    #
+    # The two are told apart by {#unroutable?} rather than by two classes,
+    # because a caller who only wants to know that the message did not arrive
+    # should not have to rescue both. Go and Python split the same failure the
+    # same way — a flag on the one error — and the word the telemetry writes is
+    # read off it, so the counter and the span cannot disagree about which of
+    # the two happened.
+    class PublishError < TransportError
+      # Whether the broker accepted the message and had nowhere to put it.
+      #
+      # False for everything else: a refused publish, a connection that dropped
+      # mid-flight, a confirm that never came. Only a mandatory publish can ever
+      # set it, because only a mandatory publish is told.
+      def unroutable? = @unroutable
+
+      # @param message [String, nil]
+      # @param unroutable [Boolean]
+      def initialize(message = nil, unroutable: false)
+        super(message)
+        @unroutable = unroutable
+      end
+    end
 
     # One message, as it arrived, before any codec has looked at it.
     #
@@ -60,6 +81,81 @@ module AceMQ
 
       # Returns the message, requeued or not.
       def nack(requeue: false) = on_nack&.call(requeue)
+    end
+
+    # The messages the broker handed back, on their way to whoever sent them.
+    #
+    # A class of its own because it is the one place in this file where two
+    # threads meet: bunny dispatches +basic.return+ on its reader thread while
+    # the thread that published is still inside {Transport#publish} waiting for
+    # a confirm. It is also the only place that has to know bunny's rule for
+    # delivering a return, which is a rule about exchange objects rather than
+    # about messages.
+    #
+    # @api private
+    class ReturnedMessages
+      def initialize
+        @returns = Thread::Queue.new
+        @watched = []
+      end
+
+      # Gets ready to hear about this exchange, and forgets anything left over.
+      #
+      # bunny hands +basic.return+ to the +Bunny::Exchange+ object registered on
+      # the channel under that name and drops it with a warning when there is
+      # none, so there has to be one — and it has to be one that does not
+      # declare, because this transport publishes to exchanges the application
+      # declared and re-declaring one with a type guessed here is how a publish
+      # turns into PRECONDITION_FAILED. +no_declare+ is bunny's word for that;
+      # the default exchange skips the declaration on its own name anyway.
+      #
+      # Registered once per exchange. The object is kept by the channel, which
+      # is what makes throwing this one away safe.
+      #
+      # Anything still queued belongs to a publish that raised before it could
+      # read its own return, and attributing it to this message would report the
+      # wrong one as unroutable.
+      def arm(channel, exchange)
+        name = exchange.to_s
+        unless @watched.include?(name)
+          ::Bunny::Exchange.new(channel, :direct, name, no_declare: true)
+                           .on_return { |info, _properties, _content| record(info) }
+          @watched << name
+        end
+        @returns.clear
+      end
+
+      # Forgets which exchanges are watched, for a channel that has been
+      # reopened: the registrations lived on the old one and went with it.
+      def reopened
+        @watched = []
+        @returns.clear
+      end
+
+      # Why the message just published was handed back, or nil when it was not.
+      #
+      # Non-blocking, because a return that was coming has already arrived: the
+      # broker sends it ahead of the confirm and bunny dispatches frames in
+      # order, so a wait here would put the cost of +mandatory+ on every message
+      # rather than on the ones it is about.
+      def take
+        @returns.pop(true)
+      rescue ThreadError
+        nil
+      end
+
+      private
+
+      # Called on bunny's reader thread, so it does nothing but note the reason.
+      #
+      # The reply text is what the broker said and is worth keeping: NO_ROUTE is
+      # not the only reason a message comes back, and the others are the
+      # interesting ones.
+      def record(info)
+        code = info.reply_code
+        text = info.reply_text.to_s
+        @returns.push(text.empty? ? "returned #{code}" : "#{code} #{text}")
+      end
     end
 
     # The broker, over AMQP 0-9-1.
@@ -146,6 +242,7 @@ module AceMQ
         # on the channel it is about to acknowledge from.
         @pull_lock = Mutex.new
         @subscriptions = []
+        @returns = ReturnedMessages.new
       end
 
       # The bunny session, for the things this class deliberately does not wrap.
@@ -195,24 +292,48 @@ module AceMQ
       # having them, and the difference only ever shows up as messages that
       # were never anywhere.
       #
+      # +mandatory+ buys the other half of that. A confirm says the broker has
+      # the message; it does not say the message reached a queue, and a publish
+      # to an exchange with no matching binding is confirmed and dropped in the
+      # same breath. Asking for +mandatory+ makes the broker hand such a message
+      # back as +basic.return+ before it confirms it, which is the only way
+      # AMQP will tell you. It costs a round trip only when the message really
+      # is unroutable.
+      #
       # @param reply_to [String, nil] AMQP's own +reply-to+ property, left off
       #   the message entirely when it is nil
+      # @param mandatory [Boolean] whether reaching no queue is an error rather
+      #   than a silence
       # @return [String] the message id it went out with
-      # @raise [PublishError] when the broker did not confirm it
+      # @raise [PublishError] when the broker did not confirm it, or when it was
+      #   mandatory and reached no queue — {PublishError#unroutable?} tells the
+      #   two apart
       def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil,
-                  headers: {}, persistent: true, reply_to: nil)
+                  headers: {}, persistent: true, reply_to: nil, mandatory: false)
+        returned = nil
         confirmed = publish_channel do |channel|
+          @returns.arm(channel, exchange) if mandatory
           channel.basic_publish(body.to_s, exchange, routing_key,
                                 content_type: content_type, message_id: message_id,
-                                reply_to: presence(reply_to),
+                                reply_to: presence(reply_to), mandatory: mandatory,
                                 headers: stringify(headers), persistent: persistent)
-          channel.wait_for_confirms
+          # The return, when there is one, arrives ahead of the confirm and is
+          # dispatched on the reader thread while this one waits — so by the
+          # time the wait is over it is already waiting to be taken.
+          ok = channel.wait_for_confirms
+          returned = @returns.take if mandatory
+          ok
         end
-        return message_id if confirmed
+        unless confirmed
+          raise PublishError,
+                "the broker would not confirm message #{message_id} on exchange " \
+                "#{exchange.inspect} with key #{routing_key.inspect}"
+        end
+        return message_id if returned.nil?
 
-        raise PublishError,
-              "the broker would not confirm message #{message_id} on exchange " \
-              "#{exchange.inspect} with key #{routing_key.inspect}"
+        raise PublishError.new("the broker had nowhere to route message #{message_id} " \
+                               "published to exchange #{exchange.inspect} with key " \
+                               "#{routing_key.inspect}: #{returned}", unroutable: true)
       rescue PublishError
         raise
       rescue StandardError => e
@@ -407,6 +528,7 @@ module AceMQ
           if @publish_channel.nil? || !@publish_channel.open?
             @publish_channel = @session.create_channel
             @publish_channel.confirm_select
+            @returns.reopened
           end
           yield @publish_channel
         end

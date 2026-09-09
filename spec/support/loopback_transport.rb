@@ -30,13 +30,26 @@ class LoopbackTransport
     @closed = false
   end
 
-  def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil, headers: {},
-              persistent: true, reply_to: nil) # rubocop:disable Lint/UnusedMethodArgument
+  def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil,
+              headers: {}, reply_to: nil, mandatory: false,
+              persistent: true) # rubocop:disable Lint/UnusedMethodArgument
     @published << FakeTransport::Published.new(
       exchange: exchange, routing_key: routing_key, body: body, content_type: content_type,
-      message_id: message_id, headers: headers, reply_to: reply_to
+      message_id: message_id, headers: headers, reply_to: reply_to, mandatory: mandatory
     )
-    routed(exchange, routing_key).each do |queue|
+    queues = routed(exchange, routing_key)
+    # The broker's own rule, and the reason `mandatory` exists: a message that
+    # matched no binding is confirmed and dropped, and only a publisher that
+    # asked to be told ever hears about it. Recorded above either way, because a
+    # test asking what was published is asking what went on the wire.
+    if mandatory && queues.empty?
+      raise AceMQ::AMQP::PublishError.new(
+        "the broker had nowhere to route message #{message_id} published to exchange " \
+        "#{exchange.inspect} with key #{routing_key.inspect}: 312 NO_ROUTE", unroutable: true
+      )
+    end
+
+    queues.each do |queue|
       offer(queue, body: body, content_type: content_type, routing_key: routing_key,
                    message_id: message_id, headers: headers, reply_to: reply_to)
     end

@@ -184,11 +184,23 @@ module AceMQ
       #   is not a header: it is the property Java and .NET responders read, and
       #   {Patterns::Requester} writes it alongside the +acemq-reply-to+ header
       #   so that a responder in any of the five libraries can answer.
+      # @param mandatory [Boolean] whether a message that reaches no queue at
+      #   all is an error rather than a silence. False by default, which is what
+      #   the broker does on its own and what Go and Python default to: a
+      #   publish to an exchange with no matching binding is confirmed and
+      #   dropped, and nothing anywhere says so. Pass +true+ and the broker
+      #   hands the message back instead, which raises a {PublishError} whose
+      #   {PublishError#unroutable?} is true, counts
+      #   +acemq.publish.total{outcome="unroutable"}+, and marks the publish
+      #   span +unroutable+. It costs a round trip only when a message really
+      #   did go nowhere.
       # @param fields [Hash] envelope fields, when no envelope is given
       # @return [Envelope] what was actually put on the wire, which is what the
       #   interceptors left rather than what was handed in
+      # @raise [PublishError] when the broker would not take the message, or
+      #   when +mandatory+ and it reached no queue
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
-                  reply_to: nil, **fields)
+                  reply_to: nil, mandatory: false, **fields)
         if envelope && !fields.empty?
           raise ArgumentError,
                 "publish was given both an envelope and the fields to build one " \
@@ -202,14 +214,20 @@ module AceMQ
         # paths through the one method every message in the process goes down.
         context = PublishContext.new(exchange: exchange, routing_key: to,
                                      envelope: envelope, payload: payload,
-                                     reply_to: reply_to)
+                                     reply_to: reply_to, mandatory: mandatory)
         send_intercepted(context, codec, persistent)
       rescue StandardError => e
         # Counted before the interceptors are told, so a publish refused by an
         # interceptor is counted too. It did not reach the broker, which is the
         # thing this metric is about.
-        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
-                         exchange: exchange, outcome: Telemetry::Outcome::FAILED)
+        #
+        # +unroutable+ rather than +failed+ for a message the broker took and
+        # could not route, because those are two different problems: a failed
+        # publish is a broker or a network, an unroutable one is a binding
+        # nobody made, and an operator told +failed+ goes looking in the wrong
+        # place. The span reads the same word off the same failure.
+        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1, exchange: exchange,
+                                                      outcome: Telemetry::Outcome.of_publish_failure(e))
         @interceptors.on_publish_error(context, e) if context
         raise
       end
@@ -355,7 +373,8 @@ module AceMQ
                            body: codec.encode(context.payload),
                            content_type: codec.content_type, message_id: context.envelope.id,
                            headers: context.envelope.to_headers(context.routing_key),
-                           persistent: persistent, reply_to: context.reply_to)
+                           persistent: persistent, reply_to: context.reply_to,
+                           mandatory: context.mandatory)
         @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
                          exchange: context.exchange, outcome: Telemetry::Outcome::CONFIRMED)
         @interceptors.after_confirm(context)
@@ -758,40 +777,52 @@ module AceMQ
       # Republishes to a dead-letter or parking queue with the reason attached,
       # then acknowledges the original.
       #
-      # What happens when the republish itself fails is worth writing down,
-      # because it is not what Go and Python do. There, a message that cannot be
-      # moved is rejected to the broker, so the delivery is settled either way.
-      # Here the {PublishError} escapes {#handle} entirely: the delivery is never
-      # settled, and the broker redelivers it when the channel closes. Nothing is
-      # lost, which is why this has been left alone — but a message that keeps
-      # coming back because its dead-letter queue is missing looks, from outside,
-      # exactly like a handler that keeps failing.
+      # The republish is mandatory, so a dead-letter queue that is not on the
+      # broker is an answer rather than a silence: the default exchange drops
+      # what it cannot route, and without +mandatory+ a message set aside into a
+      # queue nobody declared is confirmed, acknowledged and gone. Go and Python
+      # both publish this one mandatory for the same reason.
       #
-      # +acemq.messages.set.aside.failed+ is what tells the two apart. It is the
-      # same counter Go and Python raise in the same situation, so an alert
-      # written once reads the same against all three, and it is the only sign
-      # this path leaves. Counted and then re-raised, deliberately: counting is
-      # not a reason to change what happens to the message.
+      # **A message that cannot be moved is rejected to the broker**, not
+      # requeued and not left unsettled. This library used to let the
+      # {PublishError} escape {#handle} instead, which settled nothing and let
+      # the broker redeliver — nothing was lost, but the message came back for
+      # ever, the handler ran for ever, and from outside it looked exactly like a
+      # handler failing on the same message rather than like a queue that is
+      # missing. A rejection is bounded and visible: it is settled once, and
+      # whatever dead-lettering the queue itself was declared with is the last
+      # thing between this message and nothing. Go and Python do the same, and
+      # this is now the whole family's answer.
+      #
+      # +acemq.messages.set.aside.failed+ is what says which of the two happened,
+      # tagged with the queue that could not be reached. It is the same counter
+      # in all three languages, so an alert written once reads the same against
+      # them, and it is still the only sign this path leaves.
       def set_aside(target, delivery, envelope, reason)
-        begin
-          republish(target, delivery, envelope.with(error: reason))
-        rescue StandardError
-          @telemetry.count(Telemetry::SET_ASIDE_FAILED, 1, queue: @queue, target: target)
-          raise
-        end
+        republish(target, delivery, envelope.with(error: reason), mandatory: true)
+      rescue StandardError
+        @telemetry.count(Telemetry::SET_ASIDE_FAILED, 1, queue: @queue, target: target)
+        delivery.nack(requeue: false)
+      else
         # Only once the copy is safely elsewhere. Acknowledging first would drop
-        # the message on a broker that then refused the copy.
+        # the message on a broker that then refused the copy — and +else+ rather
+        # than a line after the +rescue+, so that a failure to acknowledge is not
+        # counted as a failure to move the message and does not then nack it too.
         delivery.ack
       end
 
       # +reply_to+ travels with the copy. A request that is retried, dead-lettered
       # or parked keeps the property saying where its answer was meant to go, so
       # a replay off the dead-letter queue can still answer whoever asked.
-      def republish(queue, delivery, envelope)
+      #
+      # +mandatory+ only where the caller has somewhere to go when the queue is
+      # missing. A retry has {#declared?} and its own rung-missing path, and
+      # asking the broker the same question twice would buy nothing.
+      def republish(queue, delivery, envelope, mandatory: false)
         @transport.publish(exchange: "", routing_key: queue, body: delivery.body,
                            content_type: delivery.content_type, message_id: envelope.id,
-                           headers: envelope.to_headers(delivery.routing_key), persistent: true,
-                           reply_to: delivery.reply_to)
+                           headers: envelope.to_headers(delivery.routing_key),
+                           persistent: true, reply_to: delivery.reply_to, mandatory: mandatory)
       end
 
       def describe(error)

@@ -1007,4 +1007,124 @@ RSpec.describe "against a real broker", :integration do
       expect(wait_for { mq.message_count(queue) == 1 }).to be(true)
     end
   end
+
+  # The half a confirm does not cover, and the reason it needs a real broker:
+  # every part of this is the broker's, from the `mandatory` bit on the wire to
+  # the basic.return frame that comes back before the confirm does. A fake can
+  # be told to behave this way; only RabbitMQ can prove it does.
+  describe "a mandatory publish" do
+    let(:queue) { queue_named("mandatory") }
+    let(:nowhere) { queue_named("mandatory.nobody-declared-this") }
+    let(:exchange) { "#{PREFIX}mandatory-events" }
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:mq) do
+      AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", telemetry: metrics)
+    end
+
+    before do
+      scrub(queue, nowhere)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+      mq.declare_exchange(exchange, kind: "topic")
+    end
+
+    after do
+      scrub(queue, nowhere)
+      mq.transport.delete_exchange(exchange)
+    end
+
+    it "raises, counts and marks unroutable when the broker hands the message back" do
+      expect { mq.publish({ "order_id" => "A-1" }, to: nowhere, mandatory: true) }
+        .to raise_error(AceMQ::AMQP::PublishError) do |error|
+          expect(error.unroutable?).to be(true)
+          # The broker's own words. NO_ROUTE is the usual one and not the only
+          # one, which is why the reply text is kept rather than a flag.
+          expect(error.message).to include("NO_ROUTE")
+        end
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "unroutable"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "failed"]).to eq(0)
+    end
+
+    it "reports an exchange with no matching binding, which a queue name cannot show" do
+      # The case a confirm can never catch: the exchange exists, the publish is
+      # perfectly valid, and the message matches no binding. Confirmed and
+      # dropped in the same breath unless somebody asked to be told.
+      expect do
+        mq.publish({ "order_id" => "A-2" }, to: "order.placed",
+                                            exchange: exchange, mandatory: true)
+      end.to raise_error(AceMQ::AMQP::PublishError, /NO_ROUTE/)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: exchange, outcome: "unroutable"]).to eq(1)
+    end
+
+    it "confirms a mandatory message that did reach a queue, like any other" do
+      mq.publish({ "order_id" => "A-3" }, to: queue, mandatory: true)
+
+      expect(wait_for { mq.message_count(queue) == 1 }).to be(true)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "confirmed"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "unroutable"]).to eq(0)
+    end
+
+    it "leaves a publish that did not ask alone, which is what the default is for" do
+      # Confirmed and silently dropped: the broker's own behaviour, unchanged
+      # for every caller who did not ask. This is why `mandatory` is opt-in.
+      mq.publish({ "order_id" => "A-4" }, to: nowhere)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "confirmed"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "unroutable"]).to eq(0)
+    end
+  end
+
+  # The whole reason the set-aside republish is mandatory, and the behaviour
+  # that changed with it: a dead-letter queue that is not on the broker used to
+  # swallow the copy without a word, and before that it left the delivery
+  # unsettled for the broker to hand back for ever. It is rejected now, once.
+  describe "a dead letter with nowhere to go" do
+    let(:queue) { queue_named("no-dlq") }
+    let(:dlq) { AceMQ::AMQP::Naming.dead_letter_queue(queue) }
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:mq) do
+      AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", telemetry: metrics)
+    end
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after { scrub(queue) }
+
+    it "rejects the message rather than letting the broker redeliver it for ever" do
+      seen = 0
+      consumer = mq.consume(queue) do |_message|
+        seen += 1
+        AceMQ::AMQP::Ack.reject("no such customer")
+      end
+      # Taken away underneath the consumer, which declared it at start-up. A
+      # broker change nobody told the consumer about is the realistic version of
+      # this; deleting it is the reproducible one.
+      mq.delete_queue(dlq)
+
+      mq.publish({ "order_id" => "A-1" }, to: queue)
+
+      expect(wait_for do
+        metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED, queue: queue, target: dlq] == 1
+      end).to be(true)
+
+      # Settled, so it does not come back. The old behaviour was an unsettled
+      # delivery, which the broker redelivers as soon as the channel closes and
+      # which turns one bad message into a handler that never stops.
+      sleep(0.5)
+      expect(seen).to eq(1)
+      expect(mq.message_count(queue)).to eq(0)
+      consumer.cancel
+    end
+  end
 end

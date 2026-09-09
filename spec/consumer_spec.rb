@@ -451,35 +451,70 @@ RSpec.describe AceMQ::AMQP::Consumer do
   end
 
   # Republishing to the dead-letter or parking queue can itself fail — a queue
-  # that was never declared is the usual reason. Nothing is lost: the delivery
-  # is never settled and the broker redelivers it. What that looks like from
-  # outside is a handler failing over and over on the same message, and this
-  # counter is the only thing that tells the two apart.
+  # that was never declared is the usual reason. The message is rejected to the
+  # broker rather than left unsettled: an unsettled delivery is redelivered for
+  # ever, which is a queue that never drains and a handler that runs for ever,
+  # and from outside it looks exactly like a handler failing on the same message
+  # rather than like a dead-letter queue that is missing. This counter is the
+  # only thing that tells the two apart. Go and Python reject here too.
   describe "a message that cannot be set aside" do
-    it "counts acemq.messages.set.aside.failed and leaves the delivery unsettled" do
+    it "counts acemq.messages.set.aside.failed and rejects the delivery" do
       metrics = AceMQ::AMQP::Telemetry::Registry.new
       transport.refuse!("orders.new.dlq")
       delivery, recorder = FakeDelivery.build(headers: headers_for)
 
       expect { consumer(telemetry: metrics) { Ack.reject("nope") }.handle(delivery) }
-        .to raise_error(AceMQ::AMQP::PublishError)
+        .not_to raise_error
 
       expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
                      queue: "orders.new", target: "orders.new.dlq"]).to eq(1)
+      expect(recorder.rejected?).to be(true)
       expect(recorder.acked?).to be(false)
+      # Not requeued, which is the whole difference. A requeue is the loop this
+      # used to have with extra steps.
       expect(recorder.requeued?).to be(false)
     end
 
     it "counts it for the parking queue too, and names which one it was" do
       metrics = AceMQ::AMQP::Telemetry::Registry.new
       transport.refuse!("orders.new.parked")
-      delivery, = FakeDelivery.build(body: "{ not json", headers: headers_for)
+      delivery, recorder = FakeDelivery.build(body: "{ not json", headers: headers_for)
 
-      expect { consumer(telemetry: metrics) { Ack.accept }.handle(delivery) }
-        .to raise_error(AceMQ::AMQP::PublishError)
+      consumer(telemetry: metrics) { Ack.accept }.handle(delivery)
 
       expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
                      queue: "orders.new", target: "orders.new.parked"]).to eq(1)
+      expect(recorder.rejected?).to be(true)
+      expect(recorder.requeued?).to be(false)
+    end
+
+    # A dead-letter queue that is not on the broker is the case this counter
+    # exists for, and it is the one the default exchange hides: it drops what it
+    # cannot route without a word, so a set-aside into a queue nobody declared
+    # used to be confirmed, acknowledged and gone. The republish is mandatory so
+    # that the broker has to say something, which is what Go and Python do.
+    it "publishes the copy mandatory, so a missing queue is heard rather than dropped" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      transport.unroutable!("orders.new.dlq")
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+
+      consumer(telemetry: metrics) { Ack.reject("nope") }.handle(delivery)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
+                     queue: "orders.new", target: "orders.new.dlq"]).to eq(1)
+      expect(recorder.rejected?).to be(true)
+      expect(recorder.acked?).to be(false)
+    end
+
+    it "leaves a retry alone: a rung is asked for by name, not by publishing at it" do
+      # Only the set-aside republish is mandatory. A retry has its own
+      # rung-missing path, and asking the broker the same question twice would
+      # buy nothing.
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 0)) { Ack.retry }.handle(delivery)
+
+      expect(transport.published_to("orders.new").size).to eq(1)
+      expect(transport.published.map(&:mandatory)).to all(be_falsey)
     end
   end
 

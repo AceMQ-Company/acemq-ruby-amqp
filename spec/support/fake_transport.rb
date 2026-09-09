@@ -10,7 +10,7 @@
 # things only a real broker can: that a message survives the wire.
 class FakeTransport
   Published = Struct.new(:exchange, :routing_key, :body, :content_type, :message_id, :headers,
-                         :reply_to, keyword_init: true)
+                         :reply_to, :mandatory, keyword_init: true)
 
   attr_reader :published, :declared_queues, :declared_exchanges, :bindings
 
@@ -21,6 +21,7 @@ class FakeTransport
     @bindings = []
     @missing = []
     @refused = []
+    @unroutable = []
     @closed = false
   end
 
@@ -28,16 +29,24 @@ class FakeTransport
   # there is nothing for it to mean. It is in the signature because a fake that
   # takes fewer arguments than the real thing stops catching the mistake it
   # exists to catch.
-  def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil, headers: {},
-              persistent: true, reply_to: nil) # rubocop:disable Lint/UnusedMethodArgument
+  def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil,
+              headers: {}, reply_to: nil, mandatory: false,
+              persistent: true) # rubocop:disable Lint/UnusedMethodArgument
     if @refused.include?(routing_key)
       raise AceMQ::AMQP::PublishError,
             "the broker would not confirm message #{message_id} with key #{routing_key.inspect}"
     end
 
+    if mandatory && @unroutable.include?(routing_key)
+      raise AceMQ::AMQP::PublishError.new(
+        "the broker had nowhere to route message #{message_id} " \
+        "with key #{routing_key.inspect}: 312 NO_ROUTE", unroutable: true
+      )
+    end
+
     @published << Published.new(exchange: exchange, routing_key: routing_key, body: body,
                                 content_type: content_type, message_id: message_id,
-                                headers: headers, reply_to: reply_to)
+                                headers: headers, reply_to: reply_to, mandatory: mandatory)
     message_id
   end
 
@@ -72,6 +81,12 @@ class FakeTransport
   # refuses a publish to a queue that is not there and is not being created.
   # How the set-aside failure path is reached without a broker.
   def refuse!(*names) = @refused.concat(names)
+
+  # Confirms a publish to these keys and hands it straight back, the way a
+  # broker returns a mandatory message it has nowhere to route. Only a mandatory
+  # publish notices, which is the point: without it the message is confirmed and
+  # dropped, exactly as it is on a real broker.
+  def unroutable!(*names) = @unroutable.concat(names)
 
   # What was published to a queue through the default exchange, which is how
   # both dead-lettering and parking get there.
@@ -118,4 +133,9 @@ class FakeDelivery
   def record_nack(requeue) = @nacked << requeue
   def acked? = @acked.positive?
   def requeued? = @nacked.include?(true)
+
+  # Rejected without a requeue, which is what settles a message the broker is
+  # not going to hand back.
+  def rejected? = @nacked.include?(false)
+  def settled? = acked? || !@nacked.empty?
 end

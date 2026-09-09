@@ -115,13 +115,61 @@ end
 
 Publishing is confirmed: the transport waits for the broker to acknowledge the
 message and raises `PublishError` if it does not. A publish that returns has
-been accepted by the broker — not necessarily routed to a queue, which is a
-separate thing an unbound exchange will do silently.
+been accepted by the broker — not necessarily *routed to a queue*, which is a
+separate thing an unbound exchange will do silently, and which the next section
+is about.
 
 Whatever the failure, `acemq.publish.total{outcome="failed"}` is counted before the
 interceptors are told, so a publish an interceptor refused is counted too. It
 did not reach the broker, which is what the metric is about. See
 [metrics and health](observability.md).
+
+## When reaching no queue should be an error
+
+A confirm says the broker has the message. It does not say the message reached a
+queue, and the two come apart more often than they look like they should: an
+exchange with no matching binding, a typo in a routing key, a consumer's queue
+that was never declared. The publish is confirmed and the message is dropped in
+the same breath. It is the quietest failure AMQP has — the publisher succeeded,
+the consumer is still waiting, and nothing anywhere says why.
+
+`mandatory: true` asks the broker to hand the message back instead:
+
+```ruby
+begin
+  mq.publish(event, to: "order.placed", exchange: "orders-events", mandatory: true)
+rescue AceMQ::AMQP::PublishError => e
+  raise unless e.unroutable?
+
+  logger.error("nothing is bound to order.placed on orders-events: #{e.message}")
+end
+```
+
+`PublishError#unroutable?` is what separates the two: `false` is a message the
+broker would not take, `true` is one it took and could not route. One exception
+class with a flag rather than two classes, so a caller who only wants to know
+that the message did not arrive still rescues one thing. Go and Python split the
+same failure the same way; Java has it as `PublishOptions.allowUnroutable()`,
+which is the same choice made the other way up.
+
+**It is off by default**, and per publish. Turning it on for everybody would turn
+a message nobody happens to be listening for *yet* into an exception in code that
+has never seen one, which is a fair description of most first deployments. It
+also costs a round trip only when a message really is unroutable: the return
+frame arrives ahead of the confirm the publish was already waiting for, so a
+message that routes normally pays nothing.
+
+An unroutable publish counts `acemq.publish.total{outcome="unroutable"}` rather
+than `outcome="failed"`, and marks the publish span `unroutable`, which **is** an
+error outcome — with the broker's own reply text as `messaging.acemq.reason`. The
+word is kept apart from `failed` because they are fixed in different places:
+`failed` is a broker or a network, `unroutable` is a binding nobody made.
+
+The consumer uses this on its own account. A message being set aside into
+`{queue}.dlq` or `{queue}.parked` is republished mandatory, so a dead-letter queue
+that is not on the broker is heard rather than silently swallowed by the default
+exchange — see
+[when a message cannot be set aside](reliability.md#when-a-message-cannot-be-set-aside-at-all).
 
 ## Publishing and a database in the same breath
 

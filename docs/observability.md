@@ -19,7 +19,7 @@ written for one reads the same against another:
 
 | | |
 |---|---|
-| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed` or `failed` |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, `unroutable` or `failed` |
 | `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
 | `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
 | `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way **in** |
@@ -37,6 +37,14 @@ written against the old Ruby names — every one of them changed.
 `acemq.publish.total` counts a publish an interceptor refused as `failed` too. It
 did not reach the broker, which is what the metric is about; whether it was the
 broker or a policy that said no is the exception's business.
+
+`outcome=unroutable` is its own word, and not a kind of `failed`. It is a message
+the broker took and had nowhere to route — the quietest failure AMQP has, because
+the publish succeeds, the consumer waits, and nothing anywhere says why. Only a
+[mandatory publish](publishing.md#when-reaching-no-queue-should-be-an-error) is
+ever told, so this series stays at zero until something asks for one. Keeping it
+apart from `failed` is the point: `failed` is a broker or a network, `unroutable`
+is a binding nobody made, and they are fixed in different places.
 
 `acemq.consume.attempts` is two numbers in one. Its **sample count** is how many
 deliveries this consumer was given, taken on the way in — so a handler that never
@@ -245,17 +253,17 @@ the life of a consumer, and only on the retry path. See
 `acemq.messages.set.aside.failed`.
 
 A message that ran out of attempts, or that a handler rejected or parked, is
-republished to `{queue}.dlq` or `{queue}.parked`. When that republish is itself
-refused — a queue that was never declared is the usual reason — this counter goes
-up, labelled with the `queue` it came from and the `target` it could not reach.
+republished to `{queue}.dlq` or `{queue}.parked`. When that republish is refused,
+or reaches no queue at all — a queue that was never declared is the usual reason
+for both — this counter goes up, labelled with the `queue` it came from and the
+`target` it could not reach.
 
-Nothing is lost. The failure escapes the handler, the delivery is never settled,
-and the broker redelivers it when the channel closes. But from outside, a message
-that keeps coming back because its dead-letter queue is missing looks exactly
-like a handler failing over and over on the same message, and this counter is the
-only thing that tells the two apart. Anything above zero means a topology was
-never applied. Go and Python raise the same counter where they instead reject the
-message to the broker, so one alert reads the same against all three.
+The message is rejected to the broker rather than left unsettled, so the delivery
+ends once instead of being redelivered until somebody notices. That makes this
+counter the only sign the path leaves, which is exactly why it is worth an alert:
+anything above zero means a topology was never applied, and it names the queue to
+declare. Go and Python reject and count the same way, so one alert reads the same
+against all three.
 
 ## Tracing
 
@@ -346,9 +354,11 @@ queue being long, and it is not evidence that anything went wrong here. Java and
 Go write the same word without marking the span red. Anything else raised inside
 `tracing.request` is `failed` and *is* an error.
 
-`unroutable` is the one word in the shared vocabulary this library never writes:
-it needs a mandatory publish and the broker's basic.return, which this
-transport does not use. See [the divergences it leaves](#what-is-not-raised-for-you).
+`unroutable` is written for a message the broker took and could not route, which
+only a [mandatory publish](publishing.md#when-reaching-no-queue-should-be-an-error)
+is ever told about. It is an error, and a different one from `failed`: `failed`
+sends whoever reads the trace to the broker, and the answer is a binding nobody
+made.
 
 A retry the handler marked `FatalError` is reported as `dead_lettered` rather
 than `retried`, because that is what the consumer will actually do with it.
@@ -427,13 +437,6 @@ how long the record sat between being committed and going out, which is the
 number that says whether a relay is keeping up.
 
 ### What is not raised for you
-
-`unroutable` is never written. It is the outcome for a message the broker
-accepted and then routed to no queue at all, which is only visible through a
-mandatory publish and a `basic.return` handler; this library publishes with
-confirms and not with `mandatory`, so it never learns that a message went
-nowhere. The word stays in the error list so that a span written by a Java or Go
-service reads correctly here.
 
 `pipeline.run_finished` is a method you call and nothing in this library calls
 it. Java has a `Pipeline` object that owns a name and a list of steps, so it
