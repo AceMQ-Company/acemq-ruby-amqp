@@ -44,9 +44,14 @@ module AceMQ
     # channel. That keeps the consumer from knowing which channel a message
     # came down, which is the whole reason a fake transport can stand in for a
     # broker in a test.
+    #
+    # +reply_to+ is AMQP's own property and not a header, which is why it is a
+    # field here rather than something read out of +headers+. The Java and .NET
+    # libraries write requests with it and nothing else, so a Ruby responder
+    # that could not see it could not answer them.
     Delivery = Struct.new(
       :body, :content_type, :routing_key, :message_id, :headers, :redelivered,
-      :on_ack, :on_nack, keyword_init: true
+      :reply_to, :on_ack, :on_nack, keyword_init: true
     ) do
       def redelivered? = !!redelivered
 
@@ -190,13 +195,16 @@ module AceMQ
       # having them, and the difference only ever shows up as messages that
       # were never anywhere.
       #
+      # @param reply_to [String, nil] AMQP's own +reply-to+ property, left off
+      #   the message entirely when it is nil
       # @return [String] the message id it went out with
       # @raise [PublishError] when the broker did not confirm it
       def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil,
-                  headers: {}, persistent: true)
+                  headers: {}, persistent: true, reply_to: nil)
         confirmed = publish_channel do |channel|
           channel.basic_publish(body.to_s, exchange, routing_key,
                                 content_type: content_type, message_id: message_id,
+                                reply_to: presence(reply_to),
                                 headers: stringify(headers), persistent: persistent)
           channel.wait_for_confirms
         end
@@ -442,6 +450,7 @@ module AceMQ
           message_id: properties[:message_id].to_s,
           headers: properties[:headers] || {},
           redelivered: info.redelivered,
+          reply_to: properties[:reply_to].to_s,
           on_ack: -> { settle.call { channel.ack(tag, false) } },
           on_nack: ->(requeue) { settle.call { channel.nack(tag, false, requeue) } }
         )
@@ -466,6 +475,14 @@ module AceMQ
         return {} if table.nil? || table.empty?
 
         table.to_h { |name, value| [name.to_s, value] }
+      end
+
+      # An empty property is absent rather than blank. A +reply-to+ carrying ""
+      # is a reply-to somebody has to write a special case for at the other end,
+      # which is the same rule {Envelope#to_headers} follows for its headers.
+      def presence(value)
+        text = value.to_s
+        text.empty? ? nil : text
       end
     end
   end

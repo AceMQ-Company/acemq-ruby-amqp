@@ -22,35 +22,39 @@ written for one reads the same against another:
 | `acemq.messages.published` | by `exchange` |
 | `acemq.messages.publish.failed` | by `exchange`, including a publish an interceptor refused |
 | `acemq.messages.consumed` | by `queue`, counted on the way **in** |
-| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` | by `queue` — what the consumer decided, one of the four per delivery |
-| `acemq.messages.parked` | nothing could decode it |
+| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` / `.parked` | by `queue` — what the consumer decided, one of the five per delivery |
+| `acemq.messages.set.aside.failed` | by `queue` and `target`; see [below](#the-two-worth-an-alert) |
 | `acemq.handler.duration` | seconds; handler and interceptors together |
 | `acemq.messages.in.flight` | a gauge, per queue |
-| `acemq.retry.rung.missing` | see [below](#the-one-worth-an-alert) |
+| `acemq.retry.rung.missing` | see [below](#the-two-worth-an-alert) |
 
 `consumed` is counted on the way in rather than on the way out, so a handler that
 never returns is still a message this consumer was given — which is the number
 you want when the question is why a queue is not draining.
+
+`parked` counts the messages nothing could read: a body no codec could decode, or
+one a handler answered with `Ack.park`. Both go to `{queue}.parked` and both
+carry `messaging.acemq.outcome = "parked"` on their span.
 
 `handler.duration` is the handler **and** the interceptors together. That is the
 number worth having: it is how long a message occupied one of this consumer's
 prefetch slots, and an interceptor that is slow costs exactly as much as a
 handler that is.
 
-### The four outcome counters are what the consumer decided
+### The outcome counters are what the consumer decided
 
-`accepted`, `retried`, `rejected` and `dead.lettered` are the four
+`accepted`, `retried`, `rejected`, `dead.lettered` and `parked` are the
 [`Settlement`](interceptors.md#the-settlement) outcomes, one counter each, and
 **exactly one of them goes up per delivery**. They are read off the same
 decision the span's `messaging.acemq.outcome` attribute is read off, so a
-delivery counted as `dead.lettered` has a span saying `dead_lettered`, and the
-two cannot drift.
+delivery counted as `dead.lettered` has a span saying `dead_lettered`, one
+counted as `parked` has a span saying `parked`, and the two cannot drift.
 
 That is worth saying because it used to be otherwise: the counters classified by
 the `Ack` the handler returned, and an `Ack` cannot know whether there is an
 attempt left to spend. A handler asking for a retry on its last attempt
 incremented `retried` on its way to the dead-letter queue and was counted again
-as `dead.lettered`, so `consumed` never equalled the sum of the four and the
+as `dead.lettered`, so `consumed` never equalled the sum of them and the
 retry rate included messages that were never retried.
 
 **What a dashboard will show after upgrading**: `acemq.messages.retried` falls
@@ -162,7 +166,7 @@ Serve it on a port the ingress does not publish. What a service publishes and
 how long its handlers take is more than an anonymous caller should be able to
 learn.
 
-### The one worth an alert
+### The two worth an alert
 
 `acemq.retry.rung.missing`.
 
@@ -176,6 +180,21 @@ lost; what is lost is the reason the rung exists, since a restart mid-wait now
 turns a five-minute backoff into none. The check is one round trip per rung for
 the life of a consumer, and only on the retry path. See
 [reliability](reliability.md#when-a-rung-is-missing).
+
+`acemq.messages.set.aside.failed`.
+
+A message that ran out of attempts, or that a handler rejected or parked, is
+republished to `{queue}.dlq` or `{queue}.parked`. When that republish is itself
+refused — a queue that was never declared is the usual reason — this counter goes
+up, labelled with the `queue` it came from and the `target` it could not reach.
+
+Nothing is lost. The failure escapes the handler, the delivery is never settled,
+and the broker redelivers it when the channel closes. But from outside, a message
+that keeps coming back because its dead-letter queue is missing looks exactly
+like a handler failing over and over on the same message, and this counter is the
+only thing that tells the two apart. Anything above zero means a topology was
+never applied. Go and Python raise the same counter where they instead reject the
+message to the broker, so one alert reads the same against all three.
 
 ## Tracing
 
@@ -286,7 +305,7 @@ it.
 that went up are the same decision said twice, so
 `acemq.messages.dead.lettered` and `outcome=dead_lettered` always name the same
 deliveries. See [the four outcome
-counters](#the-four-outcome-counters-are-what-the-consumer-decided).
+counters](#the-outcome-counters-are-what-the-consumer-decided).
 
 ### Events, not spans
 

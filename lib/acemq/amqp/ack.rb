@@ -16,8 +16,8 @@
 
 module AceMQ
   module AMQP
-    # What a handler says about a message: it worked, try it again, or never
-    # again.
+    # What a handler says about a message: it worked, try it again, never again,
+    # or put it somewhere a person will look.
     #
     # Returned rather than performed, so a handler that forgets to decide is
     # caught immediately rather than leaving a message unacknowledged until the
@@ -27,6 +27,7 @@ module AceMQ
       ACCEPT = :accept
       RETRY = :retry
       REJECT = :reject
+      PARK = :park
 
       attr_reader :action, :error
 
@@ -60,9 +61,31 @@ module AceMQ
         new(REJECT, error)
       end
 
+      # Sends the message to +{queue}.parked+ without trying again.
+      #
+      # Parked and not dead-lettered, because they are different problems and
+      # the two queues exist to keep them apart: the dead-letter queue holds
+      # messages that were tried and failed, and the parking queue holds
+      # messages nothing could make sense of. A handler that already knows a
+      # message is unreadable — a field that is not a date where a date has to
+      # be, a version this service was never taught — used to have to reject it
+      # into the dead letters and lose that distinction. Somebody draining the
+      # dead-letter queue after an outage should not have to sort out the
+      # messages that were never going to work from the ones that failed while
+      # the database was down.
+      #
+      # The engine parks a message it could not decode by itself; this is the
+      # same destination, asked for by a handler that got further.
+      #
+      # @param reason [String, Exception, nil] why it cannot be read
+      def self.park(reason = nil)
+        new(PARK, reason)
+      end
+
       def accept? = action == ACCEPT
       def retry? = action == RETRY
       def reject? = action == REJECT
+      def park? = action == PARK
 
       def to_s = action.to_s
 

@@ -285,8 +285,10 @@ The message is **republished** to `{queue}.dlq` with the reason in
 
 All four routes end in the same queue, and the counters keep them apart:
 `Ack.reject` counts as `acemq.messages.rejected`, the other three as
-`acemq.messages.dead.lettered`, and neither is also counted as a retry. See
-[observability](observability.md#the-four-outcome-counters-are-what-the-consumer-decided).
+`acemq.messages.dead.lettered`, and neither is also counted as a retry.
+`Ack.park` is not one of these routes at all: it ends in `{queue}.parked` and
+counts as `acemq.messages.parked`. See
+[observability](observability.md#the-outcome-counters-are-what-the-consumer-decided).
 
 Acknowledging a failure looks wrong and is what makes it reliable: the message
 is already safely somewhere else, so the original is a copy that has been dealt
@@ -308,10 +310,45 @@ retrying cannot help: AceMQ::AMQP::FatalError: no such SKU
 A body **no codec can read** goes to `{queue}.parked` rather than `{queue}.dlq`,
 and is counted as `acemq.messages.parked`.
 
+So does a message a handler answers with `Ack.park`:
+
+```ruby
+mq.consume("orders.new") do |message|
+  next Ack.park("schema version #{message.envelope.version}") unless known?(message)
+  place(message.payload)
+  Ack.accept
+end
+```
+
+Same queue, same counter, same `parked` on the span. The engine parks what it
+could not decode; `Ack.park` is for the handler that got further and still knows
+the message is unreadable — a version this service was never taught, a field that
+is not a date where a date has to be. Without it such a handler had to reject the
+message into the dead letters, which is exactly the mixing the parking queue
+exists to prevent.
+
 A message that failed five times and a message nothing could read are different
 problems: one is a bug in the handler or a bad day for a downstream service, the
 other is a producer sending something this consumer was never taught. Mixing
 them means somebody sorts them by hand.
+
+### When a message cannot be set aside at all
+
+Republishing to `{queue}.dlq` or `{queue}.parked` can itself fail, and a queue
+that was never declared is the usual reason. Ruby does not settle the delivery in
+that case: the publish failure escapes the handler, nothing is acknowledged, and
+the broker redelivers the message when the channel closes. Nothing is lost, and
+the message keeps coming back until the queue exists.
+
+`acemq.messages.set.aside.failed` is counted when this happens, labelled with the
+`queue` and the `target` that could not be reached. It is worth an alert: from
+outside, a message redelivered forever because its dead-letter queue is missing
+is indistinguishable from a handler failing forever on the same message, and this
+counter is the only thing that says which it is.
+
+Go and Python differ here — they reject the message to the broker instead, so the
+delivery is settled either way — but they raise the same counter, so an alert
+written once reads the same against all three.
 
 For this to work, a codec has to raise `DecodeError` rather than its own
 exception class — see [codecs](serialization.md#writing-your-own).

@@ -101,13 +101,22 @@ module AceMQ
         REASON = "messaging.acemq.reason"
         OUTBOX_LAG = "messaging.acemq.outbox_lag_ms"
 
+        # What a failure is called when nothing more specific was said. The same
+        # word the counters use, which is the whole point of having one.
+        FAILED = "failed"
+
         # The outcomes that make a span an error, and the ones that do not.
         #
         # +retried+ and +rejected+ are deliberately absent. A message that will
         # be tried again has not failed yet, and a message the handler refused
         # on purpose is the system working; marking either as an error is how a
         # trace view fills with red and stops meaning anything.
-        FAILING_OUTCOMES = %w[unroutable failed dead_lettered].freeze
+        #
+        # +parked+ is here with +dead_lettered+: a message nothing could read,
+        # or one a handler said was unreadable, is a message that will never be
+        # processed, and the parking queue exists because somebody has to go and
+        # look at it.
+        FAILING_OUTCOMES = %w[unroutable failed dead_lettered parked].freeze
 
         # Runs before every other interceptor on the way in and after every
         # other one on the way out, so a span covers whatever they do.
@@ -384,10 +393,11 @@ module AceMQ
 
         # What an ack alone is called on a span.
         #
-        # The same four words the Java adapter writes. +dead_lettered+ rather
-        # than +retried+ for a retry marked fatal, because that is what the
-        # consumer will actually do with it — honouring the mark rather than the
-        # request is the entire point of having it.
+        # The same words the Java adapter writes, plus +parked+ for the action
+        # Java's vocabulary does not have. +dead_lettered+ rather than +retried+
+        # for a retry marked fatal, because that is what the consumer will
+        # actually do with it — honouring the mark rather than the request is
+        # the entire point of having it.
         #
         # This is the fallback. What an ack cannot know is whether a retry has
         # any attempts left, so a {Settlement} on the context wins over it; see
@@ -398,6 +408,7 @@ module AceMQ
         def self.outcome_of(ack)
           return "acked" if ack.accept?
           return "rejected" if ack.reject?
+          return "parked" if ack.park?
           return "dead_lettered" if ack.error.is_a?(FatalError)
 
           "retried"
@@ -448,6 +459,7 @@ module AceMQ
             @span = span
             @token = token
             @closed = false
+            @named = false
           end
 
           # Records what happened, and marks the span an error when it was one.
@@ -455,6 +467,7 @@ module AceMQ
           # @param outcome [String]
           # @return [Scope] self
           def outcome(outcome)
+            @named = true
             @span.set_attribute(OUTCOME, outcome.to_s)
             if FAILING_OUTCOMES.include?(outcome.to_s)
               @span.status = ::OpenTelemetry::Trace::Status.error(outcome.to_s)
@@ -462,10 +475,28 @@ module AceMQ
             self
           end
 
+          # Records a failure, and says so in the vocabulary every other signal
+          # uses.
+          #
+          # The exception and the error status are not enough on their own: they
+          # say something went wrong without saying what became of the
+          # operation, and a span that said nothing where the counter said
+          # +failed+ is the same disagreement between a metric and a trace that
+          # this library treats as a defect everywhere else — a dashboard shows
+          # the failures and the trace backend, asked for
+          # +messaging.acemq.outcome = "failed"+, finds none of the spans behind
+          # them. The Java adapter was fixed for exactly this and Python already
+          # did it.
+          #
+          # An outcome already named wins, because a caller who named one knows
+          # more than "it threw": a request that ran out of time is +timed_out+,
+          # which is the absence of an answer rather than a failure here.
+          #
           # @param failure [Exception, String, nil]
           # @return [Scope] self
           def failed(failure)
             @span.record_exception(failure) if failure.is_a?(Exception)
+            @span.set_attribute(OUTCOME, FAILED) unless @named
             @span.status = ::OpenTelemetry::Trace::Status.error(describe(failure))
             self
           end

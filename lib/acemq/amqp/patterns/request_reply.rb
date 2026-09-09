@@ -44,9 +44,19 @@ module AceMQ
 
       # Where a responder should send its answer.
       #
-      # An application header rather than AMQP's own +reply-to+ property, so it
-      # travels through the same envelope machinery as everything else and
-      # survives a hop through a service that rebuilds the message.
+      # An application header as well as AMQP's own +reply-to+ property, and the
+      # two always say the same thing. The header travels through the same
+      # envelope machinery as everything else and survives a hop through a
+      # service that rebuilds the message; the property is what a broker, a
+      # management console and the Java and .NET libraries understand. Writing
+      # only one of them is what kept a Java requester and a Ruby responder from
+      # talking to each other.
+      #
+      # The rule is the same in all five libraries: a requester writes both, and
+      # a responder reads the header first and falls back to the property.
+      # Header first because it is the one that survives a rebuild — a service
+      # that reads a message and publishes a new one keeps the headers and
+      # usually drops the properties.
       #
       # Deliberately without the +x-acemq-+ prefix: that namespace belongs to
       # the engine and is kept away from application headers, so a responder
@@ -153,12 +163,16 @@ module AceMQ
           end
         end
 
+        # Both places, the same name. The header is what a responder reads
+        # first; the property is what a responder written against another
+        # library reads, and what a broker's own tooling shows.
         def publish(request, correlation, fields)
           envelope = fields.merge(
             correlation_id: correlation,
             headers: fields.fetch(:headers, {}).merge(REPLY_TO_HEADER => @reply_queue)
           )
-          @connection.publish(request, to: @to, exchange: @exchange, **envelope)
+          @connection.publish(request, to: @to, exchange: @exchange,
+                                       reply_to: @reply_queue, **envelope)
         end
 
         def answer(message, correlation)
@@ -243,18 +257,32 @@ module AceMQ
         raise ArgumentError, "Patterns.serve needs a block to answer with" unless handler
 
         connection.consume(queue, **options) do |message|
-          reply_to = message.envelope.headers[REPLY_TO_HEADER].to_s
+          reply_to = reply_address(message)
           if reply_to.empty?
             # Retrying cannot make a reply queue appear, so this is
             # dead-lettered rather than looped.
             next Ack.reject(FatalError.new(
-                              "request #{message.id} carries no #{REPLY_TO_HEADER} header, " \
-                              "so there is nowhere to reply"
+                              "request #{message.id} carries neither the #{REPLY_TO_HEADER} " \
+                              "header nor a reply-to property, so there is nowhere to reply"
                             ))
           end
 
           answer(connection, reply_to, message, handler)
         end
+      end
+
+      # Where to send the answer: the header first, the AMQP property second.
+      #
+      # Both, because the five libraries do not all write both yet and a
+      # responder that read only one of them could not answer half the fleet. A
+      # requester here writes both and they agree, so which one is read makes no
+      # difference; the order matters only for a request from somewhere else.
+      #
+      # @param message [Message]
+      # @return [String] empty when the request asked for no answer
+      def self.reply_address(message)
+        header = message.envelope.headers[REPLY_TO_HEADER].to_s
+        header.empty? ? message.reply_to.to_s : header
       end
 
       # @api private

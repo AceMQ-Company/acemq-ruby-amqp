@@ -39,13 +39,22 @@ and `redelivered?` for "might I have half-done this already".
 
 ## What a handler returns
 
-An `Ack`, and it has to be one of three:
+An `Ack`, and it has to be one of four:
 
 ```ruby
 Ack.accept                         # done
 Ack.retry("the warehouse said no") # try again, if the policy allows
 Ack.reject("no such SKU")          # never going to work; dead-letter it
+Ack.park("schema version 9")       # nothing here can read it; park it
 ```
+
+`Ack.park` puts the message in `{queue}.parked` rather than `{queue}.dlq`. Use it
+where the handler already knows the message is unreadable — a version this
+service was never taught, a field that is not a date where a date has to be. The
+dead-letter queue holds messages that were tried and failed; the parking queue
+holds messages that were never going to work, and mixing the two means somebody
+sorts them out by hand after an outage. It is counted as `acemq.messages.parked`
+and its span carries `messaging.acemq.outcome = "parked"`.
 
 A handler that raises is treated as `Ack.retry`. Raising `FatalError` is treated
 as `Ack.reject`:
@@ -106,7 +115,8 @@ mq.consume("thumbnails", codec: BytesCodec.new) { |message| ... }
 **A body no codec can read goes to `{queue}.parked`**, not to `{queue}.dlq`. A
 message that failed five times and a message nothing could read are different
 problems, and mixing them means somebody sorts them by hand later. It is counted
-as `acemq.messages.parked`. See [codecs](serialization.md) for how a composite
+as `acemq.messages.parked`, the same counter a handler's own `Ack.park` raises.
+See [codecs](serialization.md) for how a composite
 codec reads several content types, and [reliability](reliability.md) for what
 else lands where.
 

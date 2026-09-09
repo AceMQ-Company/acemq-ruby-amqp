@@ -118,8 +118,75 @@ While the version is `0.x` the public API may change in any release.
   the same shape and the same attribute name the Java, Go and Python adapters
   use. Ruby was the only library without it, so a lag panel built on the others
   had a hole where the Ruby services should have been.
+- **`Ack.park`.** A handler can now say a message is unreadable and have it go to
+  `{queue}.parked` instead of `{queue}.dlq`. The engine has always parked a body
+  no codec could decode; a handler that got further and still knew the message
+  was unreadable — a schema version this service was never taught, a field that
+  is not a date where a date has to be — had no way to ask for the same thing,
+  and had to reject it into the dead letters. That is exactly the mixing the
+  parking queue exists to prevent: somebody draining dead letters after an
+  outage had to sort the messages that were never going to work from the ones
+  that failed while a database was down.
+
+  It settles to `{queue}.parked`, counts as `acemq.messages.parked` — the same
+  counter the decode path raises, and counted once — and writes
+  `messaging.acemq.outcome = "parked"` on the span. `Settlement::PARKED` is a
+  fifth outcome alongside `acked`, `retried`, `rejected` and `dead_lettered`;
+  `Settlement#parked?` is new and `#dead_letters?` is false for it, because a
+  parked message goes to a queue of its own on purpose. Go and Python are adding
+  the same action under the same name.
+- **`acemq.messages.set.aside.failed`**, counted when the republish to
+  `{queue}.dlq` or `{queue}.parked` is itself refused, labelled with the `queue`
+  and the `target` that could not be reached. Go and Python already had it.
+
+  What Ruby does with such a message is unchanged and is now written down: the
+  publish failure escapes the handler, the delivery is never settled, and the
+  broker redelivers it when the channel closes. Nothing is lost. But from
+  outside, a message redelivered forever because its dead-letter queue was never
+  declared looks exactly like a handler failing forever on the same message, and
+  this counter was the only thing missing to tell the two apart. Go and Python
+  reject the message to the broker instead, so the delivery is settled either
+  way; they raise this same counter, so one alert reads the same against all
+  three.
+- **AMQP's own `reply-to` property**, on both sides. `Connection#publish` takes
+  `reply_to:`, `Message#reply_to` reads what arrived, and both are carried
+  through `Delivery`, `PublishContext`, the consumer's republish and a replay.
 
 ### Changed
+
+- **A requester writes the reply address twice, and a responder reads either
+  one.** `Patterns::Requester` now sets AMQP's native `reply-to` property as well
+  as the `acemq-reply-to` header, to the same queue, and `Patterns.serve` reads
+  the header first and falls back to the property.
+
+  **This is what makes request and reply work across the family.** Java and .NET
+  wrote and read the native property; Go, Python and Ruby wrote and read the
+  header. A Java or .NET requester and a Ruby responder could not talk to each
+  other at all, in either direction, and nothing in any suite covered it. All
+  five libraries are making the same change: write both, read either, header
+  first. Header first because it is the half that survives a service which reads
+  a message and publishes a new one — such a service keeps the headers and
+  usually drops the properties. On a message this library produced the two always
+  agree, so the order decides anything only for a request that came from
+  somewhere else. `Patterns.reply_address(message)` is the rule on its own.
+
+  A request carrying neither is still dead-lettered, and the reason now says so:
+  "carries neither the acemq-reply-to header nor a reply-to property".
+- **`Telemetry::OpenTelemetry::Scope#failed` sets the outcome.** Recording a
+  failure now writes `messaging.acemq.outcome = "failed"` as well as the
+  exception and the error status, unless an outcome was already named explicitly
+  — in which case the explicit one wins, which is what keeps `timed_out` on a
+  request deadline from being overwritten by the exception that carried it.
+
+  It used to write no outcome at all. A span that said nothing where the counter
+  said `failed` is the same disagreement between a metric and a trace this
+  library treats as a defect everywhere else: a dashboard shows the failures and
+  the trace backend, queried for `messaging.acemq.outcome = "failed"`, finds none
+  of the spans behind them. Java has just been fixed for exactly this; Python
+  already did it.
+- `parked` joins `unroutable`, `failed` and `dead_lettered` as an outcome that
+  marks a span an error. A message nothing could read will never be processed,
+  which is at least as bad as one that ran out of attempts.
 
 - **A fixed-schema `AvroCodec` reads the content type before it reads the
   bytes.** `AvroCodec#decode` now takes an optional content type, and it decides:

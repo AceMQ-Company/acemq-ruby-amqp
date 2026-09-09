@@ -10,7 +10,7 @@
 # things only a real broker can: that a message survives the wire.
 class FakeTransport
   Published = Struct.new(:exchange, :routing_key, :body, :content_type, :message_id, :headers,
-                         keyword_init: true)
+                         :reply_to, keyword_init: true)
 
   attr_reader :published, :declared_queues, :declared_exchanges, :bindings
 
@@ -20,6 +20,7 @@ class FakeTransport
     @declared_exchanges = []
     @bindings = []
     @missing = []
+    @refused = []
     @closed = false
   end
 
@@ -28,10 +29,15 @@ class FakeTransport
   # takes fewer arguments than the real thing stops catching the mistake it
   # exists to catch.
   def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil, headers: {},
-              persistent: true) # rubocop:disable Lint/UnusedMethodArgument
+              persistent: true, reply_to: nil) # rubocop:disable Lint/UnusedMethodArgument
+    if @refused.include?(routing_key)
+      raise AceMQ::AMQP::PublishError,
+            "the broker would not confirm message #{message_id} with key #{routing_key.inspect}"
+    end
+
     @published << Published.new(exchange: exchange, routing_key: routing_key, body: body,
                                 content_type: content_type, message_id: message_id,
-                                headers: headers)
+                                headers: headers, reply_to: reply_to)
     message_id
   end
 
@@ -62,6 +68,11 @@ class FakeTransport
   # missing-rung path is reached without taking a broker away from it.
   def missing!(*names) = @missing.concat(names)
 
+  # Refuses to confirm anything published with these keys, the way a broker
+  # refuses a publish to a queue that is not there and is not being created.
+  # How the set-aside failure path is reached without a broker.
+  def refuse!(*names) = @refused.concat(names)
+
   # What was published to a queue through the default exchange, which is how
   # both dead-lettering and parking get there.
   def published_to(queue)
@@ -86,11 +97,12 @@ class FakeDelivery
   attr_reader :acked, :nacked
 
   def self.build(body: "{}", headers: {}, routing_key: "orders.new",
-                 content_type: "application/json", redelivered: false)
+                 content_type: "application/json", redelivered: false, reply_to: nil)
     recorder = new
     delivery = AceMQ::AMQP::Delivery.new(
       body: body, content_type: content_type, routing_key: routing_key,
       message_id: headers["x-acemq-id"].to_s, headers: headers, redelivered: redelivered,
+      reply_to: reply_to,
       on_ack: -> { recorder.record_ack },
       on_nack: ->(requeue) { recorder.record_nack(requeue) }
     )

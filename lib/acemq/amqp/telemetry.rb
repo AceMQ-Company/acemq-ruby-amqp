@@ -78,8 +78,23 @@ module AceMQ
       # queue, and only the word keeps them apart.
       DEAD_LETTERED = "acemq.messages.dead.lettered"
 
-      # Messages nothing could decode, which go somewhere a person looks.
+      # Messages nothing could read, which go somewhere a person looks: a body
+      # no codec could decode, or one a handler answered with +Ack.park+.
       PARKED = "acemq.messages.parked"
+
+      # Messages that could not be moved to their dead-letter or parking queue,
+      # because the republish itself failed.
+      #
+      # Worth an alert, and usually a queue that was never declared. Nothing is
+      # lost: the delivery is never settled, so the broker redelivers it. What
+      # it looks like from outside is a handler failing over and over on the
+      # same message, which is a different problem with a different fix — and
+      # this counter is the only thing that tells the two apart.
+      #
+      # The Go and Python libraries raise the same counter where they reject the
+      # message to the broker instead, so an alert written once reads the same
+      # against all three.
+      SET_ASIDE_FAILED = "acemq.messages.set.aside.failed"
 
       # How long handlers take, in seconds.
       HANDLER_DURATION = "acemq.handler.duration"

@@ -211,6 +211,15 @@ been paused — a message can be on attempt one and four days old.
 
 ### What the consumer actually does
 
+A handler returns one of four:
+
+```ruby
+Ack.accept                         # done
+Ack.retry("the warehouse said no") # try again, if the policy allows
+Ack.reject("no such SKU")          # never going to work; dead-letter it
+Ack.park("schema version 9")       # nothing here can read it; park it
+```
+
 `Ack.retry` returns the message to the broker with `x-acemq-attempt` advanced.
 The count travels **on the message**, because a requeue hands the broker back
 the bytes it was given: counting in the consumer instead is wrong the moment a
@@ -370,9 +379,18 @@ into a hot loop or hand it to whatever dead-lettering the queue happens to carry
 — and neither of those can write down *why*, which is the one thing whoever
 finds it needs.
 
-A body no codec can read goes to `{queue}.parked` rather than `{queue}.dlq`. A
-message that failed five times and a message nothing could read are different
-problems, and mixing them means somebody sorts them by hand.
+A body no codec can read goes to `{queue}.parked` rather than `{queue}.dlq`, and
+so does a message a handler answers with `Ack.park`. A message that failed five
+times and a message nothing could read are different problems, and mixing them
+means somebody sorts them by hand — which is what a handler had to cause before
+`Ack.park` existed, by rejecting an unreadable message into the dead letters.
+
+When the republish to `{queue}.dlq` or `{queue}.parked` is itself refused —
+usually a queue nobody declared — the failure escapes the handler, the delivery
+is never settled, and the broker redelivers it. Nothing is lost, but it looks
+from outside like a handler failing forever on one message;
+`acemq.messages.set.aside.failed` is what tells the two apart and is worth an
+alert.
 
 Without a policy, `Connection` uses `RetryPolicy.none` — one delivery — so a
 retry against an unconfigured connection dead-letters immediately. That is a
@@ -463,19 +481,20 @@ alert written for one service reads the same against the next:
 | `acemq.messages.published` | by `exchange` |
 | `acemq.messages.publish.failed` | including a publish an interceptor refused |
 | `acemq.messages.consumed` | by `queue`, counted on the way in |
-| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` | what the consumer decided, one of the four per delivery |
-| `acemq.messages.parked` | nothing could decode it |
+| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` / `.parked` | what the consumer decided, one of the five per delivery |
+| `acemq.messages.parked` | nothing could read it: no codec could decode the body, or the handler said `Ack.park` |
+| `acemq.messages.set.aside.failed` | by `queue` and `target`; could not be moved to its dead-letter or parking queue at all |
 | `acemq.handler.duration` | seconds, handler and interceptors together |
 | `acemq.messages.in.flight` | a gauge, per queue |
 | `acemq.retry.rung.missing` | see below |
 
-The four outcome counters are the four
+The outcome counters are the
 [`Settlement`](docs/interceptors.md#the-settlement) outcomes and **exactly one
 goes up per delivery** — read off the same decision the span's
 `messaging.acemq.outcome` attribute is, so the two cannot disagree. A handler
 asking for a retry on its last attempt is counted `dead.lettered` and not also
 `retried`. See
-[observability](docs/observability.md#the-four-outcome-counters-are-what-the-consumer-decided)
+[observability](docs/observability.md#the-outcome-counters-are-what-the-consumer-decided)
 for what that changes on an existing dashboard.
 
 **No dependency on a metrics gem.** An observer is anything answering `count`,
@@ -896,10 +915,18 @@ A timeout says an answer did not arrive. It says nothing about whether the work
 was done, which is why a request that changes anything wants an idempotent
 responder.
 
-Two headers carry this, `acemq-reply-to` and `acemq-error`. They are application
-headers on purpose: the `x-acemq-` namespace belongs to the engine and is kept
-away from what a handler sees, so a responder could never read them if they
-lived there.
+A requester writes the reply address **twice**: in the `acemq-reply-to` header
+and in AMQP's own `reply-to` property, to the same queue. A responder reads the
+header first and falls back to the property. The rule is identical in Java, Go,
+.NET, Python and Ruby, and it is what makes a requester in any of them able to
+talk to a responder in any other — the two halves of the family used to write
+only one each, and the two halves could not answer each other. See
+[patterns](docs/patterns.md#the-reply-address-is-written-twice-and-read-either-way).
+
+`acemq-reply-to` and `acemq-error` are application headers on purpose: the
+`x-acemq-` namespace belongs to the engine and is kept away from what a handler
+sees, so a responder could never read them if they lived there. A handler can
+read the native property as `message.reply_to`.
 
 ### Replay
 

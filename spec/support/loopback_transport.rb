@@ -31,14 +31,14 @@ class LoopbackTransport
   end
 
   def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil, headers: {},
-              persistent: true) # rubocop:disable Lint/UnusedMethodArgument
+              persistent: true, reply_to: nil) # rubocop:disable Lint/UnusedMethodArgument
     @published << FakeTransport::Published.new(
       exchange: exchange, routing_key: routing_key, body: body, content_type: content_type,
-      message_id: message_id, headers: headers
+      message_id: message_id, headers: headers, reply_to: reply_to
     )
     routed(exchange, routing_key).each do |queue|
       offer(queue, body: body, content_type: content_type, routing_key: routing_key,
-                   message_id: message_id, headers: headers)
+                   message_id: message_id, headers: headers, reply_to: reply_to)
     end
     message_id
   end
@@ -191,6 +191,7 @@ class LoopbackTransport
       body: message[:body], content_type: message[:content_type],
       routing_key: message[:routing_key].to_s, message_id: message[:message_id].to_s,
       headers: message[:headers] || {}, redelivered: false,
+      reply_to: message[:reply_to].to_s,
       on_ack: -> {},
       on_nack: lambda { |requeue|
         next if requeued || !requeue

@@ -29,10 +29,10 @@ RSpec.describe AceMQ::AMQP::Consumer do
   # dead letter, and none of that is the broker's arithmetic.
   def consumer(policy: AceMQ::AMQP::RetryPolicy.none, codec: AceMQ::AMQP::JSONCodec.new,
                threshold: AceMQ::AMQP::RetryLadder::DEFAULT_THRESHOLD,
-               interceptors: AceMQ::AMQP::Interceptors.new, &handler)
+               interceptors: AceMQ::AMQP::Interceptors.new, telemetry: nil, &handler)
     described_class.new(transport: transport, queue: "orders.new", handler: handler,
                         codec: codec, retry_policy: policy, retry_threshold: threshold,
-                        interceptors: interceptors)
+                        interceptors: interceptors, telemetry: telemetry)
   end
 
   def headers_for(id: "msg-1", attempt: 1, **extra)
@@ -322,6 +322,16 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(seen.last.reason).to eq("rejected by the handler: not ours")
     end
 
+    it "keeps parking apart from both, because it goes to a queue of its own" do
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(interceptors: interceptors) { Ack.park("unreadable") }.handle(delivery)
+
+      expect(seen.last.outcome).to eq(AceMQ::AMQP::Settlement::PARKED)
+      expect(seen.last).to be_parked
+      expect(seen.last).not_to be_dead_letters
+      expect(seen.last.reason).to eq("parked by the handler: unreadable")
+    end
+
     it "says acked when the handler was happy" do
       delivery, = FakeDelivery.build(headers: headers_for)
       consumer(interceptors: interceptors) { Ack.accept }.handle(delivery)
@@ -379,6 +389,87 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(parked.size).to eq(1)
       expect(parked.first.headers[Headers::ERROR]).to match(/could not be decoded: /)
       expect(parked.first.body).to eq("{ not json")
+    end
+
+    it "counts it as parked, once" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      delivery, = FakeDelivery.build(body: "{ not json", headers: headers_for)
+      consumer(telemetry: metrics) { Ack.accept }.handle(delivery)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PARKED, queue: "orders.new"]).to eq(1)
+    end
+  end
+
+  # A handler that already knows a message is unreadable used to have to reject
+  # it into the dead letters, which lost the distinction the parking queue
+  # exists to make.
+  describe "parking, asked for by the handler" do
+    it "sends it to the parking queue and not to the dead letters" do
+      delivery, recorder = FakeDelivery.build(body: '{"id":"A-1"}', headers: headers_for)
+      consumer { Ack.park("the schema version is one nothing here was taught") }
+        .handle(delivery)
+
+      expect(recorder.acked?).to be(true)
+      expect(recorder.requeued?).to be(false)
+      expect(transport.published_to("orders.new.dlq")).to be_empty
+
+      parked = transport.published_to("orders.new.parked")
+      expect(parked.size).to eq(1)
+      expect(parked.first.headers[Headers::ERROR])
+        .to match(/parked by the handler: the schema version is one nothing here was taught/)
+      expect(parked.first.body).to eq('{"id":"A-1"}')
+    end
+
+    it "does not try again, however many attempts are left" do
+      policy = AceMQ::AMQP::RetryPolicy.fixed(10, 0)
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(policy: policy) { Ack.park("unreadable") }.handle(delivery)
+
+      expect(transport.published_to("orders.new")).to be_empty
+      expect(transport.published_to("orders.new.parked").size).to eq(1)
+    end
+
+    it "counts it as parked and as nothing else" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(telemetry: metrics) { Ack.park("unreadable") }.handle(delivery)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PARKED, queue: "orders.new"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::REJECTED, queue: "orders.new"]).to eq(0)
+      expect(metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED, queue: "orders.new"]).to eq(0)
+    end
+  end
+
+  # Republishing to the dead-letter or parking queue can itself fail — a queue
+  # that was never declared is the usual reason. Nothing is lost: the delivery
+  # is never settled and the broker redelivers it. What that looks like from
+  # outside is a handler failing over and over on the same message, and this
+  # counter is the only thing that tells the two apart.
+  describe "a message that cannot be set aside" do
+    it "counts acemq.messages.set.aside.failed and leaves the delivery unsettled" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      transport.refuse!("orders.new.dlq")
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+
+      expect { consumer(telemetry: metrics) { Ack.reject("nope") }.handle(delivery) }
+        .to raise_error(AceMQ::AMQP::PublishError)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
+                     queue: "orders.new", target: "orders.new.dlq"]).to eq(1)
+      expect(recorder.acked?).to be(false)
+      expect(recorder.requeued?).to be(false)
+    end
+
+    it "counts it for the parking queue too, and names which one it was" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      transport.refuse!("orders.new.parked")
+      delivery, = FakeDelivery.build(body: "{ not json", headers: headers_for)
+
+      expect { consumer(telemetry: metrics) { Ack.accept }.handle(delivery) }
+        .to raise_error(AceMQ::AMQP::PublishError)
+
+      expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
+                     queue: "orders.new", target: "orders.new.parked"]).to eq(1)
     end
   end
 

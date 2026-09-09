@@ -144,7 +144,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     # ambiently inside it — which is the only way to show that the parent came
     # out of the message rather than off this thread.
     def delivery(headers: {}, body: '{"a":1}')
-      Struct.new(:body, :headers, :routing_key, :content_type, :redelivered, :acked,
+      Struct.new(:body, :headers, :routing_key, :content_type, :redelivered, :reply_to, :acked,
                  keyword_init: true) do
         def redelivered? = !!redelivered
         def ack = self.acked = true
@@ -221,7 +221,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
         handler: handler
       ).handle(
         Struct.new(:body, :headers, :routing_key, :content_type, :redelivered,
-                   keyword_init: true) do
+                   :reply_to, keyword_init: true) do
           def redelivered? = false
           def ack = nil
         end.new(body: '{"a":1}', headers: {}, routing_key: "orders.new",
@@ -312,6 +312,16 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       expect(span.events.map(&:name)).to include("exception")
     end
 
+    # A handler that knows the message cannot be read says so, and the message
+    # goes to the parking queue rather than into the dead letters with the ones
+    # that merely failed.
+    it "calls a parked message parked, and does call that an error" do
+      span = handled { |_m| AceMQ::AMQP::Ack.park("the schema version is unknown here") }
+
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("parked")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+    end
+
     it "calls a publish nobody would take failed, and does call that an error" do
       failing = AceMQ::AMQP::Connection.new(transport: transport, origin: "rspec@otel")
       tracing.install(failing)
@@ -343,8 +353,8 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     # Every counter a delivery could land on, so "exactly one went up" is a
     # thing an example can assert rather than a thing it has to trust.
     OUTCOME_COUNTERS = ["acemq.messages.accepted", "acemq.messages.retried",
-                        "acemq.messages.rejected",
-                        "acemq.messages.dead.lettered"].freeze
+                        "acemq.messages.rejected", "acemq.messages.dead.lettered",
+                        "acemq.messages.parked"].freeze
 
     def counted
       OUTCOME_COUNTERS.to_h { |name| [name, metrics[name, queue: "orders.new"]] }
@@ -358,7 +368,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
         handler: handler
       ).handle(
         Struct.new(:body, :headers, :routing_key, :content_type, :redelivered,
-                   keyword_init: true) do
+                   :reply_to, keyword_init: true) do
           def redelivered? = false
           def ack = nil
         end.new(body: '{"a":1}', headers: {}, routing_key: "orders.new",
@@ -397,6 +407,58 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
 
       expect(outcome).to eq("dead_lettered")
       expect(counted).to eq("acemq.messages.dead.lettered" => 1)
+    end
+
+    # Parking has its own counter and its own word, and a handler that asks for
+    # it must land on both — not on the dead-letter counter with the messages
+    # that were tried and failed.
+    it "agrees on parked, and does not also count it as a dead letter" do
+      outcome = deliver(retrying) { |_m| AceMQ::AMQP::Ack.park("nothing here reads version 9") }
+
+      expect(outcome).to eq("parked")
+      expect(counted).to eq("acemq.messages.parked" => 1)
+    end
+  end
+
+  # A failure has to say what became of the operation in the vocabulary every
+  # other signal uses. The exception and the error status are not enough on
+  # their own: a span that said nothing where the counter said failed is a
+  # dashboard full of failures and a trace backend, asked for
+  # messaging.acemq.outcome = "failed", that finds none of the spans behind
+  # them. Java was fixed for exactly this; Python already did it.
+  describe "the outcome a failure carries" do
+    it "names it failed when nothing else named an outcome" do
+      scope = tracing.consume_started(queue: "orders.new", envelope: AceMQ::AMQP::Envelope.new)
+      scope.failed(RuntimeError.new("the database is down"))
+      scope.close
+
+      span = span_named("orders.new process")
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("failed")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+    end
+
+    # A caller who named an outcome knows more than "it threw". timed_out is the
+    # one that matters: a request nobody answered in time is the absence of a
+    # reply, and calling it failed would lose that.
+    it "leaves an outcome that was named explicitly alone" do
+      scope = tracing.request_started(destination: "pricing.quote")
+      scope.outcome("timed_out")
+      scope.failed(RuntimeError.new("no reply within 5 seconds"))
+      scope.close
+
+      expect(span_named("pricing.quote request").attributes["messaging.acemq.outcome"])
+        .to eq("timed_out")
+    end
+
+    it "still records the exception and the error status either way" do
+      scope = tracing.request_started(destination: "pricing.quote")
+      scope.outcome("timed_out")
+      scope.failed(RuntimeError.new("no reply within 5 seconds"))
+      scope.close
+
+      span = span_named("pricing.quote request")
+      expect(span.events.map(&:name)).to include("exception")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
     end
   end
 

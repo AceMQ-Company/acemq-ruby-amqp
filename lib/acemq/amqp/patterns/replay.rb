@@ -188,7 +188,10 @@ module AceMQ
             exchange: @exchange, routing_key: @routing_key || delivery.routing_key,
             body: delivery.body, content_type: delivery.content_type,
             message_id: envelope.id, headers: stamped(envelope, delivery.routing_key),
-            persistent: true
+            persistent: true,
+            # A replayed request keeps the property saying where its answer was
+            # meant to go, the same way the consumer's own republish does.
+            reply_to: delivery.reply_to
           )
         rescue StandardError => e
           # Returned rather than dropped, and the replay stops. A replay that

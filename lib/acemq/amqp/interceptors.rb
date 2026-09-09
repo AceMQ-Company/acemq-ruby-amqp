@@ -33,11 +33,17 @@ module AceMQ
     class PublishContext
       attr_accessor :exchange, :routing_key, :envelope, :payload
 
-      def initialize(exchange:, routing_key:, envelope:, payload:)
+      # AMQP's own +reply-to+ property, which is not a header and so is not in
+      # the envelope. Nil for the messages that expect no answer, which is most
+      # of them; {Patterns::Requester} is what usually sets it.
+      attr_accessor :reply_to
+
+      def initialize(exchange:, routing_key:, envelope:, payload:, reply_to: nil)
         @exchange = exchange
         @routing_key = routing_key
         @envelope = envelope
         @payload = payload
+        @reply_to = reply_to
       end
 
       # Adds an application header to the message about to be sent.
@@ -70,10 +76,11 @@ module AceMQ
     #     record(context.settlement.outcome, context.settlement.delay)
     #   end
     #
-    # The four outcomes are the words every AceMQ library writes on a span, and
+    # The outcomes are the words every AceMQ library writes on a span, and
     # +rejected+ is kept apart from +dead_lettered+ even though both end in the
     # dead-letter queue: a message the handler refused on purpose is the system
-    # working, and one that ran out of attempts is not.
+    # working, and one that ran out of attempts is not. +parked+ is kept apart
+    # from both, because a message nothing could read is a third thing again.
     class Settlement
       # Acknowledged: the handler was happy.
       ACKED = "acked"
@@ -83,8 +90,11 @@ module AceMQ
       RETRIED = "retried"
       # Out of attempts, or marked as something retrying cannot fix.
       DEAD_LETTERED = "dead_lettered"
+      # Set aside in +{queue}.parked+ for somebody to look at: the body would
+      # not decode, or the handler said the message cannot be read.
+      PARKED = "parked"
 
-      # @return [String] one of the four words above
+      # @return [String] one of the words above
       attr_reader :outcome
       # @return [Float, nil] seconds this message will wait, when it is a retry
       attr_reader :delay
@@ -102,12 +112,15 @@ module AceMQ
       def self.rejected(reason) = new(outcome: REJECTED, reason: reason)
       def self.retried(delay) = new(outcome: RETRIED, delay: delay)
       def self.dead_lettered(reason) = new(outcome: DEAD_LETTERED, reason: reason)
+      def self.parked(reason) = new(outcome: PARKED, reason: reason)
 
       def acked? = @outcome == ACKED
       def retried? = @outcome == RETRIED
+      def parked? = @outcome == PARKED
 
       # Whether the message is going to the dead-letter queue, which a rejection
-      # and a give-up both do.
+      # and a give-up both do. Parking is not one of them: it goes to a queue of
+      # its own, on purpose.
       def dead_letters? = @outcome == REJECTED || @outcome == DEAD_LETTERED
 
       def to_s = @reason.nil? ? @outcome : "#{@outcome}: #{@reason}"

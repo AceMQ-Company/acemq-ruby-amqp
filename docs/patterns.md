@@ -325,13 +325,34 @@ twice.
 arrive. It says nothing about whether the work was done**, which is why a
 request that changes anything wants an [idempotent](#idempotency) responder.
 
-A request carrying no reply queue is dead-lettered rather than looped: retrying
-cannot make a reply queue appear.
+A request carrying no reply address at all is dead-lettered rather than looped:
+retrying cannot make a reply queue appear.
 
-Two headers carry this, `acemq-reply-to` and `acemq-error`. They are
-**application** headers on purpose — the `x-acemq-` namespace belongs to the
-engine and is kept away from what a handler sees, so a responder could never
-read them if they lived there.
+### The reply address is written twice, and read either way
+
+A requester sets **both** the `acemq-reply-to` header and AMQP's own `reply-to`
+property, to the same queue. A responder reads the **header first** and falls
+back to the property.
+
+That rule is identical in all five libraries, and it exists because they did not
+start out agreeing: Java and .NET wrote and read the native property, Go, Python
+and Ruby wrote and read the header, and a Java requester talking to a Ruby
+responder simply went unanswered. Writing both and reading either makes every
+combination work without anybody choosing a winner.
+
+Header first, because the header is the half that survives: a service that reads
+a message and publishes a new one keeps the headers and usually drops the
+properties. On a message this library produced the two always agree, so the order
+only decides anything for a request that came from somewhere else.
+
+```ruby
+Patterns.reply_address(message)   # => the header, or the property, or ""
+```
+
+`acemq-reply-to` and `acemq-error` are **application** headers on purpose — the
+`x-acemq-` namespace belongs to the engine and is kept away from what a handler
+sees, so a responder could never read them if they lived there. A handler can
+also read the native property directly as `message.reply_to`.
 
 ## Replay
 

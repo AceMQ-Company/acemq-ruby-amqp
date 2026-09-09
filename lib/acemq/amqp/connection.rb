@@ -37,9 +37,13 @@ module AceMQ
     # there for a handler that wants the bytes the codec was given, which is
     # what anybody debugging a decoding disagreement between two languages
     # actually needs.
+    # +reply_to+ is AMQP's own property, read off the delivery rather than out
+    # of the headers, and it is what a request published by the Java or .NET
+    # library carries. {Patterns.serve} reads the +acemq-reply-to+ header first
+    # and falls back to this.
     Message = Struct.new(
       :payload, :envelope, :routing_key, :content_type, :redelivered, :body,
-      keyword_init: true
+      :reply_to, keyword_init: true
     ) do
       def redelivered? = !!redelivered
       def id = envelope.id
@@ -175,11 +179,16 @@ module AceMQ
       #   to the queue whose name matches the routing key
       # @param envelope [Envelope, nil] one built elsewhere, for when a
       #   message's metadata derives from another message's
+      # @param reply_to [String, nil] AMQP's own +reply-to+ property, for a
+      #   message that is asking a question. Not an envelope field, because it
+      #   is not a header: it is the property Java and .NET responders read, and
+      #   {Patterns::Requester} writes it alongside the +acemq-reply-to+ header
+      #   so that a responder in any of the five libraries can answer.
       # @param fields [Hash] envelope fields, when no envelope is given
       # @return [Envelope] what was actually put on the wire, which is what the
       #   interceptors left rather than what was handed in
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
-                  **fields)
+                  reply_to: nil, **fields)
         if envelope && !fields.empty?
           raise ArgumentError,
                 "publish was given both an envelope and the fields to build one " \
@@ -192,7 +201,8 @@ module AceMQ
         # against a round trip to a broker, and the alternative is two code
         # paths through the one method every message in the process goes down.
         context = PublishContext.new(exchange: exchange, routing_key: to,
-                                     envelope: envelope, payload: payload)
+                                     envelope: envelope, payload: payload,
+                                     reply_to: reply_to)
         send_intercepted(context, codec, persistent)
       rescue StandardError => e
         # Counted before the interceptors are told, so a publish refused by an
@@ -344,7 +354,7 @@ module AceMQ
                            body: codec.encode(context.payload),
                            content_type: codec.content_type, message_id: context.envelope.id,
                            headers: context.envelope.to_headers(context.routing_key),
-                           persistent: persistent)
+                           persistent: persistent, reply_to: context.reply_to)
         @telemetry.count(Telemetry::PUBLISHED, 1, exchange: context.exchange)
         @interceptors.after_confirm(context)
         context.envelope
@@ -365,12 +375,15 @@ module AceMQ
       # One counter per outcome, keyed by the word the {Settlement} carries — so
       # the counter that goes up and the +messaging.acemq.outcome+ attribute on
       # the span for the same delivery are read off the same decision and cannot
-      # disagree.
+      # disagree. Parking a message a handler asked to park is counted here like
+      # the rest; the decode path, which never reaches a handler and so never
+      # reaches {#observe}, counts its own.
       COUNTER_FOR = {
         Settlement::ACKED => Telemetry::ACCEPTED,
         Settlement::RETRIED => Telemetry::RETRIED,
         Settlement::REJECTED => Telemetry::REJECTED,
-        Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED
+        Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED,
+        Settlement::PARKED => Telemetry::PARKED
       }.freeze
 
       attr_reader :queue, :retry_policy, :codec, :ladder
@@ -455,6 +468,12 @@ module AceMQ
         # that failed five times and a message nothing could read are two
         # different problems, and whoever drains the dead letters should not
         # have to sort them by hand.
+        #
+        # Counted here rather than inside {#park}, because this delivery never
+        # reached a handler and so never reached {#observe}: a handler that asks
+        # for {Ack.park} is counted there with every other outcome, and counting
+        # in both places would count it twice.
+        @telemetry.count(Telemetry::PARKED, 1, queue: @queue)
         park(delivery, envelope, "could not be decoded: #{e.message}")
       ensure
         leave
@@ -543,7 +562,8 @@ module AceMQ
                                  payload: context.payload, envelope: context.envelope,
                                  routing_key: delivery.routing_key,
                                  content_type: delivery.content_type,
-                                 redelivered: delivery.redelivered?, body: delivery.body
+                                 redelivered: delivery.redelivered?, body: delivery.body,
+                                 reply_to: delivery.reply_to
                                ))
         return result if result.is_a?(Ack)
 
@@ -570,6 +590,8 @@ module AceMQ
         if ack.reject?
           return Settlement.rejected("rejected by the handler: #{describe(ack.error)}")
         end
+        return Settlement.parked("parked by the handler: #{describe(ack.error)}") if ack.park?
+
         if ack.error.is_a?(FatalError)
           # The handler asked for a retry but marked the reason as one that
           # will not change. Honouring the mark rather than the request is the
@@ -589,6 +611,8 @@ module AceMQ
       def settle(delivery, envelope, settlement)
         if settlement.acked?
           delivery.ack
+        elsif settlement.parked?
+          park(delivery, envelope, settlement.reason)
         elsif settlement.dead_letters?
           dead_letter(delivery, envelope, settlement.reason)
         else
@@ -697,21 +721,53 @@ module AceMQ
       # of +rejected+ for the same delivery. {#observe} counts the decision, by
       # its own name, once.
       def dead_letter(delivery, envelope, reason)
-        republish(@dead_letter_queue, delivery, envelope.with(error: reason))
-        delivery.ack
+        set_aside(@dead_letter_queue, delivery, envelope, reason)
       end
 
+      # Sends the message to its parking queue: the body would not decode, or a
+      # handler said it cannot be read.
       def park(delivery, envelope, reason)
-        @telemetry.count(Telemetry::PARKED, 1, queue: @queue)
         envelope ||= Envelope.from_headers(delivery.headers, delivery.routing_key)
-        republish(@parked_queue, delivery, envelope.with(error: reason))
+        set_aside(@parked_queue, delivery, envelope, reason)
+      end
+
+      # Republishes to a dead-letter or parking queue with the reason attached,
+      # then acknowledges the original.
+      #
+      # What happens when the republish itself fails is worth writing down,
+      # because it is not what Go and Python do. There, a message that cannot be
+      # moved is rejected to the broker, so the delivery is settled either way.
+      # Here the {PublishError} escapes {#handle} entirely: the delivery is never
+      # settled, and the broker redelivers it when the channel closes. Nothing is
+      # lost, which is why this has been left alone — but a message that keeps
+      # coming back because its dead-letter queue is missing looks, from outside,
+      # exactly like a handler that keeps failing.
+      #
+      # +acemq.messages.set.aside.failed+ is what tells the two apart. It is the
+      # same counter Go and Python raise in the same situation, so an alert
+      # written once reads the same against all three, and it is the only sign
+      # this path leaves. Counted and then re-raised, deliberately: counting is
+      # not a reason to change what happens to the message.
+      def set_aside(target, delivery, envelope, reason)
+        begin
+          republish(target, delivery, envelope.with(error: reason))
+        rescue StandardError
+          @telemetry.count(Telemetry::SET_ASIDE_FAILED, 1, queue: @queue, target: target)
+          raise
+        end
+        # Only once the copy is safely elsewhere. Acknowledging first would drop
+        # the message on a broker that then refused the copy.
         delivery.ack
       end
 
+      # +reply_to+ travels with the copy. A request that is retried, dead-lettered
+      # or parked keeps the property saying where its answer was meant to go, so
+      # a replay off the dead-letter queue can still answer whoever asked.
       def republish(queue, delivery, envelope)
         @transport.publish(exchange: "", routing_key: queue, body: delivery.body,
                            content_type: delivery.content_type, message_id: envelope.id,
-                           headers: envelope.to_headers(delivery.routing_key), persistent: true)
+                           headers: envelope.to_headers(delivery.routing_key), persistent: true,
+                           reply_to: delivery.reply_to)
       end
 
       def describe(error)

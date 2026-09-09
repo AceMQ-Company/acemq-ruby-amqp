@@ -756,6 +756,54 @@ RSpec.describe "against a real broker", :integration do
         .to raise_error(AceMQ::AMQP::Patterns::ResponderFailed, /the catalogue is down/)
       requester.close
     end
+
+    # The three that need a real broker. reply-to is an AMQP property and not a
+    # header, so it travels in basic.properties rather than in the field table:
+    # a fake transport can be made to carry anything, and only the wire says
+    # whether bunny really wrote it and really read it back. This is what makes
+    # a Java or .NET requester and a Ruby responder able to talk.
+    describe "the reply address, on the wire" do
+      it "goes out in the AMQP property as well as the header" do
+        # Nothing is serving the queue, so the request stays on it to be looked
+        # at. The timeout is short because the timing out is not the point.
+        requester = AceMQ::AMQP::Patterns::Requester.new(mq, to: queue, reply_to: replies,
+                                                             timeout: 0.5)
+        begin
+          requester.call({ "sku" => "X" })
+        rescue AceMQ::AMQP::Patterns::RequestTimedOut
+          nil
+        end
+        properties, = take_one(queue)
+
+        expect(properties[:reply_to]).to eq(replies)
+        expect(properties[:headers][AceMQ::AMQP::Patterns::REPLY_TO_HEADER]).to eq(replies)
+        requester.close
+      end
+
+      it "answers a request carrying only the property, as Java and .NET send it" do
+        AceMQ::AMQP::Patterns.serve(mq, queue) do |message|
+          { "price" => message.payload["sku"].length * 100 }
+        end
+        mq.publish({ "sku" => "X-12" }, to: queue, reply_to: replies,
+                                        correlation_id: "from-java")
+
+        _properties, body = take_one(replies)
+        expect(JSON.parse(body)).to eq({ "price" => 400 })
+      end
+
+      it "answers a request carrying only the header, as Go and Python send it" do
+        AceMQ::AMQP::Patterns.serve(mq, queue) do |message|
+          { "price" => message.payload["sku"].length * 100 }
+        end
+        mq.publish({ "sku" => "X-12" }, to: queue, correlation_id: "from-go",
+                                        headers: {
+                                          AceMQ::AMQP::Patterns::REPLY_TO_HEADER => replies
+                                        })
+
+        _properties, body = take_one(replies)
+        expect(JSON.parse(body)).to eq({ "price" => 400 })
+      end
+    end
   end
 
   describe "replaying a dead-letter queue" do

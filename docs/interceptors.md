@@ -82,11 +82,14 @@ end
 
 `rejected` is kept apart from `dead_lettered` although both end in the
 dead-letter queue: a message the handler refused on purpose is the system
-working, and one that ran out of attempts is not.
+working, and one that ran out of attempts is not. `parked` is kept apart from
+both, and `dead_letters?` is false for it: it goes to `{queue}.parked`, which is
+a queue of its own, on purpose.
 
-The library reads it from the same place. The four outcomes are the four
-[outcome counters](observability.md#the-four-outcome-counters-are-what-the-consumer-decided)
-and the four values of the span's `messaging.acemq.outcome` attribute, so a
+The library reads it from the same place. The five outcomes — `acked`, `retried`,
+`rejected`, `dead_lettered`, `parked` — are the
+[outcome counters](observability.md#the-outcome-counters-are-what-the-consumer-decided)
+and the values of the span's `messaging.acemq.outcome` attribute, so a
 counter, a span and an interceptor looking at one delivery all say the same
 word.
 
