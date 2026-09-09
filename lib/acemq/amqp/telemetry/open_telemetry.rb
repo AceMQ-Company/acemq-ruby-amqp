@@ -112,11 +112,12 @@ module AceMQ
         # on purpose is the system working; marking either as an error is how a
         # trace view fills with red and stops meaning anything.
         #
-        # +parked+ is here with +dead_lettered+: a message nothing could read,
-        # or one a handler said was unreadable, is a message that will never be
-        # processed, and the parking queue exists because somebody has to go and
-        # look at it.
-        FAILING_OUTCOMES = %w[unroutable failed dead_lettered parked].freeze
+        # +parked+ is deliberately absent, for the same reason +rejected+ is: a
+        # handler that parks a message meant to, and a decision somebody made is
+        # not a failure. Go and Python leave it out too, so a parked span reads
+        # the same in all three. The parking queue still has to be looked at --
+        # that is what the +acemq.messages.parked+ counter is for.
+        FAILING_OUTCOMES = %w[unroutable failed dead_lettered].freeze
 
         # Runs before every other interceptor on the way in and after every
         # other one on the way out, so a span covers whatever they do.

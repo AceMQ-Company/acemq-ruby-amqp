@@ -314,12 +314,13 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
 
     # A handler that knows the message cannot be read says so, and the message
     # goes to the parking queue rather than into the dead letters with the ones
-    # that merely failed.
-    it "calls a parked message parked, and does call that an error" do
+    # that merely failed. That is a decision, not a failure, so the span is not
+    # red -- the same reading Go and Python give it.
+    it "calls a parked message parked, and does not call that an error" do
       span = handled { |_m| AceMQ::AMQP::Ack.park("the schema version is unknown here") }
 
       expect(span.attributes["messaging.acemq.outcome"]).to eq("parked")
-      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+      expect(span.status.code).not_to eq(OpenTelemetry::Trace::Status::ERROR)
     end
 
     it "calls a publish nobody would take failed, and does call that an error" do
