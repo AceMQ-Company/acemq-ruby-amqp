@@ -377,14 +377,21 @@ module AceMQ
       # The counters a delivery raises besides +acemq.consume.total+, keyed by
       # the word the {Settlement} carries.
       #
-      # A retry and a give-up are counted twice on purpose: once in
+      # A retry and a message set aside are counted twice on purpose: once in
       # +acemq.consume.total+ tagged with the outcome, which is the series
       # saying exactly one thing happened to this message, and once under a name
       # of their own, because a retry rate and a dead-letter rate are the two
       # most often wanted without a tag filter. All five languages keep the same
       # pair. Nothing else has a second name; the tag is how they are read.
+      #
+      # +parked+ shares +dead.lettered.total+ with +dead_lettered+ rather than
+      # having a counter of its own, tagged apart by the outcome. That is Java's
+      # rule, and its reasoning is worth repeating: both are a message set
+      # aside, and an operator asking "how much is this queue giving up on"
+      # wants one number that can then be split.
       ALSO_COUNTED = { Settlement::RETRIED => Telemetry::RETRIED_TOTAL,
-                       Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED_TOTAL }.freeze
+                       Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED_TOTAL,
+                       Settlement::PARKED => Telemetry::DEAD_LETTERED_TOTAL }.freeze
 
       attr_reader :queue, :retry_policy, :codec, :ladder
 
@@ -548,7 +555,10 @@ module AceMQ
                            queue: @queue, outcome: outcome)
         @telemetry.count(Telemetry::CONSUME_TOTAL, 1, queue: @queue, outcome: outcome)
         also = ALSO_COUNTED[outcome]
-        @telemetry.count(also, 1, queue: @queue) if also
+        # Tagged with the outcome as well, because dead.lettered.total carries
+        # two of them: a give-up and a park. Untagged it would still add up, but
+        # nobody could ask which. Java and Go both tag it.
+        @telemetry.count(also, 1, queue: @queue, outcome: outcome) if also
       end
 
       # What an interceptor sees, and what the handler is built from.

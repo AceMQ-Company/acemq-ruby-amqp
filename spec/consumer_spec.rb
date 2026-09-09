@@ -430,17 +430,23 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(transport.published_to("orders.new.parked").size).to eq(1)
     end
 
-    it "counts it as parked and as nothing else" do
+    # Parked is its own word everywhere it appears, but it is not its own
+    # counter: it shares dead.lettered.total with a give-up, tagged apart. That
+    # is Java's rule -- both are a message set aside, and "how much is this
+    # queue giving up on" should be one number in every language.
+    it "counts it as parked, and with the messages set aside" do
       metrics = AceMQ::AMQP::Telemetry::Registry.new
       delivery, = FakeDelivery.build(headers: headers_for)
       consumer(telemetry: metrics) { Ack.park("unreadable") }.handle(delivery)
 
       queue = { queue: "orders.new" }
       total = AceMQ::AMQP::Telemetry::CONSUME_TOTAL
+      set_aside = AceMQ::AMQP::Telemetry::DEAD_LETTERED_TOTAL
       expect(metrics[total, **queue, outcome: "parked"]).to eq(1)
       expect(metrics[total, **queue, outcome: "rejected"]).to eq(0)
       expect(metrics[total, **queue, outcome: "dead_lettered"]).to eq(0)
-      expect(metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED_TOTAL, **queue]).to eq(0)
+      expect(metrics[set_aside, **queue, outcome: "parked"]).to eq(1)
+      expect(metrics[set_aside, **queue, outcome: "dead_lettered"]).to eq(0)
     end
   end
 

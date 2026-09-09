@@ -101,8 +101,12 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       consumer { AceMQ::AMQP::Ack.retry("the warehouse is down") }.handle(delivery_for.first)
 
       queue = { queue: "orders.new" }
-      expect(metrics[Telemetry::RETRIED_TOTAL, **queue]).to eq(1)
-      expect(metrics[Telemetry::DEAD_LETTERED_TOTAL, **queue]).to eq(1)
+      # Tagged with the outcome, like the consume counter. dead.lettered.total
+      # carries both a give-up and a park, and untagged nobody could ask which.
+      expect(metrics[Telemetry::RETRIED_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::RETRIED]).to eq(1)
+      expect(metrics[Telemetry::DEAD_LETTERED_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::DEAD_LETTERED]).to eq(1)
       # And they say the same as the tag they duplicate, always.
       expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
                      outcome: Telemetry::Outcome::RETRIED]).to eq(1)
