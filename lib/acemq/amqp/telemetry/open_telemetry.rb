@@ -300,12 +300,21 @@ module AceMQ
         # The handler has returned or raised, and the delivery has not been
         # settled yet — which is the last moment the outcome and the span are
         # both in hand.
+        #
+        # The outcome comes off the context's {Settlement} when there is one,
+        # because that is what the consumer is about to do; the ack is only what
+        # the handler asked for. A retry on the last attempt is a dead letter,
+        # and reading it off the ack is how a dead-lettered message ends up with
+        # +outcome=retried+ on its span and nothing in the trace to say it was
+        # dropped. The ack is still the fallback, for anything driving this
+        # interceptor without a consumer behind it.
         def after_handle(context, ack)
           scope = pop(@consuming)
           return context if scope.nil?
 
-          outcome = self.class.outcome_of(ack)
-          note(context, ack, outcome)
+          settlement = settlement_of(context)
+          outcome = settlement&.outcome || self.class.outcome_of(ack)
+          note(context, ack, settlement, outcome)
           scope.failed(ack.error) if ack.error.is_a?(Exception)
           finish(scope, outcome)
           context
@@ -327,12 +336,16 @@ module AceMQ
           context
         end
 
-        # What a decision is called on a span.
+        # What an ack alone is called on a span.
         #
         # The same four words the Java adapter writes. +dead_lettered+ rather
         # than +retried+ for a retry marked fatal, because that is what the
         # consumer will actually do with it — honouring the mark rather than the
         # request is the entire point of having it.
+        #
+        # This is the fallback. What an ack cannot know is whether a retry has
+        # any attempts left, so a {Settlement} on the context wins over it; see
+        # {#after_handle}.
         #
         # @param ack [Ack]
         # @return [String]
@@ -476,14 +489,31 @@ module AceMQ
           end
         end
 
+        # The settlement the consumer attached, or nil for anything else.
+        #
+        # Asked of the context rather than assumed, because this interceptor is
+        # public and can be handed a context built by something that is not this
+        # library's consumer.
+        def settlement_of(context)
+          context.respond_to?(:settlement) ? context.settlement : nil
+        end
+
         # The two events the consume path knows enough to raise on its own.
-        def note(context, ack, outcome)
+        #
+        # Both are written with what the settlement decided: the delay is the
+        # one the retry policy really chose, and the reason is the sentence that
+        # goes onto the dead letter itself — which is what somebody reading the
+        # trace and somebody draining the queue need to be able to match up. A
+        # rejection is dead-lettered too, so it raises the event as well; only
+        # the word on the span keeps them apart.
+        def note(context, ack, settlement, outcome)
           case outcome
           when "retried"
-            message_retried(queue: context.queue, envelope: context.envelope)
-          when "dead_lettered"
+            message_retried(queue: context.queue, envelope: context.envelope,
+                            delay: settlement&.delay)
+          when "dead_lettered", "rejected"
             message_dead_lettered(queue: context.queue, envelope: context.envelope,
-                                  reason: ack.error.to_s)
+                                  reason: settlement&.reason || ack.error.to_s)
           end
         end
 

@@ -292,6 +292,18 @@ indistinguishable, and a fixed-schema codec reading a framed message decodes the
 identifier as the first field without throwing — so this library follows Java
 and .NET, and the spec says so.
 
+A second disagreement, about how a fixed-schema codec tells the two framings
+apart in the bytes, has been **resolved rather than recorded**. Java refused any
+body of five or more bytes beginning with `0x00`, in case it was a framed
+message, and this library copied the check. It is the wrong rule: a legitimate
+Avro body begins with a zero byte whenever its first field encodes to zero — an
+empty string, a `0`, a `false`, branch 0 of a union — so the check refused real
+messages to catch a framing the content type had already named. The content type
+now decides, and the leading-zero guess applies only when nothing was said at
+all; Python implemented that first and Java has been changed to match. The
+example that pins it encodes an order with an empty `orderId`, whose first byte
+really is `0x00`, and reads it back under `avro/binary`.
+
 ### Keeping the copies identical
 
 The fixtures work only for as long as every library's copy is the same file. A

@@ -112,6 +112,42 @@ While the version is `0.x` the public API may change in any release.
   `FatalError`, because it is no longer only the transport's. The constant is
   unchanged: `AceMQ::AMQP::DependencyMissing`.
 
+### Changed
+
+- **A fixed-schema `AvroCodec` reads the content type before it reads the
+  bytes.** `AvroCodec#decode` now takes an optional content type, and it decides:
+  `avro/binary`, `application/avro` and any `…+avro` type are read as a
+  fixed-schema body with no further checking, `application/vnd.acemq.avro` is
+  refused as the registry framing, and only a message that named no Avro type at
+  all falls back to the old guess — five or more bytes beginning with `0x00` are
+  refused as probably framed.
+
+  The guess used to be the whole rule, copied from Java. It refuses legitimate
+  messages: an Avro body begins with a zero byte whenever its first field
+  encodes to zero — an empty string, a `0`, a `false`, branch 0 of a union — so
+  a real record was being refused to catch a framing the sender had already
+  named. Python implemented the rule above first and Java has been changed to
+  match, so all three now read the same bytes the same way.
+  `CompositeCodec` passes the content type down to any candidate whose `decode`
+  takes one, so a composite holding an Avro codec gets the same answer.
+- **The OpenTelemetry adapter reports what the consumer decided, not what the
+  handler asked for.** A handler asking for a retry with no attempts left is
+  dead-lettered by the consumer; the span said `outcome=retried` and no
+  `message.dead_lettered` event was raised at all, so a trace backend queried
+  for dead letters found nothing. The span now says `dead_lettered` and the
+  event carries the reason written onto the message. `message.retried` carries
+  `messaging.acemq.retry_delay_ms` — the delay the retry policy actually chose,
+  which is only known while the delivery is being settled.
+
+  The seam is a `Settlement` — `outcome`, `delay`, `reason` — worked out by the
+  consumer before the interceptors run and left on `ConsumeContext#settlement`,
+  so any interceptor can read what is about to happen rather than infer it from
+  the ack. `rejected` stays a separate outcome from `dead_lettered` although
+  both end in the dead-letter queue, and the dead-letter event is raised for
+  both. Nothing about this is OpenTelemetry-specific and nothing is required
+  until an adapter is built: `opentelemetry-api` remains a lazily required
+  optional gem, and the gemspec still declares no runtime dependencies.
+
 ### Security
 
 - **`YAMLCodec` parses with `Psych.safe_load`, never `YAML.load`.** A message

@@ -54,6 +54,65 @@ module AceMQ
       def to_s = "publish #{@envelope.id} to #{@exchange.inspect}/#{@routing_key}"
     end
 
+    # What the consumer has decided to do with a delivery, before it does it.
+    #
+    # An {Ack} is what the handler asked for; this is what the retry engine
+    # settled on, which is not always the same thing and is the part worth
+    # reporting. A handler that asks for a retry on its last attempt is
+    # dead-lettered, and a retry that will happen has a delay attached — a
+    # number that does not exist until the retry policy has been asked, which
+    # is why this is worked out before the interceptors are told rather than
+    # guessed from the ack afterwards.
+    #
+    # Read it off the {ConsumeContext} in +after_handle+:
+    #
+    #   def after_handle(context, _ack)
+    #     record(context.settlement.outcome, context.settlement.delay)
+    #   end
+    #
+    # The four outcomes are the words every AceMQ library writes on a span, and
+    # +rejected+ is kept apart from +dead_lettered+ even though both end in the
+    # dead-letter queue: a message the handler refused on purpose is the system
+    # working, and one that ran out of attempts is not.
+    class Settlement
+      # Acknowledged: the handler was happy.
+      ACKED = "acked"
+      # Refused by the handler, and dead-lettered because of it.
+      REJECTED = "rejected"
+      # Going round again, after {#delay} seconds.
+      RETRIED = "retried"
+      # Out of attempts, or marked as something retrying cannot fix.
+      DEAD_LETTERED = "dead_lettered"
+
+      # @return [String] one of the four words above
+      attr_reader :outcome
+      # @return [Float, nil] seconds this message will wait, when it is a retry
+      attr_reader :delay
+      # @return [String, nil] why, when it is not going round again
+      attr_reader :reason
+
+      def initialize(outcome:, delay: nil, reason: nil)
+        @outcome = outcome
+        @delay = delay
+        @reason = reason
+        freeze
+      end
+
+      def self.acked = new(outcome: ACKED)
+      def self.rejected(reason) = new(outcome: REJECTED, reason: reason)
+      def self.retried(delay) = new(outcome: RETRIED, delay: delay)
+      def self.dead_lettered(reason) = new(outcome: DEAD_LETTERED, reason: reason)
+
+      def acked? = @outcome == ACKED
+      def retried? = @outcome == RETRIED
+
+      # Whether the message is going to the dead-letter queue, which a rejection
+      # and a give-up both do.
+      def dead_letters? = @outcome == REJECTED || @outcome == DEAD_LETTERED
+
+      def to_s = @reason.nil? ? @outcome : "#{@outcome}: #{@reason}"
+    end
+
     # A message that has arrived, as an interceptor sees it before the handler.
     #
     # The payload is already decoded, which is the useful moment: an interceptor
@@ -66,11 +125,23 @@ module AceMQ
     # way to the queue somebody looks at.
     class ConsumeContext
       attr_accessor :envelope
+
+      # What the consumer is about to do with this delivery.
+      #
+      # Nil until the handler has returned, and set before +after_handle+ runs
+      # — so an interceptor that wants to know whether the message is going
+      # round again, and after how long, can read it there rather than work it
+      # out from the ack, which cannot say.
+      #
+      # @return [Settlement, nil]
+      attr_accessor :settlement
+
       attr_reader :queue, :payload, :body, :content_type, :redelivered
 
       def initialize(queue:, envelope:, payload:, body:, content_type:, redelivered:)
         @queue = queue
         @envelope = envelope
+        @settlement = nil
         @payload = payload
         @body = body
         @content_type = content_type
@@ -231,6 +302,9 @@ module AceMQ
 
       # Runs every +after_handle+, in reverse order, after the handler has
       # returned or raised and before the delivery is settled.
+      #
+      # The context carries the {Settlement} by then, so an interceptor is told
+      # what is about to happen rather than only what was asked for.
       def after_handle(context, ack)
         @consuming.reverse_each do |entry|
           safely(entry.after, "after a handler") { entry.after.call(context, ack) }

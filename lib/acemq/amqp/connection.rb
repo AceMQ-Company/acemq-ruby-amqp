@@ -422,6 +422,13 @@ module AceMQ
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         ack = invoke(context, delivery)
         observe(ack, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+        # Decided before the interceptors are told rather than after, because
+        # the decision is the thing worth telling them: an ack asking for a
+        # retry on the last attempt is a dead letter, and a retry that will
+        # really happen has a delay attached that does not exist until the
+        # policy has been asked. An interceptor left to infer it from the ack
+        # reports the message as retried and the delay as nothing.
+        context.settlement = decide(context.envelope, ack)
         # After the handler and before the delivery is settled, so an
         # interceptor can still see how it went and still undo whatever it set
         # up on the way in. The envelope read back off the context is the one an
@@ -429,7 +436,7 @@ module AceMQ
         # written with — otherwise a header stamped on the way in would be there
         # for the handler and gone from the queue somebody has to look at.
         @interceptors.after_handle(context, ack)
-        settle(delivery, context.envelope, ack)
+        settle(delivery, context.envelope, context.settlement)
       rescue DecodeError => e
         # A body that will not decode decodes no better next time, so it is
         # parked rather than retried. Parked and not dead-lettered: a message
@@ -536,39 +543,52 @@ module AceMQ
         Ack.retry(e)
       end
 
-      def settle(delivery, envelope, ack)
-        if ack.accept?
-          delivery.ack
-        elsif ack.reject?
-          dead_letter(delivery, envelope, "rejected by the handler: #{describe(ack.error)}")
-        else
-          retry_or_give_up(delivery, envelope, ack)
+      # What will happen to this delivery, worked out and not yet done.
+      #
+      # Separate from {#settle} because the answer is wanted a moment before it
+      # is acted on: it is what the interceptors are handed, and the delay in it
+      # is the number a retry event has to carry. Nothing here touches the
+      # broker, so working it out early costs a decision object and no round
+      # trip.
+      def decide(envelope, ack)
+        return Settlement.acked if ack.accept?
+        if ack.reject?
+          return Settlement.rejected("rejected by the handler: #{describe(ack.error)}")
         end
-      end
-
-      def retry_or_give_up(delivery, envelope, ack)
         if ack.error.is_a?(FatalError)
           # The handler asked for a retry but marked the reason as one that
           # will not change. Honouring the mark rather than the request is the
           # entire point of having it.
-          return dead_letter(delivery, envelope, "retrying cannot help: #{describe(ack.error)}")
+          return Settlement.dead_lettered("retrying cannot help: #{describe(ack.error)}")
         end
 
         # Without jitter, because this number decides where the wait happens and
-        # a jittered one names no rung. Jitter is added below, and only to the
+        # a jittered one names no rung. Jitter is added later, and only to the
         # waits this process performs itself.
         delay = @retry_policy.next_delay(envelope.attempt, envelope.age, jitter: false)
-        if delay.nil?
-          return dead_letter(delivery, envelope, "#{gave_up(envelope)}: #{describe(ack.error)}")
-        end
+        return Settlement.retried(delay) unless delay.nil?
 
-        # Republished rather than requeued, with the attempt advanced, whichever
-        # way the wait happens. A requeue hands back the bytes the broker was
-        # given, so the count would have to live in this process — and then a
-        # fleet of consumers each counts its own, a message that moves between
-        # them is for ever on attempt one, and a restart forgets everything. The
-        # trade is that the message goes to the back of its queue rather than
-        # the front.
+        Settlement.dead_lettered("#{gave_up(envelope)}: #{describe(ack.error)}")
+      end
+
+      def settle(delivery, envelope, settlement)
+        if settlement.acked?
+          delivery.ack
+        elsif settlement.dead_letters?
+          dead_letter(delivery, envelope, settlement.reason)
+        else
+          retry_after(settlement.delay, delivery, envelope)
+        end
+      end
+
+      # Republished rather than requeued, with the attempt advanced, whichever
+      # way the wait happens. A requeue hands back the bytes the broker was
+      # given, so the count would have to live in this process — and then a
+      # fleet of consumers each counts its own, a message that moves between
+      # them is for ever on attempt one, and a restart forgets everything. The
+      # trade is that the message goes to the back of its queue rather than the
+      # front.
+      def retry_after(delay, delivery, envelope)
         next_attempt = envelope.with(attempt: envelope.attempt + 1)
         rung = rung_for(delay)
         return wait_in_broker(rung, delivery, next_attempt) if rung

@@ -253,7 +253,7 @@ module AceMQ
       def decode(body, content_type = "")
         failures = []
         candidates(content_type).each do |codec|
-          return codec.decode(body)
+          return read(codec, body, content_type)
         rescue DecodeError => e
           failures << "#{codec.content_type}: #{e.message}"
         end
@@ -272,6 +272,17 @@ module AceMQ
       attr_reader :codecs
 
       private
+
+      # A codec that reads by content type is told it; a plain one has no use
+      # for it. Asked of the codec rather than assumed, so a codec from another
+      # gem works either way round — and so the Avro codec inside a composite
+      # gets the same signal it would get on its own, which is what tells it
+      # which framing it is being handed.
+      def read(codec, body, content_type)
+        return codec.decode(body) if codec.method(:decode).arity == 1
+
+        codec.decode(body, content_type)
+      end
 
       # Every codec when the sender named no content type, and only those that
       # claim it when it did.

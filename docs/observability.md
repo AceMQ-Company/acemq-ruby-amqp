@@ -232,6 +232,15 @@ fills with red and stops meaning anything.
 A retry the handler marked `FatalError` is reported as `dead_lettered` rather
 than `retried`, because that is what the consumer will actually do with it.
 
+**The outcome is what the consumer decided, not what the handler asked for.**
+An `Ack` cannot know whether there is an attempt left to spend, so a handler
+asking for a retry on its last attempt is reported as `dead_lettered` — the
+message is going to the dead-letter queue, and a span saying `retried` would
+send whoever is looking for it to the wrong queue. The consumer works the
+decision out before the interceptors run and puts it on the context as a
+[`Settlement`](interceptors.md#the-settlement), which is where the adapter reads
+it.
+
 ### Events, not spans
 
 ```
@@ -243,7 +252,18 @@ message.dead_lettered
 
 Events on the span that is already open. A zero-length span at the end of a
 trace adds a row and no information. The two the consume path knows about are
-raised for you; the other two are methods you call:
+raised for you; the other two are methods you call.
+
+`message.retried` carries `messaging.acemq.retry_delay_ms` — the delay the retry
+policy really chose, which is the number that says whether the message comes
+back in a second or in an hour. `message.dead_lettered` carries
+`messaging.acemq.reason`, the same sentence written onto the message as
+`x-acemq-error`, so a dead letter found in the queue and the trace that produced
+it can be matched up by eye. It is raised for a rejection as well as for a
+give-up: both go to the dead-letter queue, and only the word on the span keeps
+them apart.
+
+The two you call yourself:
 
 ```ruby
 tracing.outbox_publish_failed(exchange: "orders", reason: error.message)

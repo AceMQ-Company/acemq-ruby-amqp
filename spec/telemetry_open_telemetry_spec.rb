@@ -208,10 +208,16 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
   describe "outcomes" do
     let(:interceptors) { AceMQ::AMQP::Interceptors.new.add_consume(tracing) }
 
-    def handled(&handler)
+    # Five attempts and a wait of fifty milliseconds, which is short enough that
+    # the consumer keeps it rather than sending the message round a rung — so a
+    # message handed this really is retried, and the wait costs the suite
+    # nothing worth measuring.
+    let(:retrying) { AceMQ::AMQP::RetryPolicy.fixed(5, 0.05) }
+
+    def handled(retry_policy: AceMQ::AMQP::RetryPolicy.none, &handler)
       AceMQ::AMQP::Consumer.new(
         transport: transport, queue: "orders.new", codec: AceMQ::AMQP::JSONCodec.new,
-        retry_policy: AceMQ::AMQP::RetryPolicy.none, interceptors: interceptors,
+        retry_policy: retry_policy, interceptors: interceptors,
         handler: handler
       ).handle(
         Struct.new(:body, :headers, :routing_key, :content_type, :redelivered,
@@ -234,11 +240,39 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     # A message that will be tried again has not failed yet. Marking it as an
     # error is how a trace view fills with red and stops meaning anything.
     it "calls a retry retried, and does not call it an error either" do
-      span = handled { |_m| AceMQ::AMQP::Ack.retry("the warehouse said no") }
+      span = handled(retry_policy: retrying) { |_m| AceMQ::AMQP::Ack.retry("no stock") }
 
       expect(span.attributes["messaging.acemq.outcome"]).to eq("retried")
       expect(span.status.code).to eq(OpenTelemetry::Trace::Status::UNSET)
       expect(span.events.map(&:name)).to include("message.retried")
+    end
+
+    # The delay is not in the ack. It is chosen by the retry policy while the
+    # delivery is being settled, and an event raised before that carries no
+    # delay at all — which is a retry event nobody can do anything with.
+    it "writes the delay the retry policy really chose onto the retry event" do
+      span = handled(retry_policy: retrying) { |_m| AceMQ::AMQP::Ack.retry("no stock") }
+      event = span.events.find { |one| one.name == "message.retried" }
+
+      expect(event.attributes["messaging.acemq.retry_delay_ms"]).to eq(50)
+      expect(event.attributes["messaging.acemq.attempt"]).to eq(1)
+      expect(event.attributes["messaging.destination.name"]).to eq("orders.new")
+    end
+
+    # The one this change is for. The handler asked for a retry, the policy had
+    # no attempts left, and the consumer dead-lettered the message — while the
+    # span said "retried" and no dead-letter event was ever raised, so a query
+    # for dead letters in a trace backend found nothing at all.
+    it "calls a retry with no attempts left dead_lettered rather than retried" do
+      span = handled { |_m| AceMQ::AMQP::Ack.retry("the warehouse said no") }
+      event = span.events.find { |one| one.name == "message.dead_lettered" }
+
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("dead_lettered")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+      expect(span.events.map(&:name)).not_to include("message.retried")
+      expect(event.attributes["messaging.acemq.reason"])
+        .to eq("gave up after 1 attempts: the warehouse said no")
+      expect(event.attributes["messaging.acemq.attempt"]).to eq(1)
     end
 
     it "calls a rejection rejected, which is the system working" do
@@ -246,6 +280,18 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
 
       expect(span.attributes["messaging.acemq.outcome"]).to eq("rejected")
       expect(span.status.code).to eq(OpenTelemetry::Trace::Status::UNSET)
+    end
+
+    # A rejected message goes to the dead-letter queue like any other, so the
+    # event is raised for it too — with the same sentence that is written onto
+    # the message, which is what lets somebody draining the queue find the
+    # trace. Only the word on the span keeps the two apart.
+    it "raises the dead-letter event for a rejection, with the reason on the message" do
+      span = handled { |_m| AceMQ::AMQP::Ack.reject("not ours") }
+      event = span.events.find { |one| one.name == "message.dead_lettered" }
+
+      expect(event.attributes["messaging.acemq.reason"])
+        .to eq("rejected by the handler: not ours")
     end
 
     # A retry marked fatal is a dead letter, because that is what the consumer

@@ -100,6 +100,14 @@ Each reads more content types than it writes — `application/x-yaml`,
 a producer in another stack uses whichever spelling its own library picked. Only
 `JSONCodec` and `BytesCodec` answer for a message with no content type at all.
 
+The two Avro framings are indistinguishable in the bytes, so **the content type
+decides which one a fixed-schema codec is reading**: `avro/binary`,
+`application/avro` and any `…+avro` type are read as a fixed-schema body,
+`application/vnd.acemq.avro` is refused as the registry framing, and only a
+message that said nothing falls back to guessing from a leading `0x00`. Guessing
+first would refuse every legitimate record whose first field encodes to zero —
+an empty string, a `0`, a `false`.
+
 The gem still declares no runtime dependencies: YAML is Psych, the TOML reader
 and writer are written into the gem, and XML, Protobuf and Avro require REXML,
 `google-protobuf` and `avro` lazily and name the gem to install. REXML ships
@@ -407,6 +415,12 @@ these it cares about:
 | `on_error(context, failure)` | `on_error(context, failure)` |
 | `order` | `order` |
 
+By the time `after_handle` runs, `context.settlement` says what the consumer is
+about to *do* — `acked`, `rejected`, `retried` or `dead_lettered`, with the
+delay of a retry or the reason for a dead letter. The ack cannot say either: the
+delay does not exist until the retry policy has been asked, and a handler asking
+for a retry with no attempts left is dead-lettered.
+
 **Raising means different things in different places, on purpose.** From
 `before_publish` it *stops the publish* and the caller sees the exception —
 that is the point of intercepting rather than observing, and a message that
@@ -497,6 +511,14 @@ of tracing a message system.
 failed yet. Retries, dead letters, outbox failures and finished pipeline runs
 are *events* on the span already open, because a zero-length span at the end of a
 trace adds a row and no information.
+
+The outcome is **what the consumer decided, not what the handler asked for**: an
+ack cannot know whether an attempt is left to spend, so a handler asking for a
+retry on its last one is reported `dead_lettered` and its message.dead_lettered
+event carries the reason written onto the dead letter. `message.retried` carries
+`messaging.acemq.retry_delay_ms`, the delay the retry policy really chose. Both
+come off the `Settlement` the consumer puts on the context before `after_handle`
+runs, which any interceptor can read.
 
 `opentelemetry-api` is not a runtime dependency. It is required at the moment an
 adapter is built and names itself when it is absent, the way bunny does:

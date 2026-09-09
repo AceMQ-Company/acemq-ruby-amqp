@@ -40,6 +40,7 @@ sees it:
 |---|---|
 | `envelope` | — writable |
 | `queue`, `payload`, `body`, `content_type`, `redelivered?` | read-only |
+| `settlement` | what the consumer is about to do — set before `after_handle` |
 | `set_header(name, value)` | as above |
 
 What an interceptor leaves on the envelope is what the handler receives **and**
@@ -49,6 +50,39 @@ for it.
 
 `set_header` still refuses the reserved `x-acemq-` names — see
 [the envelope](envelope.md#application-headers).
+
+### The settlement
+
+An `Ack` says what the handler asked for. A **`Settlement`** says what the
+consumer is going to do about it, which is not the same thing:
+
+| | |
+|---|---|
+| `outcome` | `acked`, `rejected`, `retried` or `dead_lettered` |
+| `delay` | seconds until the retry, when it is one |
+| `reason` | the sentence written onto the message, when it is not |
+| `acked?`, `retried?`, `dead_letters?` | the three questions worth asking |
+
+It is on the context by the time `after_handle` runs, and it is the only place
+two things can be read at all. The first is the delay: it is chosen by the
+[retry policy](reliability.md) while the delivery is being settled, so nothing
+before that point knows it. The second is what happens on the last attempt — a
+handler asking for a retry with no attempts left is dead-lettered, and an
+interceptor reading the ack alone reports a message that was dropped as one that
+is coming back.
+
+```ruby
+def after_handle(context, _ack)
+  settlement = context.settlement
+  return unless settlement.dead_letters?
+
+  Alerts.raise("#{context.queue} dropped #{context.envelope.id}: #{settlement.reason}")
+end
+```
+
+`rejected` is kept apart from `dead_lettered` although both end in the
+dead-letter queue: a message the handler refused on purpose is the system
+working, and one that ran out of attempts is not.
 
 ## Blocks and objects
 

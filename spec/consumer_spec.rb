@@ -28,9 +28,11 @@ RSpec.describe AceMQ::AMQP::Consumer do
   # how long to wait, when to give up and what reason gets written onto the
   # dead letter, and none of that is the broker's arithmetic.
   def consumer(policy: AceMQ::AMQP::RetryPolicy.none, codec: AceMQ::AMQP::JSONCodec.new,
-               threshold: AceMQ::AMQP::RetryLadder::DEFAULT_THRESHOLD, &handler)
+               threshold: AceMQ::AMQP::RetryLadder::DEFAULT_THRESHOLD,
+               interceptors: AceMQ::AMQP::Interceptors.new, &handler)
     described_class.new(transport: transport, queue: "orders.new", handler: handler,
-                        codec: codec, retry_policy: policy, retry_threshold: threshold)
+                        codec: codec, retry_policy: policy, retry_threshold: threshold,
+                        interceptors: interceptors)
   end
 
   def headers_for(id: "msg-1", attempt: 1, **extra)
@@ -272,6 +274,60 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(recorder.requeued?).to be(false)
       expect(transport.published_to("orders.new.dlq").first.headers[Headers::ERROR])
         .to eq("rejected by the handler: no customer on this order")
+    end
+  end
+
+  # An ack says what the handler asked for. It cannot say whether there is an
+  # attempt left to spend on it, or how long the next wait will be, so anything
+  # reporting on this consumer from the outside has to be told rather than left
+  # to infer it.
+  describe "what the interceptors are told about the settlement" do
+    let(:seen) { [] }
+
+    let(:interceptors) do
+      recorded = seen
+      watcher = Object.new
+      watcher.define_singleton_method(:after_handle) do |context, _ack|
+        recorded << context.settlement
+      end
+      AceMQ::AMQP::Interceptors.new.add_consume(watcher)
+    end
+
+    it "hands after_handle the delay the retry policy chose" do
+      policy = AceMQ::AMQP::RetryPolicy.fixed(5, 0.05)
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(policy: policy, interceptors: interceptors) { Ack.retry("not yet") }
+        .handle(delivery)
+
+      expect(seen.last.outcome).to eq("retried")
+      expect(seen.last.delay).to eq(0.05)
+    end
+
+    it "says dead_lettered, not retried, once the attempts are used up" do
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(interceptors: interceptors) { Ack.retry("the warehouse said no") }
+        .handle(delivery)
+
+      expect(seen.last.outcome).to eq("dead_lettered")
+      expect(seen.last.reason).to eq("gave up after 1 attempts: the warehouse said no")
+      expect(seen.last.delay).to be_nil
+    end
+
+    it "keeps a rejection apart from a give-up, though both are dead-lettered" do
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(interceptors: interceptors) { Ack.reject("not ours") }.handle(delivery)
+
+      expect(seen.last.outcome).to eq("rejected")
+      expect(seen.last).to be_dead_letters
+      expect(seen.last.reason).to eq("rejected by the handler: not ours")
+    end
+
+    it "says acked when the handler was happy" do
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(interceptors: interceptors) { Ack.accept }.handle(delivery)
+
+      expect(seen.last).to be_acked
+      expect(seen.last.reason).to be_nil
     end
   end
 

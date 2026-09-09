@@ -66,6 +66,11 @@ module AceMQ
     # and .NET libraries do. The Go library accepts both in either mode, and is
     # the outlier.
     #
+    # Which is why the content type, and not the shape of the bytes, decides
+    # what a fixed-schema codec reads: the sender already said which framing it
+    # wrote, and guessing from a leading zero byte refuses real messages whose
+    # first field encodes to zero. See {unframed} for the whole rule.
+    #
     # == The gem
     #
     # +avro+, required lazily and named when it is missing, so that the gem can
@@ -145,11 +150,13 @@ module AceMQ
       end
 
       # @param body [String]
+      # @param content_type [String, nil] what the sender said these bytes are,
+      #   which is the only reliable way to tell the two framings apart
       # @return [Object] the datum, resolved onto this codec's schema
       # @raise [DecodeError] when the bytes are not Avro this codec can read
-      def decode(body)
+      def decode(body, content_type = nil)
         bytes = body.to_s.b
-        writer_schema, offset = registered? ? framed(bytes) : unframed(bytes)
+        writer_schema, offset = registered? ? framed(bytes) : unframed(bytes, content_type)
         reader = Avro::IO::DatumReader.new(writer_schema, @schema)
         reader.read(Avro::IO::BinaryDecoder.new(StringIO.new(bytes[offset..].to_s)))
       rescue DecodeError
@@ -230,23 +237,58 @@ module AceMQ
         [schema_for(bytes[1, 4].unpack1("N")), FRAME_BYTES]
       end
 
-      # A fixed-schema codec reads from the first byte — unless the message
-      # looks framed, which is caught here rather than left to Avro. Without
-      # this, the five bytes of identifier are read as the beginning of the
-      # first field: no exception, and a record whose every value is wrong. The
-      # Java and .NET libraries make the same check, and pay the same price — a
-      # record whose first field really does begin with a zero byte is refused
-      # by all three.
-      def unframed(bytes)
-        if bytes.bytesize >= FRAME_BYTES && bytes.getbyte(0) == MAGIC
+      # The writer's schema for a message with no identifier on the front.
+      #
+      # A fixed-schema codec handed framed bytes would read the five bytes of
+      # identifier as the beginning of the first field: no exception, and a
+      # record whose every value is wrong. What the content type says decides
+      # it, and only when it says nothing does the shape of the bytes get a
+      # vote:
+      #
+      # * +avro/binary+, +application/avro+ or any +...+avro+ type — the sender
+      #   has said this is a fixed-schema body, so it is read as one and the
+      #   bytes are not second-guessed.
+      # * +application/vnd.acemq.avro+ — the registry framing, which this codec
+      #   cannot read, so it is refused.
+      # * nothing, or something that names no Avro type at all — a guess is all
+      #   there is, and a body of five or more bytes beginning with a zero one
+      #   is refused as probably framed.
+      #
+      # The guess is a last resort because it is wrong about real messages: a
+      # legitimate Avro body begins with a zero byte whenever its first field
+      # encodes to zero — an empty string, a +0+, a +false+, branch 0 of a
+      # union. Refusing those to catch a framing the content type already
+      # names is the wrong trade, and Java and Python read it the same way.
+      def unframed(bytes, content_type)
+        named = content_type.to_s.downcase
+        if named.start_with?(REGISTERED_CONTENT_TYPE)
           raise DecodeError,
-                "these bytes carry a schema identifier and this codec has a fixed schema, " \
-                "so reading them would quietly produce the wrong values. Build the codec " \
-                "with registered(registry, ...) to read messages written by a registered one."
+                "this message says it carries a schema identifier and this codec has a " \
+                "fixed schema, so reading it would quietly produce the wrong values. Build " \
+                "the codec with registered(registry, ...) to read it."
+        end
+        if !names_avro?(named) && looks_framed?(bytes)
+          raise DecodeError,
+                "these bytes look like they carry a schema identifier and nothing said what " \
+                "they are, so a fixed-schema codec will not guess. Build the codec with " \
+                "registered(registry, ...), or set the message's content type to " \
+                "#{FIXED_CONTENT_TYPE} if it really has a fixed schema."
         end
 
         [@schema, 0]
       end
+
+      # Whether the sender named a type that means Avro without a framing, or
+      # the fixed-schema one. +application/vnd.acemq.avro+ is excluded by the
+      # caller, which has already refused it.
+      def names_avro?(named)
+        return false if named.empty?
+
+        named.start_with?(FIXED_CONTENT_TYPE, "avro/", "application/avro") ||
+          named.include?("+avro")
+      end
+
+      def looks_framed?(bytes) = bytes.bytesize >= FRAME_BYTES && bytes.getbyte(0) == MAGIC
 
       def schema_for(id)
         cached = @lock.synchronize { @by_id[id] }

@@ -441,6 +441,55 @@ RSpec.describe AceMQ::AMQP::AvroCodec do
       .to raise_error(AceMQ::AMQP::DecodeError, /no schema identifier/)
   end
 
+  # An order with no identifier is an odd order and a perfectly ordinary Avro
+  # message: an empty string is a zigzag length of zero, so the body begins with
+  # the same byte Confluent's framing does. So does a 0, a false, and branch 0
+  # of a union. Refusing all of them to catch a framing the content type has
+  # already named is the wrong trade, and this is the record that proves the
+  # heuristic was refusing real messages.
+  it "reads a record whose first field really does encode to a zero byte" do
+    empty = RECORD.merge("orderId" => "")
+    body = fixed.encode(empty)
+
+    expect(body.getbyte(0)).to eq(0)
+    expect(body.bytesize).to be >= 5
+    expect(fixed.decode(body, "avro/binary")).to eq(empty)
+  end
+
+  it "believes the framing-neutral spellings too, since neither names the registry" do
+    empty = RECORD.merge("orderId" => "")
+    body = fixed.encode(empty)
+    types = ["application/avro", "application/vnd.acemq.order+avro",
+             "avro/binary; charset=utf-8"]
+
+    types.each do |type|
+      expect(fixed.decode(body, type)).to eq(empty), "expected #{type.inspect} to be read"
+    end
+  end
+
+  it "still refuses the registry framing by name, whatever the bytes look like" do
+    registry.register("org.acemq.samples.Order", "avro", ORDER_SCHEMA)
+    framed = sample_body("java", "avro-registered")
+
+    expect { fixed.decode(framed, "application/vnd.acemq.avro") }
+      .to raise_error(AceMQ::AMQP::DecodeError, /carries a schema identifier/)
+  end
+
+  # The guess is what is left when nothing said anything, and it is still worth
+  # making: bytes that look framed and a sender that said nothing are more
+  # likely to be a framed message than an empty first field, and the refusal
+  # names the content type that would settle it.
+  it "guesses from the bytes only when the content type says nothing useful" do
+    registry.register("org.acemq.samples.Order", "avro", ORDER_SCHEMA)
+    framed = sample_body("java", "avro-registered")
+
+    [nil, "", "application/octet-stream"].each do |type|
+      expect { fixed.decode(framed, type) }
+        .to raise_error(AceMQ::AMQP::DecodeError, %r{avro/binary}),
+            "expected #{type.inspect} to leave the guess in charge"
+    end
+  end
+
   it "resolves a producer's schema onto the consumer's, which is the point of a registry" do
     # The producer adds a field. A consumer still holding the old schema reads
     # the new message, because the writer's schema travels with it.

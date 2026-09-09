@@ -91,6 +91,22 @@ framings are indistinguishable in the bytes: a fixed-schema codec reading a
 framed message would decode the identifier as the first field, without throwing,
 and hand back a record whose every value is wrong.
 
+Which is why **the content type decides**, and the bytes only get a vote when
+nothing else does. Handed `avro/binary`, `application/avro` or any `…+avro`
+type, a fixed-schema codec reads the body as one and does not second-guess it;
+handed `application/vnd.acemq.avro`, it refuses, because that is the framing it
+cannot read. Only when the content type is absent, or names no Avro type at all,
+does it fall back to guessing — a body of five or more bytes beginning with
+`0x00` is refused as probably framed, and the refusal names the content type
+that would settle it.
+
+That last rule used to be the *only* rule, here and in Java. It is wrong on its
+own: an Avro body begins with a zero byte whenever its first field encodes to
+zero — an empty string, a `0`, a `false`, branch 0 of a union — so a codec that
+refused every one of them was refusing ordinary messages to catch a framing the
+sender had already named. Java and Python read it the way described above, and
+so does this.
+
 `ProtobufCodec` and `AvroCodec` need a gem — `google-protobuf` and `avro`. Both
 are required lazily and say which to install, so the gem still declares no
 runtime dependencies. `XMLCodec` needs REXML, which ships with Ruby but has been
@@ -191,7 +207,10 @@ will not parse is retrying a decision, not a transient fault.
 
 **`decode` may take one argument or two.** A codec that chooses by content type
 declares `decode(body, content_type)`; a plain one declares `decode(body)`. The
-consumer asks the codec's arity rather than assuming, so either shape works.
+consumer asks the codec's arity rather than assuming, so either shape works, and
+`CompositeCodec` passes the content type down to whichever candidate takes one —
+which is how the Avro codec inside a composite still learns which framing it is
+being handed.
 
 The connection checks a codec when it is built, not when the first message
 arrives:
