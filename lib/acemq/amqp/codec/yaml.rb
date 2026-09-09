@@ -75,6 +75,22 @@ module AceMQ
       # stack uses whichever spelling its library picked.
       ALSO_READS = ["application/x-yaml", "text/yaml", "text/x-yaml"].freeze
 
+      # What +safe_load+ raises for an alias it was told not to follow, which is
+      # not the same class on every Ruby this gem supports: Psych 5 introduced
+      # +AliasesNotEnabled+, and Psych 4 -- what Ruby 3.1 ships, and 3.1 is the
+      # floor -- raises +BadAlias+.
+      #
+      # Resolved once here rather than named in the +rescue+, because a +rescue+
+      # naming a constant that does not exist raises NameError while it is being
+      # matched. That does not merely miss the alias case: it escapes every
+      # later clause too, so a body that was not YAML at all came out as a
+      # NameError instead of a DecodeError.
+      ALIAS_REFUSED = if ::Psych.const_defined?(:AliasesNotEnabled)
+                        ::Psych::AliasesNotEnabled
+                      else
+                        ::Psych::BadAlias
+                      end
+
       # What +safe_load+ is allowed to build without being asked.
       #
       # Java and Go write timestamps into YAML, and a codec that rejected them
@@ -122,7 +138,7 @@ module AceMQ
         raise DecodeError,
               "this message asks for a class the YAML codec will not build: #{e.message}. " \
               "Pass permitted_classes: if the sender is trusted and really needs it."
-      rescue ::Psych::AliasesNotEnabled
+      rescue ALIAS_REFUSED
         raise DecodeError,
               "this message uses YAML anchors and aliases, which are refused because " \
               "they are how a small body expands into one large enough to take a " \

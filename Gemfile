@@ -36,6 +36,13 @@ group :development, :test do
   # google-protobuf: 1.20 raised its floor to Ruby 3.2, and this gem still
   # promises 3.1. Only on 3.1, because 1.17 does not work with Ruby 4's json.
   gem "multi_json", "~> 1.17.0" if RUBY_VERSION < "3.2"
+  # And json below 3, on 3.1 only, because multi_json 1.17's json adapter calls
+  # JSON.parse with two arguments and json 3 takes one. Bundler is free to
+  # resolve json 3 on Ruby 3.1, where json is a default gem rather than a
+  # pinned one, so `require "avro"` raised ArgumentError before anything of
+  # ours ran -- on CI only, since a newer Ruby resolves multi_json 1.20 and
+  # never reaches that adapter. This line goes when 3.1 does.
+  gem "json", "~> 2.6" if RUBY_VERSION < "3.2"
   # The OpenTelemetry adapter requires this lazily and names it when it is
   # missing, the way the transport does with bunny and the codecs do with avro.
   # Not in the gemspec: a service that publishes messages and traces nothing
