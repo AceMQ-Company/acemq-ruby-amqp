@@ -19,58 +19,110 @@ written for one reads the same against another:
 
 | | |
 |---|---|
-| `acemq.messages.published` | by `exchange` |
-| `acemq.messages.publish.failed` | by `exchange`, including a publish an interceptor refused |
-| `acemq.messages.consumed` | by `queue`, counted on the way **in** |
-| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` / `.parked` | by `queue` — what the consumer decided, one of the five per delivery |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed` or `failed` |
+| `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
+| `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
+| `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way **in** |
+| `acemq.consume.in.flight` | a gauge, per queue |
+| `acemq.messages.retried.total` | by `queue`; the `outcome=retried` deliveries, under a name of their own |
+| `acemq.messages.dead.lettered.total` | by `queue`; likewise for `outcome=dead_lettered` |
 | `acemq.messages.set.aside.failed` | by `queue` and `target`; see [below](#the-two-worth-an-alert) |
-| `acemq.handler.duration` | seconds; handler and interceptors together |
-| `acemq.messages.in.flight` | a gauge, per queue |
-| `acemq.retry.rung.missing` | see [below](#the-two-worth-an-alert) |
+| `acemq.retry.rung.missing` | by `queue`; see [below](#the-two-worth-an-alert) |
+| `acemq.pipeline.run.total` / `.duration` | by `pipeline`, `step` and `outcome`; see [patterns](patterns.md#pipelines) |
 
-`consumed` is counted on the way in rather than on the way out, so a handler that
-never returns is still a message this consumer was given — which is the number
-you want when the question is why a queue is not draining.
+This is Java's `MetricNames` vocabulary, which is the family's. Read the
+[migration note](#the-metric-names-moved-onto-javas) if you have a dashboard
+written against the old Ruby names — every one of them changed.
 
-`parked` counts the messages nothing could read: a body no codec could decode, or
-one a handler answered with `Ack.park`. Both go to `{queue}.parked` and both
-carry `messaging.acemq.outcome = "parked"` on their span.
+`acemq.publish.total` counts a publish an interceptor refused as `failed` too. It
+did not reach the broker, which is what the metric is about; whether it was the
+broker or a policy that said no is the exception's business.
 
-`handler.duration` is the handler **and** the interceptors together. That is the
-number worth having: it is how long a message occupied one of this consumer's
-prefetch slots, and an interceptor that is slow costs exactly as much as a
-handler that is.
+`acemq.consume.attempts` is two numbers in one. Its **sample count** is how many
+deliveries this consumer was given, taken on the way in — so a handler that never
+returns is still counted, which is the number you want when the question is why a
+queue is not draining. Its **distribution** is how many goes those deliveries are
+taking, so a rising mean is a dependency starting to struggle before any of it has
+reached the dead-letter queue.
 
-### The outcome counters are what the consumer decided
+`acemq.consume.duration` is the handler **and** the interceptors together. That is
+the number worth having: it is how long a message occupied one of this consumer's
+prefetch slots, and an interceptor that is slow costs exactly as much as a handler
+that is. It carries the `outcome` tag as well, because a p99 that mixes the work
+which succeeded with the work which failed is a number about neither.
 
-`accepted`, `retried`, `rejected`, `dead.lettered` and `parked` are the
-[`Settlement`](interceptors.md#the-settlement) outcomes, one counter each, and
-**exactly one of them goes up per delivery**. They are read off the same
-decision the span's `messaging.acemq.outcome` attribute is read off, so a
-delivery counted as `dead.lettered` has a span saying `dead_lettered`, one
-counted as `parked` has a span saying `parked`, and the two cannot drift.
+### The outcome tag is what the consumer decided
+
+`acked`, `retried`, `rejected`, `dead_lettered` and `parked` are the
+[`Settlement`](interceptors.md#the-settlement) outcomes, and **exactly one
+`acemq.consume.total` series goes up per delivery**. The tag is read off the same
+decision the span's `messaging.acemq.outcome` attribute is read off, so a delivery
+counted `dead_lettered` has a span saying `dead_lettered`, one counted `parked`
+has a span saying `parked`, and the two cannot drift.
 
 That is worth saying because it used to be otherwise: the counters classified by
 the `Ack` the handler returned, and an `Ack` cannot know whether there is an
 attempt left to spend. A handler asking for a retry on its last attempt
 incremented `retried` on its way to the dead-letter queue and was counted again
-as `dead.lettered`, so `consumed` never equalled the sum of them and the
+as `dead.lettered`, so the deliveries in never equalled the sum of them and the
 retry rate included messages that were never retried.
 
-**What a dashboard will show after upgrading**: `acemq.messages.retried` falls
-and `acemq.messages.dead.lettered` rises, by the same amount — the give-ups that
-were being counted in both. `acemq.messages.dead.lettered` also stops counting
-handler rejections, which are now only `rejected`; if you were alerting on
-dead letters and meant "something is broken", that alert gets quieter and more
-accurate, because a message a handler refused on purpose is the system working.
-The service behaves identically — nothing about where a message goes has
-changed, only which counter names it — so a step in these two series at deploy
-time is the upgrade and not an incident. A panel that added `retried` and
-`dead.lettered` together to get "failures" was double-counting and should be
-rebuilt on `dead.lettered` alone.
+`parked` is the messages nothing could read: a body no codec could decode, or one
+a handler answered with `Ack.park`. Both go to `{queue}.parked`, and both are kept
+apart from `dead_lettered` on purpose — a message that failed five times and a
+message nothing can read are two different problems with two different fixes.
 
-The .NET, Go and Python libraries make the same correction, so a shared
-dashboard moves once rather than four times.
+`acemq.messages.retried.total` and `acemq.messages.dead.lettered.total` count the
+same deliveries as those two tag values, under a name of their own. They are
+redundant and deliberately kept: a retry rate and a dead-letter rate are the two
+numbers most often wanted without a tag filter, and all five libraries keep the
+pair, so an alert written once reads the same against every one of them.
+
+### The metric names moved onto Java's
+
+**Every Ruby metric name changed.** Java's `MetricNames` is the family
+vocabulary and Go, Python and Ruby have moved onto it, so that a polyglot estate
+can be watched on one dashboard instead of one per language. This is a rename
+only: nothing about what is measured, when, or where a message goes has changed.
+
+| was | is now |
+|---|---|
+| `acemq.messages.published{exchange}` | `acemq.publish.total{exchange,outcome="confirmed"}` |
+| `acemq.messages.publish.failed{exchange}` | `acemq.publish.total{exchange,outcome="failed"}` |
+| `acemq.messages.consumed{queue}` | `acemq.consume.attempts{queue}` — its **sample count** |
+| `acemq.messages.accepted{queue}` | `acemq.consume.total{queue,outcome="acked"}` |
+| `acemq.messages.retried{queue}` | `acemq.consume.total{queue,outcome="retried"}`, and `acemq.messages.retried.total{queue}` |
+| `acemq.messages.rejected{queue}` | `acemq.consume.total{queue,outcome="rejected"}` |
+| `acemq.messages.dead.lettered{queue}` | `acemq.consume.total{queue,outcome="dead_lettered"}`, and `acemq.messages.dead.lettered.total{queue}` |
+| `acemq.messages.parked{queue}` | `acemq.consume.total{queue,outcome="parked"}` |
+| `acemq.handler.duration{queue}` | `acemq.consume.duration{queue,outcome}` |
+| `acemq.messages.in.flight{queue}` | `acemq.consume.in.flight{queue}` |
+| `acemq.messages.set.aside.failed{queue,target}` | unchanged — Java adopted Ruby's name |
+| `acemq.retry.rung.missing{queue}` | unchanged — Java adopted Ruby's name |
+
+The constants moved with them: `Telemetry::PUBLISHED` and
+`Telemetry::PUBLISH_FAILED` are now `Telemetry::PUBLISH_TOTAL` with
+`Telemetry::Outcome::CONFIRMED` or `::FAILED`; `ACCEPTED`, `RETRIED`, `REJECTED`,
+`DEAD_LETTERED` and `PARKED` are `Telemetry::CONSUME_TOTAL` with the matching
+`Telemetry::Outcome` value; `HANDLER_DURATION` is `CONSUME_DURATION`, `IN_FLIGHT`
+is `CONSUME_IN_FLIGHT`, and `CONSUMED` is the sample count of `CONSUME_ATTEMPTS`.
+
+**Every existing Ruby dashboard and alert rule has to be rewritten.** There is no
+compatibility shim and no double-emission: a series under an old name simply
+stops. That is deliberate — a library quietly writing both would double every
+counter for anybody who had already moved, and the estate this is for is watched
+on Java's names.
+
+### The tag names, and Prometheus
+
+`exchange`, `queue`, `outcome`, `target`, `pipeline` and `step` are what this
+library attaches. The wider family vocabulary also has `routing.key`,
+`message.type` and `transport`, and **the first two are not legal Prometheus
+label names** — a dot is not allowed in one, and a single bad line does not lose
+one series, it makes the whole scrape unparseable and loses every metric the
+process publishes. [`to_prometheus`](#to_prometheus) renders them `routing_key`
+and `message_type`, which is what Go settled on. An observer of your own that
+talks to Prometheus has to do the same.
 
 ## No dependency on a metrics gem
 
@@ -78,9 +130,13 @@ An observer is anything answering three methods:
 
 ```ruby
 def count(metric, delta = 1, **labels)
-def observe(metric, seconds, **labels)
+def observe(metric, value, **labels)
 def gauge(metric, value, **labels)
 ```
+
+`observe` is a distribution rather than a timer: durations go through it in
+seconds, and `acemq.consume.attempts` puts an attempt number through the same
+method, because the summary worth having is the same one either way.
 
 Depending on a metrics gem would put every service using this library on the
 same one, and that choice belongs to the application. So an adapter is about
@@ -89,7 +145,7 @@ fifteen lines:
 ```ruby
 class StatsDObserver
   def count(metric, delta = 1, **labels)  = StatsD.count(metric, delta, tags: tags(labels))
-  def observe(metric, seconds, **labels)  = StatsD.timing(metric, seconds, tags: tags(labels))
+  def observe(metric, value, **labels)    = StatsD.histogram(metric, value, tags: tags(labels))
   def gauge(metric, value, **labels)      = StatsD.gauge(metric, value, tags: tags(labels))
 
   private
@@ -117,10 +173,10 @@ numbers themselves are what is wanted:
 metrics = Telemetry::Registry.new
 mq = Connection.open(url, telemetry: metrics)
 
-metrics[Telemetry::PUBLISHED, exchange: "orders-events"]   # => 3
-metrics.counts                                             # => { "acemq.messages.published{exchange=orders-events}" => 3, … }
+metrics[Telemetry::PUBLISH_TOTAL, exchange: "orders-events", outcome: "confirmed"]  # => 3
+metrics.counts                    # => { "acemq.publish.total{exchange=orders-events,outcome=confirmed}" => 3, … }
 metrics.gauges
-metrics.timings["acemq.handler.duration{queue=orders.new}"].to_s
+metrics.timings["acemq.consume.duration{outcome=acked,queue=orders.new}"].to_s
 # => "12 in 0.481s (mean 0.0401s)"
 ```
 
@@ -135,7 +191,8 @@ becomes several and the total is wrong in a way nobody notices.
 It is also what makes the counters testable without a broker:
 
 ```ruby
-expect(metrics[Telemetry::DEAD_LETTERED, queue: "orders.new"]).to eq(1)
+expect(metrics[Telemetry::CONSUME_TOTAL, queue: "orders.new",
+                                         outcome: Telemetry::Outcome::DEAD_LETTERED]).to eq(1)
 ```
 
 ### to_prometheus
@@ -145,18 +202,22 @@ puts metrics.to_prometheus
 ```
 
 ```
-# TYPE acemq_messages_published counter
-acemq_messages_published{exchange="orders-events"} 3
-# TYPE acemq_handler_duration summary
-acemq_handler_duration_count{queue="orders.new"} 12
-acemq_handler_duration_sum{queue="orders.new"} 0.481
-# TYPE acemq_handler_duration_min gauge
-acemq_handler_duration_min{queue="orders.new"} 0.011
-# TYPE acemq_handler_duration_max gauge
-acemq_handler_duration_max{queue="orders.new"} 0.209
+# TYPE acemq_publish_total counter
+acemq_publish_total{exchange="orders-events",outcome="confirmed"} 3
+# TYPE acemq_consume_duration summary
+acemq_consume_duration_count{outcome="acked",queue="orders.new"} 12
+acemq_consume_duration_sum{outcome="acked",queue="orders.new"} 0.481
+# TYPE acemq_consume_duration_min gauge
+acemq_consume_duration_min{outcome="acked",queue="orders.new"} 0.011
+# TYPE acemq_consume_duration_max gauge
+acemq_consume_duration_max{outcome="acked",queue="orders.new"} 0.209
 ```
 
-Dots and dashes become underscores, which is what Prometheus requires.
+Dots and dashes become underscores, which is what Prometheus requires — in
+**label names** as well as in metric names, so a `routing.key` tag is scraped as
+`routing_key`. Prometheus allows `[a-zA-Z_][a-zA-Z0-9_]*` in a label name and
+nothing else, and one line it cannot parse costs the whole scrape rather than
+one series.
 
 **It is a string and not a Rack app on purpose.** This library has no web
 framework and should not choose one; every Ruby service already has something
@@ -303,7 +364,8 @@ it.
 
 **The counters read it from there too.** The word on the span and the counter
 that went up are the same decision said twice, so
-`acemq.messages.dead.lettered` and `outcome=dead_lettered` always name the same
+`acemq.consume.total{outcome="dead_lettered"}` and the span's
+`messaging.acemq.outcome = "dead_lettered"` always name the same
 deliveries. See [the four outcome
 counters](#the-outcome-counters-are-what-the-consumer-decided).
 

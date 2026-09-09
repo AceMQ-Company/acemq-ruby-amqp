@@ -118,7 +118,7 @@ message and raises `PublishError` if it does not. A publish that returns has
 been accepted by the broker — not necessarily routed to a queue, which is a
 separate thing an unbound exchange will do silently.
 
-Whatever the failure, `acemq.messages.publish.failed` is counted before the
+Whatever the failure, `acemq.publish.total{outcome="failed"}` is counted before the
 interceptors are told, so a publish an interceptor refused is counted too. It
 did not reach the broker, which is what the metric is about. See
 [metrics and health](observability.md).

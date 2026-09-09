@@ -53,7 +53,8 @@ where the handler already knows the message is unreadable — a version this
 service was never taught, a field that is not a date where a date has to be. The
 dead-letter queue holds messages that were tried and failed; the parking queue
 holds messages that were never going to work, and mixing the two means somebody
-sorts them out by hand after an outage. It is counted as `acemq.messages.parked`
+sorts them out by hand after an outage. It is counted as
+`acemq.consume.total{outcome="parked"}`
 and its span carries `messaging.acemq.outcome = "parked"`.
 
 A handler that raises is treated as `Ack.retry`. Raising `FatalError` is treated
@@ -115,7 +116,8 @@ mq.consume("thumbnails", codec: BytesCodec.new) { |message| ... }
 **A body no codec can read goes to `{queue}.parked`**, not to `{queue}.dlq`. A
 message that failed five times and a message nothing could read are different
 problems, and mixing them means somebody sorts them by hand later. It is counted
-as `acemq.messages.parked`, the same counter a handler's own `Ack.park` raises.
+as `acemq.consume.total{outcome="parked"}`, the same series a handler's own
+`Ack.park` raises.
 See [codecs](serialization.md) for how a composite
 codec reads several content types, and [reliability](reliability.md) for what
 else lands where.

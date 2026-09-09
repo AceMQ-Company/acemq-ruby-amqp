@@ -478,24 +478,31 @@ alert written for one service reads the same against the next:
 
 | | |
 |---|---|
-| `acemq.messages.published` | by `exchange` |
-| `acemq.messages.publish.failed` | including a publish an interceptor refused |
-| `acemq.messages.consumed` | by `queue`, counted on the way in |
-| `acemq.messages.accepted` / `.retried` / `.rejected` / `.dead.lettered` / `.parked` | what the consumer decided, one of the five per delivery |
-| `acemq.messages.parked` | nothing could read it: no codec could decode the body, or the handler said `Ack.park` |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, or `failed` for anything that did not reach the broker, an interceptor's refusal included |
+| `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
+| `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
+| `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way in |
+| `acemq.consume.in.flight` | a gauge, per queue |
+| `acemq.messages.retried.total` / `.dead.lettered.total` | by `queue`; the two outcomes most often wanted without a tag filter, under names of their own |
 | `acemq.messages.set.aside.failed` | by `queue` and `target`; could not be moved to its dead-letter or parking queue at all |
-| `acemq.handler.duration` | seconds, handler and interceptors together |
-| `acemq.messages.in.flight` | a gauge, per queue |
-| `acemq.retry.rung.missing` | see below |
+| `acemq.retry.rung.missing` | by `queue`; see below |
+| `acemq.pipeline.run.total` / `.duration` | by `pipeline`, `step` and `outcome` |
 
-The outcome counters are the
-[`Settlement`](docs/interceptors.md#the-settlement) outcomes and **exactly one
-goes up per delivery** — read off the same decision the span's
+The `outcome` values are the
+[`Settlement`](docs/interceptors.md#the-settlement) words — `acked`, `retried`,
+`rejected`, `dead_lettered`, `parked` — and **exactly one `acemq.consume.total`
+series goes up per delivery**, read off the same decision the span's
 `messaging.acemq.outcome` attribute is, so the two cannot disagree. A handler
-asking for a retry on its last attempt is counted `dead.lettered` and not also
-`retried`. See
-[observability](docs/observability.md#the-outcome-counters-are-what-the-consumer-decided)
-for what that changes on an existing dashboard.
+asking for a retry on its last attempt is tagged `dead_lettered` and not also
+`retried`. `parked` is a message nothing could read: no codec could decode the
+body, or the handler said `Ack.park`.
+
+**These names changed in this release.** They are Java's `MetricNames`
+vocabulary now, which Go, Python and .NET share, so a polyglot estate is watched
+on one dashboard rather than one per language — but every dashboard written
+against the old Ruby names has to be rewritten. See
+[observability](docs/observability.md#the-metric-names-moved-onto-javas) for the
+full old-to-new table.
 
 **No dependency on a metrics gem.** An observer is anything answering `count`,
 `observe` and `gauge`; depending on one would put every service using this

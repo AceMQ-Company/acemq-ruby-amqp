@@ -208,7 +208,8 @@ module AceMQ
         # Counted before the interceptors are told, so a publish refused by an
         # interceptor is counted too. It did not reach the broker, which is the
         # thing this metric is about.
-        @telemetry.count(Telemetry::PUBLISH_FAILED, 1, exchange: exchange)
+        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
+                         exchange: exchange, outcome: Telemetry::Outcome::FAILED)
         @interceptors.on_publish_error(context, e) if context
         raise
       end
@@ -355,7 +356,8 @@ module AceMQ
                            content_type: codec.content_type, message_id: context.envelope.id,
                            headers: context.envelope.to_headers(context.routing_key),
                            persistent: persistent, reply_to: context.reply_to)
-        @telemetry.count(Telemetry::PUBLISHED, 1, exchange: context.exchange)
+        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
+                         exchange: context.exchange, outcome: Telemetry::Outcome::CONFIRMED)
         @interceptors.after_confirm(context)
         context.envelope
       end
@@ -372,19 +374,17 @@ module AceMQ
     # waited by the broker, in a rung queue; see {RetryLadder} for why the two
     # are not the same choice.
     class Consumer
-      # One counter per outcome, keyed by the word the {Settlement} carries — so
-      # the counter that goes up and the +messaging.acemq.outcome+ attribute on
-      # the span for the same delivery are read off the same decision and cannot
-      # disagree. Parking a message a handler asked to park is counted here like
-      # the rest; the decode path, which never reaches a handler and so never
-      # reaches {#observe}, counts its own.
-      COUNTER_FOR = {
-        Settlement::ACKED => Telemetry::ACCEPTED,
-        Settlement::RETRIED => Telemetry::RETRIED,
-        Settlement::REJECTED => Telemetry::REJECTED,
-        Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED,
-        Settlement::PARKED => Telemetry::PARKED
-      }.freeze
+      # The counters a delivery raises besides +acemq.consume.total+, keyed by
+      # the word the {Settlement} carries.
+      #
+      # A retry and a give-up are counted twice on purpose: once in
+      # +acemq.consume.total+ tagged with the outcome, which is the series
+      # saying exactly one thing happened to this message, and once under a name
+      # of their own, because a retry rate and a dead-letter rate are the two
+      # most often wanted without a tag filter. All five languages keep the same
+      # pair. Nothing else has a second name; the tag is how they are read.
+      ALSO_COUNTED = { Settlement::RETRIED => Telemetry::RETRIED_TOTAL,
+                       Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED_TOTAL }.freeze
 
       attr_reader :queue, :retry_policy, :codec, :ladder
 
@@ -442,6 +442,11 @@ module AceMQ
       def handle(delivery)
         enter
         envelope = envelope_for(delivery)
+        # Which go this delivery is, recorded after the envelope and before the
+        # codec: a body that will not decode is still a delivery that arrived,
+        # and that ordering is what makes this distribution's sample count
+        # trustworthy as "deliveries in".
+        @telemetry.observe(Telemetry::CONSUME_ATTEMPTS, envelope.attempt, queue: @queue)
         context = context_for(delivery, envelope, decode(delivery))
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         ack = invoke(context, delivery)
@@ -473,7 +478,8 @@ module AceMQ
         # reached a handler and so never reached {#observe}: a handler that asks
         # for {Ack.park} is counted there with every other outcome, and counting
         # in both places would count it twice.
-        @telemetry.count(Telemetry::PARKED, 1, queue: @queue)
+        @telemetry.count(Telemetry::CONSUME_TOTAL, 1,
+                         queue: @queue, outcome: Telemetry::Outcome::PARKED)
         park(delivery, envelope, "could not be decoded: #{e.message}")
       ensure
         leave
@@ -530,11 +536,19 @@ module AceMQ
       # whole point: an ack cannot know whether there is an attempt left to
       # spend, so a handler asking for a retry on its last attempt used to
       # increment +retried+ on its way to the dead-letter queue and be counted
-      # again as +dead.lettered+. Exactly one counter goes up per delivery now,
-      # and it is the one naming what the consumer really did.
+      # again as +dead.lettered+. Exactly one +acemq.consume.total+ series goes
+      # up per delivery now, and its +outcome+ tag is the word naming what the
+      # consumer really did.
+      #
+      # The duration carries the outcome too: a p99 mixing the work that
+      # succeeded with the work that failed is a number about neither.
       def observe(settlement, seconds)
-        @telemetry.observe(Telemetry::HANDLER_DURATION, seconds, queue: @queue)
-        @telemetry.count(COUNTER_FOR.fetch(settlement.outcome), 1, queue: @queue)
+        outcome = settlement.outcome
+        @telemetry.observe(Telemetry::CONSUME_DURATION, seconds,
+                           queue: @queue, outcome: outcome)
+        @telemetry.count(Telemetry::CONSUME_TOTAL, 1, queue: @queue, outcome: outcome)
+        also = ALSO_COUNTED[outcome]
+        @telemetry.count(also, 1, queue: @queue) if also
       end
 
       # What an interceptor sees, and what the handler is built from.
@@ -778,18 +792,18 @@ module AceMQ
         "#{error.class}: #{message}"
       end
 
-      # Counted on the way in rather than on the way out, so a handler that
-      # never returns is still a message this consumer was given — which is the
+      # Raised on the way in rather than on the way out, so a handler that never
+      # returns still shows as a message this consumer was given — which is the
       # difference between a queue nothing is reading and a queue one thing is
-      # stuck on.
+      # stuck on. +acemq.consume.attempts+ is the other half of that: its sample
+      # count is how many deliveries arrived, whether or not any came back.
       def enter
-        @telemetry.count(Telemetry::CONSUMED, 1, queue: @queue)
-        @telemetry.gauge(Telemetry::IN_FLIGHT, @lock.synchronize { @in_flight += 1 },
+        @telemetry.gauge(Telemetry::CONSUME_IN_FLIGHT, @lock.synchronize { @in_flight += 1 },
                          queue: @queue)
       end
 
       def leave
-        @telemetry.gauge(Telemetry::IN_FLIGHT, @lock.synchronize { @in_flight -= 1 },
+        @telemetry.gauge(Telemetry::CONSUME_IN_FLIGHT, @lock.synchronize { @in_flight -= 1 },
                          queue: @queue)
       end
 

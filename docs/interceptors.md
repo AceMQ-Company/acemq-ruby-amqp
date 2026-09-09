@@ -135,7 +135,7 @@ On purpose.
 **From `before_publish` it stops the publish**, and the caller sees the
 exception. That is the point of intercepting rather than observing — a message
 that must not go out is stopped once, here, rather than in every publisher. The
-publish is counted as `acemq.messages.publish.failed`, because it did not reach
+publish is counted as `acemq.publish.total{outcome="failed"}`, because it did not reach
 the broker, which is what that metric is about.
 
 **From `before_handle` the handler never runs** and the delivery is treated

@@ -162,8 +162,9 @@ metrics = Telemetry::Registry.new
 mq = Connection.new(transport: transport, telemetry: metrics,
                     retry_policy: RetryPolicy.fixed(3, 1))
 # …
-expect(metrics[Telemetry::DEAD_LETTERED, queue: "orders.new"]).to eq(1)
-expect(metrics[Telemetry::RETRIED, queue: "orders.new"]).to eq(2)
+queue = { queue: "orders.new" }
+expect(metrics[Telemetry::CONSUME_TOTAL, **queue, outcome: "dead_lettered"]).to eq(1)
+expect(metrics[Telemetry::CONSUME_TOTAL, **queue, outcome: "retried"]).to eq(2)
 ```
 
 See [metrics and health](observability.md).

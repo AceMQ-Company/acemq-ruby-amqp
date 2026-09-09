@@ -351,15 +351,18 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     let(:retrying) { AceMQ::AMQP::RetryPolicy.fixed(5, 0.05) }
     let(:giving_up) { AceMQ::AMQP::RetryPolicy.none }
 
-    # Every counter a delivery could land on, so "exactly one went up" is a
-    # thing an example can assert rather than a thing it has to trust.
-    OUTCOME_COUNTERS = ["acemq.messages.accepted", "acemq.messages.retried",
-                        "acemq.messages.rejected", "acemq.messages.dead.lettered",
-                        "acemq.messages.parked"].freeze
+    # Every series a delivery could land on, so "exactly one went up" is a thing
+    # an example can assert rather than a thing it has to trust. One counter
+    # tagged five ways now rather than five counters, which is the shape Java,
+    # Go, .NET and Python all count in — the property is the same either way and
+    # is the whole reason the mapping exists.
+    OUTCOMES = %w[acked retried rejected dead_lettered parked].freeze
 
     def counted
-      OUTCOME_COUNTERS.to_h { |name| [name, metrics[name, queue: "orders.new"]] }
-                      .reject { |_name, value| value.zero? }
+      raised = OUTCOMES.to_h do |outcome|
+        [outcome, metrics["acemq.consume.total", queue: "orders.new", outcome: outcome]]
+      end
+      raised.reject { |_outcome, value| value.zero? }
     end
 
     def deliver(retry_policy, &handler)
@@ -382,21 +385,21 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.accept }
 
       expect(outcome).to eq("acked")
-      expect(counted).to eq("acemq.messages.accepted" => 1)
+      expect(counted).to eq("acked" => 1)
     end
 
     it "agrees on retried" do
       outcome = deliver(retrying) { |_m| AceMQ::AMQP::Ack.retry("no stock") }
 
       expect(outcome).to eq("retried")
-      expect(counted).to eq("acemq.messages.retried" => 1)
+      expect(counted).to eq("retried" => 1)
     end
 
     it "agrees on rejected, and does not also count it as a dead letter" do
       outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.reject("not ours") }
 
       expect(outcome).to eq("rejected")
-      expect(counted).to eq("acemq.messages.rejected" => 1)
+      expect(counted).to eq("rejected" => 1)
     end
 
     # The one this change is for. The handler asked for a retry and had no
@@ -407,7 +410,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       outcome = deliver(giving_up) { |_m| AceMQ::AMQP::Ack.retry("the warehouse said no") }
 
       expect(outcome).to eq("dead_lettered")
-      expect(counted).to eq("acemq.messages.dead.lettered" => 1)
+      expect(counted).to eq("dead_lettered" => 1)
     end
 
     # Parking has its own counter and its own word, and a handler that asks for
@@ -417,7 +420,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       outcome = deliver(retrying) { |_m| AceMQ::AMQP::Ack.park("nothing here reads version 9") }
 
       expect(outcome).to eq("parked")
-      expect(counted).to eq("acemq.messages.parked" => 1)
+      expect(counted).to eq("parked" => 1)
     end
   end
 

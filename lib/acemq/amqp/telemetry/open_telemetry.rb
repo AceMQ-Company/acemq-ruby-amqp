@@ -116,7 +116,7 @@ module AceMQ
         # handler that parks a message meant to, and a decision somebody made is
         # not a failure. Go and Python leave it out too, so a parked span reads
         # the same in all three. The parking queue still has to be looked at --
-        # that is what the +acemq.messages.parked+ counter is for.
+        # that is what +acemq.consume.total+ tagged +outcome=parked+ is for.
         FAILING_OUTCOMES = %w[unroutable failed dead_lettered].freeze
 
         # Runs before every other interceptor on the way in and after every

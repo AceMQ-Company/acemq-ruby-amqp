@@ -47,8 +47,9 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       mq.publish({ "order_id" => "A-1" }, to: "orders.new")
       mq.publish({ "order_id" => "A-2" }, to: "order.placed", exchange: "orders-events")
 
-      expect(metrics[Telemetry::PUBLISHED, exchange: ""]).to eq(1)
-      expect(metrics[Telemetry::PUBLISHED, exchange: "orders-events"]).to eq(1)
+      confirmed = { outcome: Telemetry::Outcome::CONFIRMED }
+      expect(metrics[Telemetry::PUBLISH_TOTAL, exchange: "", **confirmed]).to eq(1)
+      expect(metrics[Telemetry::PUBLISH_TOTAL, exchange: "orders-events", **confirmed]).to eq(1)
     end
 
     it "counts a publish the broker would not take, and one an interceptor refused" do
@@ -63,8 +64,10 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       expect { mq.publish({ "order_id" => "A-2" }, to: "orders.new") }
         .to raise_error(RuntimeError)
 
-      expect(metrics[Telemetry::PUBLISH_FAILED, exchange: ""]).to eq(2)
-      expect(metrics[Telemetry::PUBLISHED, exchange: ""]).to eq(0)
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::FAILED]).to eq(2)
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::CONFIRMED]).to eq(0)
     end
   end
 
@@ -77,32 +80,71 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       consumer { AceMQ::AMQP::Ack.reject("no such customer") }.handle(delivery_for.first)
 
       queue = { queue: "orders.new" }
-      expect(metrics[Telemetry::CONSUMED, **queue]).to eq(3)
-      expect(metrics[Telemetry::ACCEPTED, **queue]).to eq(1)
-      expect(metrics[Telemetry::RETRIED, **queue]).to eq(1)
-      expect(metrics[Telemetry::REJECTED, **queue]).to eq(1)
+      attempts = metrics.timings[Telemetry::Registry.key(Telemetry::CONSUME_ATTEMPTS, queue)]
+      expect(attempts.count).to eq(3)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::ACKED]).to eq(1)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::RETRIED]).to eq(1)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::REJECTED]).to eq(1)
     end
 
-    it "times the handler, and counts the message before it runs" do
-      # Counted on the way in, so a handler that never returns is still a
-      # message this consumer was given — which is the difference between a
-      # queue nothing is reading and a queue one thing is stuck on.
+    it "counts a retry and a give-up under a name of their own as well" do
+      # The same deliveries as the tagged counter, under the name a retry rate
+      # and a dead-letter rate are most often wanted by. Java, Go, .NET and
+      # Python keep the same pair, so an alert written once reads the same
+      # against all five.
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) do
+        AceMQ::AMQP::Ack.retry("not yet")
+      end.handle(delivery_for.first)
+      consumer { AceMQ::AMQP::Ack.retry("the warehouse is down") }.handle(delivery_for.first)
+
+      queue = { queue: "orders.new" }
+      expect(metrics[Telemetry::RETRIED_TOTAL, **queue]).to eq(1)
+      expect(metrics[Telemetry::DEAD_LETTERED_TOTAL, **queue]).to eq(1)
+      # And they say the same as the tag they duplicate, always.
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::RETRIED]).to eq(1)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::DEAD_LETTERED]).to eq(1)
+    end
+
+    it "times the handler under the outcome it ended in" do
+      # A p99 that mixes the work which succeeded with the work which failed is
+      # a number about neither.
       consumer do
         sleep(0.01)
         AceMQ::AMQP::Ack.accept
       end.handle(delivery_for.first)
 
-      timing = metrics.timings[Telemetry::Registry.key(Telemetry::HANDLER_DURATION,
-                                                       queue: "orders.new")]
+      timing = metrics.timings[Telemetry::Registry.key(
+        Telemetry::CONSUME_DURATION, queue: "orders.new", outcome: Telemetry::Outcome::ACKED
+      )]
       expect(timing.count).to eq(1)
       expect(timing.sum).to be >= 0.01
       expect(timing.mean).to eq(timing.sum)
     end
 
+    it "records which attempt each delivery was, counted on the way in" do
+      # Two numbers in one. The sample count is how many deliveries arrived —
+      # the difference between a queue nothing is reading and a queue one thing
+      # is stuck on — and the distribution is how many goes they are taking.
+      consumer { AceMQ::AMQP::Ack.accept }.handle(delivery_for(attempt: 1).first)
+      consumer { AceMQ::AMQP::Ack.accept }.handle(delivery_for(attempt: 4).first)
+      # A body nothing can decode never reaches a handler and is still a
+      # delivery this consumer was given.
+      consumer { AceMQ::AMQP::Ack.accept }.handle(delivery_for(body: "{ not json").first)
+
+      attempts = metrics.timings[Telemetry::Registry.key(Telemetry::CONSUME_ATTEMPTS,
+                                                         queue: "orders.new")]
+      expect([attempts.count, attempts.min, attempts.max]).to eq([3, 1, 4])
+    end
+
     it "leaves the in-flight gauge back where it started" do
       consumer { AceMQ::AMQP::Ack.accept }.handle(delivery_for.first)
 
-      key = Telemetry::Registry.key(Telemetry::IN_FLIGHT, queue: "orders.new")
+      key = Telemetry::Registry.key(Telemetry::CONSUME_IN_FLIGHT, queue: "orders.new")
       expect(metrics.gauges[key]).to eq(0)
     end
 
@@ -111,8 +153,51 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       consumer { AceMQ::AMQP::Ack.accept }.handle(delivery_for(body: "{ not json").first)
 
       queue = { queue: "orders.new" }
-      expect(metrics[Telemetry::DEAD_LETTERED, **queue]).to eq(1)
-      expect(metrics[Telemetry::PARKED, **queue]).to eq(1)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::DEAD_LETTERED]).to eq(1)
+      expect(metrics[Telemetry::CONSUME_TOTAL, **queue,
+                     outcome: Telemetry::Outcome::PARKED]).to eq(1)
+    end
+  end
+
+  describe "the outcome vocabulary" do
+    it "is the same words the settlement carries" do
+      # The counter that goes up and the +messaging.acemq.outcome+ attribute on
+      # the span for the same delivery are read off the one decision, so the two
+      # lists cannot be allowed to drift apart.
+      settlement = AceMQ::AMQP::Settlement
+      expect([settlement::ACKED, settlement::RETRIED, settlement::REJECTED,
+              settlement::DEAD_LETTERED, settlement::PARKED])
+        .to eq([Telemetry::Outcome::ACKED, Telemetry::Outcome::RETRIED,
+                Telemetry::Outcome::REJECTED, Telemetry::Outcome::DEAD_LETTERED,
+                Telemetry::Outcome::PARKED])
+    end
+
+    it "counts exactly one consume.total series per delivery" do
+      # The property the tag replaced five counters to keep: a handler asking
+      # for a retry on its last attempt used to increment +retried+ on its way
+      # to the dead-letter queue and be counted again as +dead.lettered+.
+      deliveries = {
+        Telemetry::Outcome::ACKED => -> { AceMQ::AMQP::Ack.accept },
+        Telemetry::Outcome::REJECTED => -> { AceMQ::AMQP::Ack.reject("no such customer") },
+        Telemetry::Outcome::DEAD_LETTERED => -> { AceMQ::AMQP::Ack.retry("out of goes") },
+        Telemetry::Outcome::PARKED => -> { AceMQ::AMQP::Ack.park("nothing can read this") }
+      }
+
+      deliveries.each do |expected, handler|
+        counted = Telemetry::Registry.new
+        AceMQ::AMQP::Consumer.new(
+          transport: transport, queue: "orders.new", handler: ->(_m) { handler.call },
+          codec: AceMQ::AMQP::JSONCodec.new, retry_policy: AceMQ::AMQP::RetryPolicy.none,
+          telemetry: counted
+        ).handle(delivery_for.first)
+
+        raised = counted.counts.select do |key, value|
+          key.start_with?("acemq.consume.total") && value.positive?
+        end
+        expect(raised.keys)
+          .to eq(["acemq.consume.total{outcome=#{expected},queue=orders.new}"])
+      end
     end
   end
 
@@ -168,21 +253,41 @@ RSpec.describe AceMQ::AMQP::Telemetry do
     end
 
     it "renders the Prometheus text format, dots and all" do
-      metrics.count(Telemetry::PUBLISHED, 2, exchange: "orders-events")
-      metrics.gauge(Telemetry::IN_FLIGHT, 3, queue: "orders.new")
-      metrics.observe(Telemetry::HANDLER_DURATION, 0.5, queue: "orders.new")
+      metrics.count(Telemetry::PUBLISH_TOTAL, 2,
+                    exchange: "orders-events", outcome: Telemetry::Outcome::CONFIRMED)
+      metrics.gauge(Telemetry::CONSUME_IN_FLIGHT, 3, queue: "orders.new")
+      metrics.observe(Telemetry::CONSUME_DURATION, 0.5,
+                      queue: "orders.new", outcome: Telemetry::Outcome::ACKED)
 
       rendered = metrics.to_prometheus
       expect(rendered).to include(<<~METRIC)
-        # TYPE acemq_messages_published counter
-        acemq_messages_published{exchange="orders-events"} 2
+        # TYPE acemq_publish_total counter
+        acemq_publish_total{exchange="orders-events",outcome="confirmed"} 2
       METRIC
       expect(rendered).to include(<<~METRIC)
-        # TYPE acemq_messages_in_flight gauge
-        acemq_messages_in_flight{queue="orders.new"} 3
+        # TYPE acemq_consume_in_flight gauge
+        acemq_consume_in_flight{queue="orders.new"} 3
       METRIC
-      expect(rendered).to include("acemq_handler_duration_count{queue=\"orders.new\"} 1\n")
-      expect(rendered).to include("acemq_handler_duration_sum{queue=\"orders.new\"} 0.5\n")
+      expect(rendered)
+        .to include("acemq_consume_duration_count{outcome=\"acked\",queue=\"orders.new\"} 1\n")
+      expect(rendered)
+        .to include("acemq_consume_duration_sum{outcome=\"acked\",queue=\"orders.new\"} 0.5\n")
+    end
+
+    it "renders a label name Prometheus will accept, dots and all" do
+      # +routing.key+ and +message.type+ are in the family's tag vocabulary and
+      # neither is a legal Prometheus label name: a dot is not allowed in one.
+      # A single bad line does not lose one series either — it makes the whole
+      # scrape unparseable and loses every metric this process publishes.
+      metrics.count(Telemetry::PUBLISH_TOTAL, 1,
+                    "routing.key": "order.placed", "message.type": "order.placed.v2")
+
+      rendered = metrics.to_prometheus
+      expect(rendered).to include(
+        %(acemq_publish_total{message_type="order.placed.v2",routing_key="order.placed"} 1)
+      )
+      expect(rendered).not_to include("routing.key=")
+      expect(rendered).not_to include("message.type=")
     end
 
     it "keeps the fastest and the slowest, and no percentiles" do

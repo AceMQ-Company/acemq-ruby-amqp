@@ -154,6 +154,75 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **Every metric was renamed onto Java's vocabulary, and every existing Ruby
+  dashboard breaks.** Java's `MetricNames` is the family vocabulary; Go, Python
+  and Ruby have all moved onto it. Ruby's names and Java's were entirely
+  disjoint, so no dashboard could read both and this library's claim that "the
+  names are shared with Java, Go, .NET and Python" was simply false. It is true
+  now.
+
+  The shape changed as well as the spelling. Where Ruby had one counter per
+  outcome, there is now one counter carrying an `outcome` tag, which is how a
+  dashboard sums the whole and breaks it down without knowing the list of
+  outcomes in advance:
+
+  | was | is now |
+  |---|---|
+  | `acemq.messages.published{exchange}` | `acemq.publish.total{exchange,outcome="confirmed"}` |
+  | `acemq.messages.publish.failed{exchange}` | `acemq.publish.total{exchange,outcome="failed"}` |
+  | `acemq.messages.consumed{queue}` | `acemq.consume.attempts{queue}` — its **sample count** |
+  | `acemq.messages.accepted{queue}` | `acemq.consume.total{queue,outcome="acked"}` |
+  | `acemq.messages.retried{queue}` | `acemq.consume.total{queue,outcome="retried"}`, and `acemq.messages.retried.total{queue}` |
+  | `acemq.messages.rejected{queue}` | `acemq.consume.total{queue,outcome="rejected"}` |
+  | `acemq.messages.dead.lettered{queue}` | `acemq.consume.total{queue,outcome="dead_lettered"}`, and `acemq.messages.dead.lettered.total{queue}` |
+  | `acemq.messages.parked{queue}` | `acemq.consume.total{queue,outcome="parked"}` |
+  | `acemq.handler.duration{queue}` | `acemq.consume.duration{queue,outcome}` |
+  | `acemq.messages.in.flight{queue}` | `acemq.consume.in.flight{queue}` |
+  | `acemq.messages.set.aside.failed{queue,target}` | unchanged |
+  | `acemq.retry.rung.missing{queue}` | unchanged |
+
+  The last two are unchanged because Java adopted **Ruby's** names for them,
+  along with the `target` tag and the `parked` outcome: the traffic was not all
+  one way.
+
+  **The property that made the previous release worth having survives.** Exactly
+  one `acemq.consume.total` series goes up per delivery, tagged with what the
+  consumer really decided rather than what the handler asked for, and it is read
+  off the same `Settlement` the span's `messaging.acemq.outcome` attribute is.
+  A new example asserts it outcome by outcome, and another asserts that
+  `Settlement`'s words and `Telemetry::Outcome`'s are the same strings, so the
+  two lists cannot drift.
+
+  `acemq.messages.retried.total` and `acemq.messages.dead.lettered.total` are
+  kept as standalone counters alongside the tag, as Java keeps them: a retry
+  rate and a dead-letter rate are the two numbers most often wanted without a
+  tag filter.
+
+  `acemq.messages.consumed` was counted on the way in, and that signal is not
+  lost — it is the sample count of `acemq.consume.attempts`, which is Java's
+  metric for the same moment and says which attempt each delivery was as well.
+
+  The constants moved with the strings: `Telemetry::PUBLISHED` and
+  `PUBLISH_FAILED` are `PUBLISH_TOTAL` with a `Telemetry::Outcome` value;
+  `ACCEPTED`, `RETRIED`, `REJECTED`, `DEAD_LETTERED` and `PARKED` are
+  `CONSUME_TOTAL` with one; `HANDLER_DURATION` is `CONSUME_DURATION` and
+  `IN_FLIGHT` is `CONSUME_IN_FLIGHT`. There is no compatibility shim and nothing
+  is emitted under both names — a library quietly writing both would double every
+  counter for anybody who had already moved.
+
+- **`to_prometheus` renders label names Prometheus will accept.** Prometheus
+  allows `[a-zA-Z_][a-zA-Z0-9_]*` in a label name and nothing else, so the
+  family's `routing.key` and `message.type` tags are illegal ones — and a single
+  unparseable line does not lose one series, it makes the whole scrape fail and
+  loses every metric the process publishes. Label names now go through the same
+  rule the metric name always did, so they are scraped as `routing_key` and
+  `message_type`, which is what Go settled on.
+
+- **`observe` is documented as a distribution rather than a timer.** Its second
+  argument is `value`, not `seconds`: durations still go through it in seconds,
+  and `acemq.consume.attempts` puts an attempt number through the same method.
+  The arity is unchanged, so an existing observer keeps working.
+
 - **A requester writes the reply address twice, and a responder reads either
   one.** `Patterns::Requester` now sets AMQP's native `reply-to` property as well
   as the `acemq-reply-to` header, to the same queue, and `Patterns.serve` reads

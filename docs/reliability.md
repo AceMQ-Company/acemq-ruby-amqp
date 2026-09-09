@@ -284,10 +284,10 @@ The message is **republished** to `{queue}.dlq` with the reason in
 `x-acemq-error`, and the original is then acknowledged.
 
 All four routes end in the same queue, and the counters keep them apart:
-`Ack.reject` counts as `acemq.messages.rejected`, the other three as
-`acemq.messages.dead.lettered`, and neither is also counted as a retry.
+`Ack.reject` is tagged `outcome=rejected` on `acemq.consume.total`, the other
+three `outcome=dead_lettered`, and neither is also counted as a retry.
 `Ack.park` is not one of these routes at all: it ends in `{queue}.parked` and
-counts as `acemq.messages.parked`. See
+is tagged `outcome=parked`. See
 [observability](observability.md#the-outcome-counters-are-what-the-consumer-decided).
 
 Acknowledging a failure looks wrong and is what makes it reliable: the message
@@ -308,7 +308,7 @@ retrying cannot help: AceMQ::AMQP::FatalError: no such SKU
 ## Parked messages
 
 A body **no codec can read** goes to `{queue}.parked` rather than `{queue}.dlq`,
-and is counted as `acemq.messages.parked`.
+and is tagged `outcome=parked` on `acemq.consume.total`.
 
 So does a message a handler answers with `Ack.park`:
 

@@ -396,7 +396,8 @@ RSpec.describe AceMQ::AMQP::Consumer do
       delivery, = FakeDelivery.build(body: "{ not json", headers: headers_for)
       consumer(telemetry: metrics) { Ack.accept }.handle(delivery)
 
-      expect(metrics[AceMQ::AMQP::Telemetry::PARKED, queue: "orders.new"]).to eq(1)
+      expect(metrics[AceMQ::AMQP::Telemetry::CONSUME_TOTAL, queue: "orders.new",
+                                                            outcome: "parked"]).to eq(1)
     end
   end
 
@@ -434,9 +435,12 @@ RSpec.describe AceMQ::AMQP::Consumer do
       delivery, = FakeDelivery.build(headers: headers_for)
       consumer(telemetry: metrics) { Ack.park("unreadable") }.handle(delivery)
 
-      expect(metrics[AceMQ::AMQP::Telemetry::PARKED, queue: "orders.new"]).to eq(1)
-      expect(metrics[AceMQ::AMQP::Telemetry::REJECTED, queue: "orders.new"]).to eq(0)
-      expect(metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED, queue: "orders.new"]).to eq(0)
+      queue = { queue: "orders.new" }
+      total = AceMQ::AMQP::Telemetry::CONSUME_TOTAL
+      expect(metrics[total, **queue, outcome: "parked"]).to eq(1)
+      expect(metrics[total, **queue, outcome: "rejected"]).to eq(0)
+      expect(metrics[total, **queue, outcome: "dead_lettered"]).to eq(0)
+      expect(metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED_TOTAL, **queue]).to eq(0)
     end
   end
 
