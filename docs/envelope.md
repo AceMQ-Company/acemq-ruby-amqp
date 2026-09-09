@@ -114,6 +114,26 @@ That is also why the patterns' own headers are *not* in that namespace —
 ordinary application headers, because a responder or a slip handler has to be
 able to read them and the engine keeps `x-acemq-` away from handlers.
 
+## The route
+
+`x-acemq-route`, `x-acemq-route-position` and `x-acemq-route-id` are the one
+exception to the paragraph above, and they are reserved because Java made them
+so: they are how a message travels a
+[declared pipeline](patterns.md#declared-pipelines). An envelope carries them
+opaquely, in `route`, and passes them through every hop:
+
+```ruby
+envelope.route
+# => { "x-acemq-route" => "validate,charge,ship",
+#      "x-acemq-route-position" => 1,
+#      "x-acemq-route-id" => "b0c1…" }
+```
+
+The envelope does not know what they mean; `Patterns::RoutingSlip` is what reads
+and writes them. It holds them because they are reserved names, and reserved
+names cannot go in `headers:` — a pattern that needed to write one would
+otherwise have nowhere to put it.
+
 ## Reading one off a delivery
 
 ```ruby

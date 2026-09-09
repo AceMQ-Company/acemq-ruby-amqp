@@ -57,12 +57,28 @@ module AceMQ
       # The claim-check URI, when the payload lives outside the message.
       CLAIM = "x-acemq-claim"
 
+      # The ordered step names of a declared pipeline, comma-separated; which
+      # of them is next, counting from zero; and the identifier of one run
+      # through the pipeline, stable across every hop.
+      #
+      # The itinerary as Java writes it, resolved against a
+      # {Patterns::Pipeline} rather than carrying its own destinations. Ruby's
+      # own +acemq-routing-slip+ is the self-describing form and stays the
+      # default; these three are what makes a Ruby step able to stand in a
+      # Java-declared pipeline. See {Patterns::RoutingSlip}.
+      ROUTE = "x-acemq-route"
+      ROUTE_POSITION = "x-acemq-route-position"
+      ROUTE_ID = "x-acemq-route-id"
+
       # The prefix every reserved name shares.
       PREFIX = "x-acemq-"
 
+      # The three the itinerary is written in, in the order they are read.
+      ROUTE_HEADERS = [ROUTE, ROUTE_POSITION, ROUTE_ID].freeze
+
       # Every name this library writes and understands.
-      RESERVED = [ID, TYPE, VERSION, CORRELATION, CAUSATION,
-                  ATTEMPT, FIRST_SEEN, ORIGIN, ERROR, CLAIM].freeze
+      RESERVED = [ID, TYPE, VERSION, CORRELATION, CAUSATION, ATTEMPT,
+                  FIRST_SEEN, ORIGIN, ERROR, CLAIM, *ROUTE_HEADERS].freeze
 
       # Whether a header belongs to AceMQ rather than to the application.
       #

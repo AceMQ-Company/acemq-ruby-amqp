@@ -33,7 +33,7 @@ module AceMQ
     # routing key.
     class Envelope
       attr_reader :id, :type, :version, :correlation_id, :causation_id,
-                  :attempt, :first_seen, :origin, :error, :claim, :headers
+                  :attempt, :first_seen, :origin, :error, :claim, :headers, :route
 
       # @param id [String] the message identifier
       # @param type [String] the logical type
@@ -46,11 +46,16 @@ module AceMQ
       # @param error [String] why it was dead-lettered
       # @param claim [String] where the payload is, when it is stored elsewhere
       # @param headers [Hash] the application's own headers
+      # @param route [Hash] the +x-acemq-route+ headers, when the message is
+      #   travelling a declared pipeline. Carried opaquely and passed through
+      #   every hop: an envelope has to hold them because they are reserved
+      #   names and so cannot go in +headers+, and it does not have to know what
+      #   they mean. {Patterns::RoutingSlip} is what reads and writes them.
       # @raise [ArgumentError] if a reserved name is in +headers+
       def initialize(id: SecureRandom.uuid, type: "", version: 1,
                      correlation_id: nil, causation_id: "", attempt: 1,
                      first_seen: Time.now, origin: "", error: "", claim: "",
-                     headers: {})
+                     headers: {}, route: {})
         self.class.refuse_reserved_names(headers)
 
         @id = id
@@ -64,6 +69,7 @@ module AceMQ
         @error = error
         @claim = claim
         @headers = headers.freeze
+        @route = route.freeze
         freeze
       end
 
@@ -95,7 +101,8 @@ module AceMQ
           origin: text(raw[Headers::ORIGIN]),
           error: text(raw[Headers::ERROR]),
           claim: text(raw[Headers::CLAIM]),
-          headers: application
+          headers: application,
+          route: raw.slice(*Headers::ROUTE_HEADERS)
         )
       end
 
@@ -120,7 +127,7 @@ module AceMQ
           written[name] = value unless value.nil? || value.empty?
         end
 
-        written.merge(headers)
+        written.merge(route).merge(headers)
       end
 
       # A copy with fields changed.
@@ -139,7 +146,8 @@ module AceMQ
           origin: changes.fetch(:origin, origin),
           error: changes.fetch(:error, error),
           claim: changes.fetch(:claim, claim),
-          headers: changes.fetch(:headers, headers)
+          headers: changes.fetch(:headers, headers),
+          route: changes.fetch(:route, route)
         )
       end
 

@@ -28,7 +28,7 @@ written for one reads the same against another:
 | `acemq.messages.dead.lettered.total` | by `queue`; likewise for `outcome=dead_lettered` |
 | `acemq.messages.set.aside.failed` | by `queue` and `target`; see [below](#the-two-worth-an-alert) |
 | `acemq.retry.rung.missing` | by `queue`; see [below](#the-two-worth-an-alert) |
-| `acemq.pipeline.run.total` / `.duration` | by `pipeline`, `step` and `outcome`; see [patterns](patterns.md#pipelines) |
+| `acemq.pipeline.run.total` / `.duration` | by `pipeline`, `step` and `outcome`; see [patterns](patterns.md#declared-pipelines) |
 
 This is Java's `MetricNames` vocabulary, which is the family's. Read the
 [migration note](#the-metric-names-moved-onto-javas) if you have a dashboard

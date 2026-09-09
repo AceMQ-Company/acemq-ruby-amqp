@@ -1073,7 +1073,34 @@ says how far it got, which is exactly what whoever finds it in a dead-letter
 queue is asking. The message is accepted only once the next one is out, so a
 failure to publish retries the step — which is why a step that changes anything
 should be idempotent. A slip that will not parse is fatal rather than retried:
-it will not parse next time either.
+it will not parse next time either. Returning `nil` ends the run there and
+publishes nothing.
+
+#### Declared pipelines, and Java's form of the itinerary
+
+The other shape the same idea travels in. A slip carries its destinations; a
+pipeline knows them, and the message carries only the ordered step names:
+
+```ruby
+orders = Patterns::Pipeline.new("orders", %w[validate charge ship])
+mq.apply(orders.topology)
+
+mq.consume(orders.queue_for("charge"), &orders.follow(mq) { |m| charge(m.payload) })
+orders.start(mq, order)
+```
+
+Java and .NET write `x-acemq-route`; Ruby, Go and Python write the JSON slip.
+**Ruby now reads either and writes the slip unless told otherwise**, so a Ruby
+step can stand in the middle of a pipeline a Java service declared and hand the
+message on in a shape the next Java step reads. A slip keeps the shape it
+arrived in; `write:` asks for the other one. The exchange, routing keys and
+queue names are Java's exactly — `orders`, `charge`, `orders.charge` — because a
+consumer that got them wrong would be listening where nothing publishes.
+
+A run that leaves a declared pipeline is counted as
+`acemq.pipeline.run.total`, tagged with the pipeline, the step and whether it
+`completed` or `ended_early`. See
+[patterns](docs/patterns.md#declared-pipelines).
 
 ### Sagas
 

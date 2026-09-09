@@ -10,6 +10,55 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`Patterns::Pipeline`, and the routing slip in both of the family's forms.**
+  Ruby wrote the itinerary as `acemq-routing-slip`, a JSON document naming an
+  exchange and a routing key per step. Java writes `x-acemq-route`: the ordered
+  step names of a declared pipeline, a position, and a run identifier, resolved
+  by the consumer against a pipeline it declared. A Java step could not read a
+  Ruby slip and a Ruby step could not read a Java route, so the two halves of
+  the family could not be steps of one pipeline.
+
+  Both are available in all five libraries now. **Ruby keeps the JSON slip as
+  its default** — three of the five write it and it is the self-describing one —
+  and reads either:
+
+  ```ruby
+  orders = Patterns::Pipeline.new("orders", %w[validate charge ship])
+  mq.apply(orders.topology)
+
+  mq.consume(orders.queue_for("charge"), &orders.follow(mq) { |m| charge(m.payload) })
+  orders.start(mq, order)
+  ```
+
+  A slip keeps the shape it arrived in, which is what lets a Ruby step sit in
+  the middle of a Java-declared pipeline: the message is handed on as
+  `x-acemq-route` with the position advanced and the run identifier untouched,
+  and the next Java step reads it without knowing a Ruby service was involved.
+  `Patterns.follow_slip(mq, pipeline:, write:)` asks for a shape explicitly;
+  `write: RoutingSlip::ROUTE` re-resolves every step against the pipeline,
+  because the header will carry only names and the exchange has to be the one
+  the pipeline declared.
+
+  The naming is Java's exactly — a direct exchange named for the pipeline, the
+  step name as the routing key, `pipeline.step` as the queue — because a Ruby
+  consumer that got any of it wrong would be listening where no Java service
+  publishes. `spec/patterns/routing_slip_spec.rb` follows a message built from
+  Java-shaped headers rather than from this library's own writer.
+
+- **`Envelope#route`.** The `x-acemq-route` headers, carried opaquely and passed
+  through every hop. An envelope has to hold them because they are reserved
+  names and so cannot go in `headers:`, and it does not have to know what they
+  mean: `Patterns::RoutingSlip` is what reads and writes them.
+
+- **`acemq.pipeline.run.total` and `acemq.pipeline.run.duration`**, tagged with
+  `pipeline`, `step` and an outcome of `completed` or `ended_early`. This is the
+  seam the last release documented as not worth opening while nothing owned a
+  pipeline's name; `Patterns::Pipeline` owns one, so it now costs a name and a
+  step rather than an invention. The duration is the age of the envelope rather
+  than the time in the last step, so it is the whole run. A bare JSON slip
+  reports neither — an itinerary assembled per message has no identity to tag
+  with, and a metric tagged with an empty name is worse than no metric.
+
 - **Payload encryption.** `EncryptedCodec` wraps any other codec and encrypts
   what it produced with AES-GCM, so the broker, its disk, its backups and its
   management interface hold ciphertext. `Keyring` holds more than one key so a
@@ -217,6 +266,13 @@ While the version is `0.x` the public API may change in any release.
   loses every metric the process publishes. Label names now go through the same
   rule the metric name always did, so they are scraped as `routing_key` and
   `message_type`, which is what Go settled on.
+
+- **A routing-slip step that returns nothing ends the run.** `Patterns.follow_slip`
+  used to publish whatever the block returned; returning `nil` now publishes
+  nothing and accepts the message, which is the rule
+  `Patterns.then_publish` already followed and the one Java's pipeline counts as
+  `ended_early`. A step that decides a message goes no further is making a
+  decision, not failing.
 
 - **`observe` is documented as a distribution rather than a timer.** Its second
   argument is `value`, not `seconds`: durations still go through it in seconds,

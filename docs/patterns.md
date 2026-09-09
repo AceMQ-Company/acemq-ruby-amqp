@@ -23,6 +23,7 @@ to reimplement them, and then there would be two retry engines to keep in step.
 | [Ordering](#ordering) | keep some messages in order without serialising all of them |
 | [Consumer groups](#consumer-groups) | start a set of workers together, and stop them together |
 | [Routing slips](#routing-slips) | let the message carry its own itinerary |
+| [Declared pipelines](#declared-pipelines) | a route named once, that messages travel by name |
 | [Sagas](#sagas) | undo the steps that worked when a later one does not |
 | [Scheduling](#scheduling) | deliver a message later, without a scheduler |
 | [Pipelines](#pipelines-and-middleware) | wrap a handler; chain one service to the next |
@@ -526,6 +527,98 @@ The message is accepted only once the next one is out, so a failure to publish
 retries the step — which is why a step that changes anything should be
 [idempotent](#idempotency). A slip that will not parse is fatal rather than
 retried: it will not parse next time either.
+
+Returning `nil` from the block ends the run there: nothing is published and the
+message is accepted. A step that decides a message goes no further is making a
+decision, not failing, and it is counted apart from a run that reached the end.
+
+### Declared pipelines
+
+An itinerary the message carries, or a route declared once that messages travel
+by name. Both are on the wire in this family, and this library reads and writes
+both.
+
+```ruby
+orders = Patterns::Pipeline.new("orders", %w[validate charge ship])
+mq.apply(orders.topology)
+
+mq.consume(orders.queue_for("charge"), &orders.follow(mq) do |message|
+  charge(message.payload)
+end)
+
+orders.start(mq, order)
+```
+
+A slip carries its destinations, in an `acemq-routing-slip` header; a pipeline
+knows them, and the message carries only `x-acemq-route` — the ordered step
+names — plus how far along it is and which run it belongs to. Three short
+headers instead of a JSON document, and a route that reads in a management
+console without anybody decoding anything, at the price of a route that is the
+same for every message and has to be declared at both ends.
+
+**The naming is Java's, exactly**: the exchange is the pipeline's name and is
+direct, the routing key is the step name, and the queue behind a step is
+`pipeline.step`. A Ruby consumer that got any of those wrong would be listening
+where no Java service publishes.
+
+| | the slip | the pipeline |
+|---|---|---|
+| header | `acemq-routing-slip` | `x-acemq-route`, `-position`, `-id` |
+| shape | JSON: exchange, routing key and name per step | comma-separated step names |
+| written by | Ruby, Go, Python | Java, .NET |
+| the route | decided per message, may differ every time | declared once, the same for all |
+| needs | nothing — it names its own destinations | the `Pipeline` it belongs to |
+
+### Reading either, writing one
+
+**Ruby writes the JSON slip unless told otherwise, and reads either.** The slip
+is the default because three of the five libraries write it and because it is
+the self-describing one; a message carrying both — which nothing in this family
+writes, though a gateway between two of them might — is read as the slip, for
+the same reason.
+
+A slip that arrives keeps the shape it arrived in. That is what lets a Ruby step
+stand in the middle of a pipeline a Java service declared: the message is
+handed on as `x-acemq-route` with the position advanced and the run identifier
+untouched, and the next Java step reads it without knowing a Ruby service was
+ever involved. The run identifier survives a dead-letter and a replay too, so
+one run can be followed across both.
+
+Ask for a shape explicitly with `write:`:
+
+```ruby
+Patterns.follow_slip(mq, pipeline: orders, write: Patterns::RoutingSlip::ROUTE) do |message|
+  charge(message.payload)
+end
+```
+
+Becoming a route re-resolves every step against the pipeline rather than
+keeping the destinations the slip was carrying. It has to: the header will carry
+only the names, so the exchange the next hop goes to must be the one the
+pipeline declared. A step the pipeline does not have is refused rather than
+published into the void.
+
+Following an `x-acemq-route` message needs the pipeline, because the header
+carries names and no exchange. Without one the steps and the position are still
+readable — `RoutingSlip.from(envelope)` gives a slip you can inspect — and there
+is nowhere to send the message onwards to.
+
+### What a pipeline run reports
+
+A run that leaves a **declared** pipeline is counted, tagged with the pipeline,
+the step it left at, and whether it `completed` or `ended_early`:
+
+```
+acemq.pipeline.run.total{pipeline="orders",step="ship",outcome="completed"}
+acemq.pipeline.run.duration{pipeline="orders"}
+```
+
+The duration is the age of the envelope rather than the time in the last step,
+so it is the whole run: the envelope was created when the message entered and
+carried through every hop. A bare JSON slip reports neither — it is an itinerary
+assembled per message rather than a thing with an identity, so there is no
+pipeline name to tag with, and a metric tagged with an empty one is worse than
+no metric. See [observability](observability.md#the-metrics).
 
 ## Sagas
 
