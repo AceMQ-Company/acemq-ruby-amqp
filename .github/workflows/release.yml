@@ -58,9 +58,9 @@ jobs:
         run: |
           version="${REF#v}"
           case "$version" in
-            0.3.*) echo "releasing $version" ;;
+            0.5.*) echo "releasing $version" ;;
             *)
-              echo "::error::this library releases 0.3.x only; '$version' needs the guard in release.yml lifted first"
+              echo "::error::this library releases 0.5.x only; '$version' needs the guard in release.yml lifted first"
               exit 1
               ;;
           esac
