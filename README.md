@@ -1431,22 +1431,28 @@ has had before and nothing noticed.
 
 ### Releasing
 
-`release.yml` runs on a `v*` tag: it checks the tag is a `0.1.x` version and that
+`release.yml` runs on a `v*` tag: it checks the tag is a `0.6.x` version and that
 `AceMQ::AMQP::VERSION` agrees with it, runs the specs and RuboCop, builds the
 gem, checks the built gem carries what the gemspec's glob was supposed to
 include, installs it into a clean `GEM_HOME` and requires it there — which is the
 one thing the specs cannot catch, since they satisfy every `require` from this
 repository's own Gemfile. It then runs the integration specs against a broker and
-only afterwards pushes to RubyGems.
+only afterwards publishes. **The version comes from the working tree, not from
+the tag**: a tag whose version `lib/acemq/amqp/version.rb` does not declare fails
+the run before anything is built, so the constant is bumped in the commit the tag
+points at.
 
-The push uses **RubyGems trusted publishing**: the runner exchanges a GitHub
-identity token for an API key that lives for minutes, so there is no long-lived
-secret in this repository to leak, rotate or forget. It needs a trusted publisher
-registered on rubygems.org once — repository `AceMQ-Company/acemq-ruby-amqp`,
-workflow `release.yml`, environment `rubygems` — and rubygems.org will register a
-*pending* one for a gem that has never been pushed, which is what this gem needs,
-since `v0.1.0` was tagged before there was any way to publish and is not
-installable by anybody.
+The gem goes to the **AceMQ gem feed** — `AceMQ-Company/gems`, served as a static
+index at <https://acemq.org/gems/> beside the Maven repository and the NuGet feed
+— rather than to rubygems.org. That is deliberate, and it is about
+reversibility: a version pushed to rubygems.org cannot really be withdrawn, where
+a release in this feed is corrected by deleting a file and re-indexing, which is
+the property worth having while the library is pre-1.0. The job writes with
+`GEMS_REPO_DEPLOY_KEY`, a deploy key carrying write access to that one repository
+and to nothing else in the organisation; it rebuilds the index over everything
+already published rather than over this release alone, and then installs the gem
+back out of the feed, because a feed is only real if a client can resolve from it.
+Moving to rubygems.org later changes nothing for consumers except the source line.
 
 A manual `workflow_dispatch` runs every check and stops short of publishing, so
 the workflow can be tried out without spending a version number.
