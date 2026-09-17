@@ -171,6 +171,59 @@ that is not on the broker is heard rather than silently swallowed by the default
 exchange — see
 [when a message cannot be set aside](reliability.md#when-a-message-cannot-be-set-aside-at-all).
 
+## Publishing a batch
+
+`publish` waits for the broker to confirm each message before it returns, which
+is the right trade for one message and the wrong one for a thousand: a thousand
+messages cost a thousand round trips, and the publisher spends nearly all of that
+time waiting for a network. `publish_all` hands every message over first and
+waits for all of the confirms together:
+
+```ruby
+envelopes = mq.publish_all(orders, to: "order.placed", exchange: "orders-events",
+                           type: "order.placed.v2")
+```
+
+The envelopes come back in the order the payloads were given, whatever order the
+broker confirmed them in. Everything else works as it does for a single publish:
+each message gets an envelope of its own (or pass `envelopes:`, one per payload),
+each one goes through the [publish interceptors](interceptors.md) exactly once,
+each one is counted in `acemq.publish.total` on its own, and `mandatory: true`
+means for each message what it means for one.
+
+**It is not atomic**, and nothing in AMQP could make it so. There is no way to
+publish a hundred messages such that all or none arrive, and a library that
+offered one would be lying. What this does instead is tell you how much did
+arrive:
+
+```ruby
+begin
+  mq.publish_all(orders, to: "order.placed", exchange: "orders-events")
+rescue AceMQ::AMQP::PublishError => e
+  # "3 of 500 messages were not confirmed; 497 were. The first failure was: ..."
+  logger.error(e.message)
+end
+```
+
+A batch that half succeeded is the ordinary outcome of a broker problem partway
+through, so **every message is still waited for after the first failure** and the
+counts in that sentence are real. A caller told only "it failed" republishes
+hundreds of messages that are already on a queue. The failure quoted is the first
+one *in payload order* rather than the first the broker answered, so the same
+half-failed batch reports the same message twice running. Java's `sendAll` and
+.NET's `SendAllAsync` raise that sentence word for word, so one runbook covers
+all three.
+
+`unroutable?` on that error is true only when *every* failure was a message the
+broker had nowhere to route — that being the only case where concluding "nothing
+is bound" is right. A batch that met a missing binding and a refused message is
+not an unroutable batch.
+
+Nothing bounds how many messages may be unconfirmed at once: the batch is as
+large as the array you hand in, and both this process and the broker hold all of
+it. Split a very large batch yourself — a few thousand at a time keeps the
+throughput and bounds the memory.
+
 ## Publishing and a database in the same breath
 
 A service that writes a row and then publishes has two things that can fail
@@ -188,6 +241,12 @@ threads at once, and a consumer thread dead-lettering a message publishes on
 that same channel while an application thread may be publishing its own. The
 cost is that publishes on one connection serialise; the alternative is two
 threads interleaving frames into a protocol error.
+
+`publish_all` holds that same mutex for the whole batch — every message and the
+one wait at the end — because the delivery tags it hands back have to belong to
+this batch and to nothing else. A very large batch therefore keeps other threads
+on this connection waiting for as long as it takes, which is another reason to
+split one.
 
 Interceptors are called on whichever thread is publishing, so one that keeps
 state has to be safe to call from several at once.

@@ -60,6 +60,7 @@ exactly this reason. A transport is anything answering:
 | | |
 |---|---|
 | `publish(exchange:, routing_key:, body:, content_type:, message_id:, headers:, persistent:)` | |
+| `publish_all(messages)` | one hash of those keywords per message; answers with an array in the same order, each entry the message id or the `PublishError` that message met. Only needed by a double whose tests call `publish_all` |
 | `subscribe(queue, prefetch:, concurrency:, tag:, arguments:, &handler)` | returns something answering `open?`, `stop`, `close`, `cancel` |
 | `declare_exchange(name, kind:, durable:, auto_delete:, arguments:)` | |
 | `declare_queue(name, durable:, auto_delete:, exclusive:, arguments:)` | |

@@ -77,6 +77,27 @@ gem "acemq-amqp"
 gem "bunny", "~> 2.23"
 ```
 
+### Publishing a batch
+
+```ruby
+envelopes = mq.publish_all(orders, to: "order.placed", exchange: "orders-events",
+                           type: "order.placed.v2")
+```
+
+`publish` waits for each message's confirm, which is a round trip to the broker
+per message and the wrong trade for a thousand of them. `publish_all` hands every
+message over first and waits for all the confirms together, and hands back the
+envelopes in the order the payloads were given — whatever order the broker
+confirmed them in. Interceptors, telemetry and `mandatory:` work per message
+exactly as they do for a single publish.
+
+It is **not atomic**; AMQP has no such thing. A batch that half arrived raises a
+`PublishError` that says how much did — `"3 of 500 messages were not confirmed;
+497 were. The first failure was: …"`, the same sentence Java's `sendAll` and
+.NET's `SendAllAsync` raise — and every message is waited for even after the
+first failure, so that count is real. See
+[publishing a batch](docs/publishing.md#publishing-a-batch).
+
 ### Codecs
 
 JSON, string and bytes, and the five formats the Java and Go libraries also

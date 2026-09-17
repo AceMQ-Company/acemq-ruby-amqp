@@ -56,6 +56,17 @@ class LoopbackTransport
     message_id
   end
 
+  # Routed one at a time, each one's answer collected rather than the first
+  # failure ending the batch — the transport contract {Connection#publish_all}
+  # is built on.
+  def publish_all(messages)
+    messages.map do |message|
+      publish(**message)
+    rescue AceMQ::AMQP::PublishError => e
+      e
+    end
+  end
+
   def declare_queue(name, **options)
     @declared_queues << [name, options]
     @lock.synchronize { @waiting[name] } # so message_count answers 0 rather than nothing

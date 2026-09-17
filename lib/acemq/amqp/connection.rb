@@ -232,6 +232,67 @@ module AceMQ
         raise
       end
 
+      # Publishes a batch, and waits for every confirm together.
+      #
+      # What bulk publishing actually wants: the throughput of pipelining with
+      # the safety of having waited. Every message is handed to the broker
+      # before any confirm is asked for, and then all of them are waited on at
+      # once. A loop around {#publish} is the other thing — a round trip to the
+      # broker and back per message — and it is the thing a caller can already
+      # write, which is why this method exists at all.
+      #
+      #   mq.publish_all(orders, to: "order.placed", exchange: "orders-events")
+      #
+      # **It is not atomic.** AMQP has no such thing: there is no way to publish
+      # a hundred messages such that all or none of them arrive, and a library
+      # offering one would be lying. A batch that half arrived is the ordinary
+      # outcome of a broker problem partway through, so the failure says how
+      # many *did* arrive rather than only that something went wrong — a caller
+      # told nothing but "it failed" republishes messages that are already on a
+      # queue.
+      #
+      # Every message goes through the publish interceptors exactly as a single
+      # publish does, once each, and +mandatory:+ means for each message what it
+      # means for one: a message the broker had nowhere to route is that
+      # message's failure, carrying {PublishError#unroutable?}, and the batch
+      # counts it among the ones that did not arrive.
+      #
+      # Nothing here bounds how many messages may be unconfirmed at once — the
+      # batch is as big as the array handed in. A batch of a hundred thousand is
+      # a hundred thousand messages held in memory by this process and by the
+      # broker, so split a very large one yourself.
+      #
+      # @param payloads [Array<Object>] anything the codec will encode, in the
+      #   order they should be sent
+      # @param to [String] the routing key every message is sent with
+      # @param exchange [String] empty for the default exchange
+      # @param envelopes [Array<Envelope>, nil] one envelope per payload, for
+      #   messages whose metadata derives from other messages. One built here
+      #   per payload when it is not given, which is what {#publish} does for a
+      #   single message
+      # @param mandatory [Boolean] whether a message that reaches no queue at
+      #   all is an error rather than a silence, per message
+      # @param fields [Hash] envelope fields, when no envelopes are given
+      # @return [Array<Envelope>] what actually went on the wire, in the order
+      #   the payloads were given — whatever order the broker confirmed them in
+      # @raise [PublishError] when any message was not confirmed. The message
+      #   says how many failed and how many did not, and quotes the first
+      #   failure *in payload order*, which is not necessarily the first one the
+      #   broker answered
+      def publish_all(payloads, to:, exchange: "", envelopes: nil, codec: nil, persistent: true,
+                      reply_to: nil, mandatory: false, **fields)
+        payloads = check_batch!(payloads, envelopes, fields)
+        return [] if payloads.empty?
+
+        codec = codec.nil? ? @codec : Codec.check!(codec)
+        contexts = payloads.each_with_index.map do |payload, index|
+          envelope = envelopes ? envelopes[index] : Envelope.new(origin: @origin, **fields)
+          PublishContext.new(exchange: exchange, routing_key: to, envelope: envelope,
+                             payload: payload, reply_to: reply_to, mandatory: mandatory)
+        end
+        send_all_intercepted(contexts, codec, persistent)
+      end
+
       # Reads messages from a queue until the returned consumer is cancelled.
       #
       #   consumer = mq.consume("orders.new") do |message|
@@ -369,16 +430,130 @@ module AceMQ
       # message rather than only stamp one.
       def send_intercepted(context, codec, persistent)
         @interceptors.before_publish(context)
-        @transport.publish(exchange: context.exchange, routing_key: context.routing_key,
-                           body: codec.encode(context.payload),
-                           content_type: codec.content_type, message_id: context.envelope.id,
-                           headers: context.envelope.to_headers(context.routing_key),
-                           persistent: persistent, reply_to: context.reply_to,
-                           mandatory: context.mandatory)
+        @transport.publish(**message_for(context, codec, persistent))
         @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
                          exchange: context.exchange, outcome: Telemetry::Outcome::CONFIRMED)
         @interceptors.after_confirm(context)
         context.envelope
+      end
+
+      # The message as the transport takes it, read off the context so that a
+      # single publish and a batch put the same thing on the wire. Two copies of
+      # this would be two answers to "what does an interceptor get to change",
+      # and the second one would be found by whoever needed the field it forgot.
+      def message_for(context, codec, persistent)
+        { exchange: context.exchange, routing_key: context.routing_key,
+          body: codec.encode(context.payload), content_type: codec.content_type,
+          message_id: context.envelope.id,
+          headers: context.envelope.to_headers(context.routing_key),
+          persistent: persistent, reply_to: context.reply_to,
+          mandatory: context.mandatory }
+      end
+
+      # What a batch has to be given before anything is encoded or sent.
+      #
+      # All of these are mistakes in the calling code rather than failures of a
+      # publish, so they are refused before a message exists to count or to tell
+      # an interceptor about.
+      def check_batch!(payloads, envelopes, fields)
+        unless payloads.respond_to?(:to_ary)
+          raise ArgumentError,
+                "publish_all was given a #{payloads.class} rather than an array of payloads"
+        end
+        if envelopes && !fields.empty?
+          raise ArgumentError,
+                "publish_all was given both envelopes and the fields to build them " \
+                "(#{fields.keys.join(", ")}); pass one or the other"
+        end
+
+        payloads = payloads.to_ary
+        return payloads if envelopes.nil? || envelopes.size == payloads.size
+
+        raise ArgumentError,
+              "publish_all was given #{payloads.size} payloads and #{envelopes.size} " \
+              "envelopes; there must be one envelope for each payload"
+      end
+
+      # Runs the interceptors for every message, sends the lot, and then tells
+      # each message's interceptors and counters how it went.
+      #
+      # Preparing a message is the work {#send_intercepted} does for one, and a
+      # message that cannot be prepared — an interceptor that refused it, a
+      # payload the codec will not encode — is one failure out of the batch
+      # rather than a reason to abandon the messages already prepared. The
+      # confirms follow the same rule for the same reason: what the caller has
+      # to act on is how many really went.
+      def send_all_intercepted(contexts, codec, persistent)
+        failures = Array.new(contexts.size)
+        outgoing = []
+        positions = []
+        contexts.each_with_index do |context, index|
+          @interceptors.before_publish(context)
+          outgoing << message_for(context, codec, persistent)
+          positions << index
+        rescue StandardError => e
+          failures[index] = e
+        end
+
+        # The transport answers per message and in the order it was given them,
+        # so a result is put back against the payload that produced it rather
+        # than against the position it happened to be confirmed in.
+        positions.zip(@transport.publish_all(outgoing)) do |index, result|
+          failures[index] = result if result.is_a?(StandardError)
+        end
+        report_batch(contexts, failures)
+      end
+
+      # Tells every message's interceptors and counters how it went, in payload
+      # order, and then raises if any of them did not arrive.
+      #
+      # Counted and reported per message, exactly as a single publish is: a
+      # batch is a way of sending a hundred messages in one round trip, not a
+      # way of turning a hundred messages into one metric.
+      def report_batch(contexts, failures)
+        contexts.each_with_index do |context, index|
+          failure = failures[index]
+          outcome = if failure
+                      Telemetry::Outcome.of_publish_failure(failure)
+                    else
+                      Telemetry::Outcome::CONFIRMED
+                    end
+          @telemetry.count(Telemetry::PUBLISH_TOTAL, 1, exchange: context.exchange,
+                                                        outcome: outcome)
+          if failure
+            @interceptors.on_publish_error(context, failure)
+          else
+            @interceptors.after_confirm(context)
+          end
+        end
+        raise batch_failure(failures, contexts.size) if failures.any?
+
+        contexts.map(&:envelope)
+      end
+
+      # The one exception a partly failed batch raises.
+      #
+      # The sentence is word for word the one Java and .NET raise, so that a
+      # batch that half succeeded reads the same whichever library published it
+      # and one runbook covers all three.
+      #
+      # The first failure is the first in payload order rather than the first
+      # the broker answered. The broker answers in whatever order suits it, and
+      # an exception that named a different message every run would be no use to
+      # anybody trying to reproduce one.
+      #
+      # +unroutable?+ is set only when *every* failure was a message the broker
+      # could not route, because that is the only case in which a caller
+      # rescuing it and concluding "nothing is bound" would be right. A batch
+      # that mixed a missing binding with a broker that refused a message is not
+      # an unroutable batch.
+      def batch_failure(failures, total)
+        met = failures.compact
+        PublishError.new(
+          "#{met.size} of #{total} messages were not confirmed; #{total - met.size} were. " \
+          "The first failure was: #{met.first.message}",
+          unroutable: met.all? { |e| e.is_a?(PublishError) && e.unroutable? }
+        )
       end
     end
 

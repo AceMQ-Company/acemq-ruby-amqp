@@ -1082,6 +1082,54 @@ RSpec.describe "against a real broker", :integration do
     end
   end
 
+  # A batch is the publish path whose answer is hardest to fake: bunny reports
+  # one as sets of delivery tags rather than as a failure per message, and only a
+  # real broker hands back the tags this library maps to payload positions.
+  describe "publishing a batch" do
+    let(:queue) { queue_named("batch") }
+    let(:nowhere) { queue_named("batch.nobody-declared-this") }
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:mq) do
+      AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", telemetry: metrics)
+    end
+    let(:payloads) { (1..25).map { |n| { "order_id" => "A-#{n}" } } }
+
+    before do
+      scrub(queue, nowhere)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+    end
+
+    after { scrub(queue, nowhere) }
+
+    it "confirms every message of a batch, and puts all of them on the queue" do
+      envelopes = mq.publish_all(payloads, to: queue, type: "order.placed.v2")
+
+      expect(envelopes.size).to eq(payloads.size)
+      expect(envelopes.map(&:id).uniq.size).to eq(payloads.size)
+      expect(wait_for { mq.message_count(queue) == payloads.size }).to be(true)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "confirmed"]).to eq(payloads.size)
+
+      properties, body = take_one(queue)
+      expect(body).to eq('{"order_id":"A-1"}')
+      expect(properties[:headers][AceMQ::AMQP::Headers::TYPE]).to eq("order.placed.v2")
+    end
+
+    it "counts a mandatory batch the broker had nowhere to put" do
+      # Every message comes back as a basic.return ahead of its own confirm, and
+      # the batch has to attribute each return to the message it was about.
+      expect { mq.publish_all(payloads.first(3), to: nowhere, mandatory: true) }
+        .to raise_error(AceMQ::AMQP::PublishError) do |error|
+          expect(error.message).to start_with("3 of 3 messages were not confirmed; 0 were.")
+          expect(error.message).to include("NO_ROUTE")
+          expect(error.unroutable?).to be(true)
+        end
+
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "unroutable"]).to eq(3)
+    end
+  end
+
   # The whole reason the set-aside republish is mandatory, and the behaviour
   # that changed with it: a dead-letter queue that is not on the broker used to
   # swallow the copy without a word, and before that it left the delivery

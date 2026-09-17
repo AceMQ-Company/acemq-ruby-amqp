@@ -50,6 +50,20 @@ class FakeTransport
     message_id
   end
 
+  # Every message is attempted and each one's answer collected, because that is
+  # the transport contract a batch is built on: a failure halfway through is
+  # one message's failure, not the end of the batch.
+  #
+  # Nothing here is held open, so this cannot tell a pipelined batch from a loop
+  # of single publishes — both pass. {HeldConfirmsTransport} is the one that can.
+  def publish_all(messages)
+    messages.map do |message|
+      publish(**message)
+    rescue AceMQ::AMQP::PublishError => e
+      e
+    end
+  end
+
   def declare_queue(name, **options)
     @declared_queues << [name, options]
   end

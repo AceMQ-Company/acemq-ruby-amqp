@@ -52,6 +52,70 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`publish_all`, which sends a batch in one round trip instead of one per
+  message.** Publishing a thousand messages meant a thousand calls to `publish`,
+  and every one of them waited for its own confirm before the next was written.
+  The wait is the right trade for a single message — it is the difference between
+  "the bytes reached a socket" and "the broker has it" — and the wrong one
+  repeated a thousand times, where nearly all the time is spent waiting for a
+  network with nothing on it:
+
+  ```ruby
+  envelopes = mq.publish_all(orders, to: "order.placed", exchange: "orders-events",
+                             type: "order.placed.v2")
+  ```
+
+  Every message is handed to the broker before any confirm is asked for, and
+  then all of them are waited for together — which is what publisher confirms
+  were designed for and what makes a thousand-message publish take about as long
+  as one. The envelopes come back in the order the payloads were given, whatever
+  order the broker confirmed them in, so a result can be matched to the payload
+  that produced it without anybody sorting anything.
+
+  **It is not atomic**, and no library can make it so: AMQP has no way to publish
+  a hundred messages such that all or none arrive. What it does instead is say
+  how much did arrive. A batch that met a failure is still waited for in full,
+  and the `PublishError` counts what happened:
+
+  ```
+  3 of 500 messages were not confirmed; 497 were. The first failure was: …
+  ```
+
+  That sentence matters more than it looks. A half-arrived batch is the ordinary
+  outcome of a broker problem partway through, and a caller told only "it failed"
+  republishes hundreds of messages that are already on a queue. The failure
+  quoted is the first one *in payload order* rather than the first the broker
+  answered, so the same batch reports the same message twice running rather than
+  whichever one the broker happened to answer first. Java's `sendAll` and .NET's
+  `SendAllAsync` raise that sentence word for word, so one runbook covers all
+  three.
+
+  Everything else works per message, exactly as it does for a single publish:
+  each payload gets an envelope of its own (or pass `envelopes:`, one per
+  payload), the publish interceptors run once for each,
+  `acemq.publish.total` is counted once for each with its own outcome, and
+  `mandatory: true` means what it means for one message — a message the broker
+  had nowhere to route is that message's failure, carrying `unroutable?`, and the
+  batch counts it among the ones that did not arrive. The batch error is itself
+  `unroutable?` only when *every* failure was an unroutable message, since that
+  is the only case in which rescuing it and concluding "nothing is bound" would
+  be right.
+
+  **Nothing existing changes.** `publish` is untouched, down to the wording of
+  every exception it raises — the sentences are now written in one place and a
+  batch raises exactly the ones a single publish does, so an alert matching on
+  them keeps matching. Nothing bounds how many messages may be unconfirmed at
+  once, because nothing in this library ever has: the batch is as large as the
+  array handed in, and both this process and the broker hold all of it, so split
+  a very large one yourself. A batch holds the connection's publishing mutex from
+  its first message to its last confirm, which is the price of delivery tags that
+  belong to it alone, and another reason not to send a hundred thousand at once.
+
+  **If you publish in a loop today**, hand the array to `publish_all` instead and
+  rescue `PublishError` around the batch rather than around each message. Ruby,
+  Go and Python were the three libraries without this; Java has had `sendAll`
+  since the beginning and .NET has `SendAllAsync`.
+
 - **`reader_schema:` on `AvroCodec.registered`, which is schema evolution on the
   read side.** A registered Avro codec resolves every message onto the schema it
   holds, and that schema used to be the same one it writes with, with no way to

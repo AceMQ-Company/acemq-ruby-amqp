@@ -51,6 +51,60 @@ module AceMQ
       end
     end
 
+    # The sentences a publish that did not arrive comes back with.
+    #
+    # In one place because a batch has to raise exactly what a single publish
+    # raises: whoever greps a log for one of these should not have to know
+    # which of the two paths sent the message, and two copies of a sentence are
+    # two sentences waiting to drift apart.
+    #
+    # @api private
+    module PublishFailure
+      module_function
+
+      def not_confirmed(message_id, exchange, routing_key)
+        "the broker would not confirm message #{message_id} on exchange " \
+          "#{exchange.inspect} with key #{routing_key.inspect}"
+      end
+
+      def not_routed(message_id, exchange, routing_key, reason)
+        "the broker had nowhere to route message #{message_id} published to exchange " \
+          "#{exchange.inspect} with key #{routing_key.inspect}: #{reason}"
+      end
+
+      def not_published(message_id, exchange, routing_key, reason)
+        "cannot publish message #{message_id} to exchange #{exchange.inspect} " \
+          "with key #{routing_key.inspect}: #{reason}"
+      end
+    end
+
+    # The two rules about what a property looks like on the wire, shared by
+    # everything here that writes one.
+    #
+    # @api private
+    module Wire
+      module_function
+
+      # Header and argument names go to the broker as strings, whatever they
+      # were written as here. A table keyed by :"x-message-ttl" is not the same
+      # table as one keyed by "x-message-ttl", and the broker only recognises
+      # the second — a symbol would silently become a queue argument nothing
+      # acts on.
+      def stringify(table)
+        return {} if table.nil? || table.empty?
+
+        table.to_h { |name, value| [name.to_s, value] }
+      end
+
+      # An empty property is absent rather than blank. A +reply-to+ carrying ""
+      # is a reply-to somebody has to write a special case for at the other end,
+      # which is the same rule {Envelope#to_headers} follows for its headers.
+      def presence(value)
+        text = value.to_s
+        text.empty? ? nil : text
+      end
+    end
+
     # One message, as it arrived, before any codec has looked at it.
     #
     # +redelivered+ is the broker saying it has handed these bytes over before —
@@ -116,12 +170,17 @@ module AceMQ
       # read its own return, and attributing it to this message would report the
       # wrong one as unroutable.
       def arm(channel, exchange)
-        name = exchange.to_s
-        unless @watched.include?(name)
-          ::Bunny::Exchange.new(channel, :direct, name, no_declare: true)
-                           .on_return { |info, _properties, _content| record(info) }
-          @watched << name
-        end
+        watch(channel, exchange)
+        @returns.clear
+      end
+
+      # The same, for a batch: every exchange it publishes to is watched before
+      # any of it goes out, and whatever was left over is dropped once rather
+      # than between two publishes. A return for the message just sent arrives
+      # while the next one is still being written, and clearing per message
+      # would throw it away.
+      def arm_all(channel, exchanges)
+        exchanges.each { |exchange| watch(channel, exchange) }
         @returns.clear
       end
 
@@ -139,22 +198,205 @@ module AceMQ
       # order, so a wait here would put the cost of +mandatory+ on every message
       # rather than on the ones it is about.
       def take
-        @returns.pop(true)
+        @returns.pop(true)&.last
       rescue ThreadError
         nil
       end
 
+      # Everything queued, as pairs of message id and reason.
+      #
+      # A batch has to tell *which* of its messages came back rather than only
+      # that one did, and the only thing that can say so is the returned
+      # message's own +message-id+ — the returns arrive in whatever order the
+      # broker sends them, and nothing about position survives the trip.
+      def take_all
+        taken = []
+        loop { taken << @returns.pop(true) }
+      rescue ThreadError
+        taken
+      end
+
       private
+
+      # Registers one exchange, once. See {#arm} for why it must not declare.
+      def watch(channel, exchange)
+        name = exchange.to_s
+        return if @watched.include?(name)
+
+        ::Bunny::Exchange.new(channel, :direct, name, no_declare: true)
+                         .on_return { |info, properties, _content| record(info, properties) }
+        @watched << name
+      end
 
       # Called on bunny's reader thread, so it does nothing but note the reason.
       #
       # The reply text is what the broker said and is worth keeping: NO_ROUTE is
       # not the only reason a message comes back, and the others are the
-      # interesting ones.
-      def record(info)
+      # interesting ones. The id is kept with it because a batch is told which
+      # message came back by nothing else.
+      def record(info, properties)
         code = info.reply_code
         text = info.reply_text.to_s
-        @returns.push(text.empty? ? "returned #{code}" : "#{code} #{text}")
+        reason = text.empty? ? "returned #{code}" : "#{code} #{text}"
+        @returns.push([properties[:message_id].to_s, reason])
+      end
+    end
+
+    # One batch of messages, from the moment they are handed to a channel to
+    # the moment every one of them has an answer.
+    #
+    # A class of its own because it is bookkeeping rather than transport: which
+    # delivery tag belongs to which payload, which +basic.return+ belongs to
+    # which message, and what each of the two sets bunny leaves behind means.
+    # Every method on {Transport} is about one message and a channel; this is
+    # the only thing in the file that has to hold a whole batch in its head.
+    #
+    # @api private
+    class BatchPublish
+      # @param messages [Array<Hash>] the keywords {Transport#publish} takes,
+      #   one hash per message
+      # @param returns [ReturnedMessages] the channel's returns, the same object
+      #   a single mandatory publish reads
+      def initialize(messages, returns)
+        @messages = messages
+        @returns = returns
+        @results = Array.new(messages.size)
+      end
+
+      # Publishes every message, waits once, and answers for each of them.
+      #
+      # @return [Array<String, PublishError>] one entry per message, in the
+      #   order they were given
+      def run(channel)
+        arm_returns(channel)
+        confirm_each(channel, publish_each(channel))
+        @results
+      end
+
+      private
+
+      # Gets ready to hear about the exchanges this batch publishes to
+      # mandatory. Nothing to do when none of them does.
+      def arm_returns(channel)
+        exchanges = @messages.filter_map { |message| message[:exchange] if message[:mandatory] }
+        @returns.arm_all(channel, exchanges.uniq) unless exchanges.empty?
+      end
+
+      # Hands every message to the channel, and remembers which delivery tag
+      # each one was given.
+      #
+      # The tag is read *after* the publish rather than before. bunny takes the
+      # next sequence number as part of +basic_publish+, so a publish refused
+      # before it got that far has consumed none, and a tag read in advance
+      # would belong to the message after it — which is how a batch ends up
+      # reporting the wrong message as the failed one.
+      def publish_each(channel)
+        tags = {}
+        @messages.each_with_index do |message, index|
+          channel.basic_publish(message[:body].to_s, message[:exchange],
+                                message[:routing_key], publish_options(message))
+          tags[channel.next_publish_seq_no - 1] = index
+        rescue StandardError => e
+          # One failure out of the batch rather than a reason to abandon the
+          # messages already on the wire. They are going to be confirmed anyway,
+          # and how many of them arrived is what the caller has to act on.
+          @results[index] = PublishError.new(
+            PublishFailure.not_published(message[:message_id], message[:exchange],
+                                         message[:routing_key], e.message)
+          )
+        end
+        tags
+      end
+
+      # Waits once for the whole batch, then reads each message's answer off
+      # the channel.
+      #
+      # bunny does not report a failed publish per message. It answers the wait
+      # with "were they all acked", leaves the delivery tags of the ones that
+      # were not in +nacked_set+, and leaves the ones nothing ever answered for
+      # in +unconfirmed_set+. Both are sets of tags rather than of messages,
+      # which is what +tags+ is for: without it a batch could say how many
+      # failed and not which, and its results would no longer line up with the
+      # payloads that produced them.
+      #
+      # +nacked_set+ is never emptied by bunny, so it can hold tags from
+      # publishes that finished long ago. Only this batch's tags are looked up
+      # in it, which is what keeps an older failure from being reported twice.
+      def confirm_each(channel, tags)
+        broke = wait_for_batch(channel)
+        nacked = channel.nacked_set.dup
+        silent = channel.unconfirmed_set.dup
+        returned = returns_for
+        tags.each do |tag, index|
+          unconfirmed = nacked.include?(tag) || silent.include?(tag)
+          @results[index] = answer_for(@messages[index], returned, unconfirmed, broke)
+        end
+      end
+
+      # What one message of a batch came to.
+      def answer_for(message, returned, unconfirmed, broke)
+        id = message[:message_id]
+        if unconfirmed
+          reason = PublishFailure.not_confirmed(id, message[:exchange], message[:routing_key])
+          # The wait's own failure is worth carrying: "the broker said no" and
+          # "the confirm never came" are the same missing acknowledgement and
+          # two different things to go and look at.
+          return PublishError.new(broke.nil? ? reason : "#{reason}: #{broke.message}")
+        end
+        return id unless (why = returned[id.to_s])
+
+        PublishError.new(
+          PublishFailure.not_routed(id, message[:exchange], message[:routing_key], why),
+          unroutable: true
+        )
+      end
+
+      # One wait for the batch, and the reason it ended early when it did.
+      #
+      # A wait that raises — a channel the broker took down, a confirm that
+      # never came inside bunny's continuation timeout — is not allowed out on
+      # its own. The messages it was waiting for still have to be answered one
+      # by one, and an exception here would lose every one of those answers,
+      # including the ones the broker had already acknowledged.
+      def wait_for_batch(channel)
+        channel.wait_for_confirms
+        nil
+      rescue StandardError => e
+        e
+      end
+
+      # Which of these messages the broker handed back, keyed by message id.
+      #
+      # A +basic.return+ carries the returned message's own properties, so a
+      # batch can ask which of its messages came back rather than only that one
+      # did.
+      def returns_for
+        ids = @messages.filter_map { |m| m[:message_id].to_s if m[:mandatory] }
+        return {} if ids.empty?
+
+        @returns.take_all.each_with_object({}) do |(id, reason), by_id|
+          named = charged_to(id, ids, by_id)
+          by_id[named] = reason if named
+        end
+      end
+
+      # A return whose id is not one of this batch's is charged to the first
+      # mandatory message not already accounted for. The message cannot be
+      # named — it went out without an id, or it belongs to somebody else's
+      # publish — but it reached no queue, and the count has to say so.
+      def charged_to(id, ids, already)
+        return id if ids.include?(id)
+
+        ids.find { |candidate| !already.key?(candidate) }
+      end
+
+      # The properties bunny publishes with, built from one batch message.
+      def publish_options(message)
+        { content_type: message[:content_type], message_id: message[:message_id],
+          reply_to: Wire.presence(message[:reply_to]),
+          mandatory: message[:mandatory] ? true : false,
+          headers: Wire.stringify(message[:headers] || {}),
+          persistent: message.fetch(:persistent, true) }
       end
     end
 
@@ -325,21 +567,45 @@ module AceMQ
           ok
         end
         unless confirmed
-          raise PublishError,
-                "the broker would not confirm message #{message_id} on exchange " \
-                "#{exchange.inspect} with key #{routing_key.inspect}"
+          raise PublishError, PublishFailure.not_confirmed(message_id, exchange, routing_key)
         end
         return message_id if returned.nil?
 
-        raise PublishError.new("the broker had nowhere to route message #{message_id} " \
-                               "published to exchange #{exchange.inspect} with key " \
-                               "#{routing_key.inspect}: #{returned}", unroutable: true)
+        raise PublishError.new(
+          PublishFailure.not_routed(message_id, exchange, routing_key, returned),
+          unroutable: true
+        )
       rescue PublishError
         raise
       rescue StandardError => e
         raise PublishError,
-              "cannot publish message #{message_id} to exchange #{exchange.inspect} " \
-              "with key #{routing_key.inspect}: #{e.message}"
+              PublishFailure.not_published(message_id, exchange, routing_key, e.message)
+      end
+
+      # Sends a batch, and waits for every confirm at the end.
+      #
+      # The difference from a loop around {#publish} is the whole point of the
+      # method: there, every message costs a round trip to the broker and back
+      # before the next one is written, because every message waits for its own
+      # confirm. Here every message is handed to the channel first and the wait
+      # happens once, for all of them — which is what publisher confirms were
+      # designed for and what makes a thousand-message publish take about as
+      # long as one.
+      #
+      # **It is not atomic**, and nothing in AMQP could make it so. A batch that
+      # half arrived is the ordinary outcome of a broker problem partway
+      # through, so each message gets its own answer rather than the batch
+      # getting one between them.
+      #
+      # @param messages [Array<Hash>] the keywords {#publish} takes, one hash
+      #   per message
+      # @return [Array<String, PublishError>] one entry per message, in the
+      #   order they were given: the id it went out with, or the failure it met
+      def publish_all(messages)
+        return [] if messages.empty?
+
+        batch = BatchPublish.new(messages, @returns)
+        publish_channel { |channel| batch.run(channel) }
       end
 
       # Delivers messages until the returned subscription is cancelled.
@@ -588,24 +854,9 @@ module AceMQ
         @pull_channel
       end
 
-      # Header and argument names go to the broker as strings, whatever they
-      # were written as here. A table keyed by :"x-message-ttl" is not the same
-      # table as one keyed by "x-message-ttl", and the broker only recognises
-      # the second — a symbol would silently become a queue argument nothing
-      # acts on.
-      def stringify(table)
-        return {} if table.nil? || table.empty?
-
-        table.to_h { |name, value| [name.to_s, value] }
-      end
-
-      # An empty property is absent rather than blank. A +reply-to+ carrying ""
-      # is a reply-to somebody has to write a special case for at the other end,
-      # which is the same rule {Envelope#to_headers} follows for its headers.
-      def presence(value)
-        text = value.to_s
-        text.empty? ? nil : text
-      end
+      # See {Wire}, which {BatchPublish} writes its properties with too.
+      def stringify(table) = Wire.stringify(table)
+      def presence(value) = Wire.presence(value)
     end
   end
 end
