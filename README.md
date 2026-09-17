@@ -940,36 +940,20 @@ holds a thread, a connection and a deadline, and a queue that backs up turns
 into a service that stops responding. Reach for it where a caller genuinely
 cannot go on without the answer, and publish an event otherwise.
 
-A requester is meant to be kept and reused — it holds a queue and a consumer,
-so one per request means a queue per request. Without `reply_to:` it generates
-an exclusive, transient, auto-deleting queue that goes away with the process; a
-reply queue that outlived its requester would collect answers nobody is waiting
-for. That one is classic, necessarily — the broker replicates nothing that
-disappears with its connection. A named `reply_to:` queue is an ordinary durable
-queue and gets the ordinary quorum default, so naming a queue a topology also
-declares is safe.
-
-The responder's block returns the answer rather than an `Ack`, and raising sends
-the failure back to the caller: somebody blocked on a reply should learn that it
-failed rather than wait out the timeout. Having answered, the request is settled
-rather than retried, because replying and then retrying would answer twice.
-
-A timeout says an answer did not arrive. It says nothing about whether the work
-was done, which is why a request that changes anything wants an idempotent
-responder.
+`call` blocks. A requester is meant to be kept and reused, because it holds a
+queue and a consumer. The responder's block returns the answer rather than an
+`Ack`, and raising sends the failure back to whoever is waiting. A timeout says
+an answer did not arrive and nothing at all about whether the work was done.
 
 A requester writes the reply address **twice**: in the `acemq-reply-to` header
-and in AMQP's own `reply-to` property, to the same queue. A responder reads the
-header first and falls back to the property. The rule is identical in Java, Go,
-.NET, Python and Ruby, and it is what makes a requester in any of them able to
-talk to a responder in any other — the two halves of the family used to write
-only one each, and the two halves could not answer each other. See
-[patterns](docs/patterns.md#the-reply-address-is-written-twice-and-read-either-way).
+and in AMQP's own `reply-to` property, to the same queue, and a responder reads
+the header first. The rule is identical in all five libraries, and it is what
+lets a requester in any of them be answered by a responder in any other.
 
-`acemq-reply-to` and `acemq-error` are application headers on purpose: the
-`x-acemq-` namespace belongs to the engine and is kept away from what a handler
-sees, so a responder could never read them if they lived there. A handler can
-read the native property as `message.reply_to`.
+[docs/request-reply.md](docs/request-reply.md) is the full account: the reply
+queue's shape and why it is the one classic queue this library declares, what a
+responder settles in each case, the queue you have to declare yourself, and which
+of Java's counters Ruby does not have.
 
 ### Replay
 
@@ -1290,19 +1274,18 @@ read the same stream independently and a new one can start from the beginning.
 Positions: `first`, `next` (the default), `last`, `at(offset)`, `since(time)`.
 
 **Acknowledging does not remove the message** — it advances this consumer's
-position, so restarting from `next` carries on rather than re-reading. Rejecting
-does not dead-letter it either, because there is nothing to remove it from: a
-message that cannot be handled has to be dealt with by the handler, and the
-stream moves on regardless. Nothing is lost, and nothing is retried for you.
-
-That is why `read_stream` uses `RetryPolicy.none` whatever the connection
-carries. A retry republishes, and republishing onto a stream appends a second
-copy rather than redelivering the first, so a projection reading it would see
-the message twice.
+position. Rejecting does not dead-letter it either, because there is nothing to
+remove it from. Nothing is lost, and nothing is retried for you, which is why
+`read_stream` uses `RetryPolicy.none` whatever the connection carries.
 
 Retention is unbounded by default, which for a stream means until the disk is
 full — a mistake an ordinary queue cannot make. Set at least one limit on
 anything that will run for long.
+
+[docs/streams.md](docs/streams.md) is the full account: how the retention
+arguments are rendered, why segment size is the granularity of all of them, how
+to resume from a saved offset, and everything in this library's failure handling
+that does not apply to a stream.
 
 ### SQL-backed stores
 
@@ -1417,11 +1400,18 @@ bundle exec bash .github/scripts/build-docs-site.sh   # needs pandoc
 open site/index.html
 ```
 
-The README rendered as the front page plus a YARD reference under `site/api/`,
-built from the comments in `lib/`. `docs.yml` publishes it to GitHub Pages on
-every push to `main` that touches the README, `lib/` or `docs/`. The script
-checks that every internal link resolves, because a published page pointing at a
-404 is a failure this site family has had before and nothing noticed.
+`docs/*.md` rendered by pandoc — the guide, the four
+[tutorials](docs/tutorials.md) and `docs/index.md` as the front page — plus a
+YARD reference under `site/api/`, built from the comments in `lib/`. The README
+is deliberately not part of it: a README is written for somebody looking at a
+repository and a documentation site is written for somebody trying to use the
+library, and one document cannot be both without being worse at each.
+
+`docs.yml` publishes it to GitHub Pages on every push to `main` that touches
+`docs/`, `lib/` or the build script. The script checks that **every internal link
+resolves and that no badge reached a rendered page**, and fails the build on
+either, because a published page pointing at a 404 is a failure this site family
+has had before and nothing noticed.
 
 ### Releasing
 
