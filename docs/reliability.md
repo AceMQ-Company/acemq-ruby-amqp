@@ -288,7 +288,7 @@ All four routes end in the same queue, and the counters keep them apart:
 three `outcome=dead_lettered`, and neither is also counted as a retry.
 `Ack.park` is not one of these routes at all: it ends in `{queue}.parked` and
 is tagged `outcome=parked`. See
-[observability](observability.md#the-outcome-counters-are-what-the-consumer-decided).
+[observability](observability.md#the-outcome-tag-is-what-the-consumer-decided).
 
 Acknowledging a failure looks wrong and is what makes it reliable: the message
 is already safely somewhere else, so the original is a copy that has been dealt

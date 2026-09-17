@@ -88,7 +88,7 @@ a queue of its own, on purpose.
 
 The library reads it from the same place. The five outcomes — `acked`, `retried`,
 `rejected`, `dead_lettered`, `parked` — are the
-[outcome counters](observability.md#the-outcome-counters-are-what-the-consumer-decided)
+[outcome counters](observability.md#the-outcome-tag-is-what-the-consumer-decided)
 and the values of the span's `messaging.acemq.outcome` attribute, so a
 counter, a span and an interceptor looking at one delivery all say the same
 word.

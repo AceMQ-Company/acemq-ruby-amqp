@@ -377,7 +377,7 @@ that went up are the same decision said twice, so
 `acemq.consume.total{outcome="dead_lettered"}` and the span's
 `messaging.acemq.outcome = "dead_lettered"` always name the same
 deliveries. See [the four outcome
-counters](#the-outcome-counters-are-what-the-consumer-decided).
+counters](#the-outcome-tag-is-what-the-consumer-decided).
 
 ### Events, not spans
 
