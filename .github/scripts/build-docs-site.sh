@@ -158,9 +158,14 @@ footer { max-width:50rem; margin:0 auto; padding:1.5rem 1.25rem 4rem;
 }
 CSS
 
-# Six top-level entries with the rest grouped underneath, rather than fifteen in
-# a row. Fifteen is legible at 1600px and wraps into three lines on a laptop, and
-# a navigation nobody can scan is one nobody uses.
+# A handful of top-level entries with the rest grouped underneath, rather than
+# seventeen in a row. Seventeen is legible at 1600px and wraps into three lines on
+# a laptop, and a navigation nobody can scan is one nobody uses.
+#
+# Getting started and Tutorials are both top-level and both accented: they are the
+# two doors somebody arriving at this site is looking for, and burying either one
+# in a menu is how a tutorial set goes unread. The four tutorials themselves are
+# reached from tutorials.html rather than from here.
 #
 # The groups open on hover and on focus, so the keyboard reaches them too, and
 # every link is a plain anchor — the menu needs no JavaScript and still works
@@ -169,6 +174,7 @@ NAV='<nav class="top">
   <span class="brand"><img src="assets/acemq.png" alt="AceMQ"> for Ruby</span>
   <a href="index.html">Overview</a>
   <a class="tutorials" href="getting-started.html">Getting started</a>
+  <a class="tutorials" href="tutorials.html">Tutorials</a>
 
   <div class="group">
     <button type="button" aria-haspopup="true">Guide</button>
@@ -180,6 +186,8 @@ NAV='<nav class="top">
       <a href="interceptors.html">Interceptors</a>
       <a href="testing.html">Testing without a broker</a>
       <a href="patterns.html">Patterns</a>
+      <a href="request-reply.html">Request and reply</a>
+      <a href="streams.html">Streams</a>
     </div>
   </div>
 

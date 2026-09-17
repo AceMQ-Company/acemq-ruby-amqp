@@ -43,7 +43,8 @@ mq.consume("orders.new") do |message|
 end
 ```
 
-[Getting started](getting-started.md) takes this apart line by line.
+[Getting started](getting-started.md) takes this apart line by line, and the
+[tutorials](tutorials.md) build a working service out of it in four steps.
 
 ## What it does for you
 
@@ -101,9 +102,9 @@ unverified mode included. See
 [development certificates](security.md#development-certificates).
 
 **The things everybody writes anyway, written once.** Idempotency, the outbox,
-request and reply, replay, ordering, consumer groups, routing slips, pipelines,
-schemas and streams. Required separately, because none of it is protocol. See
-[patterns](patterns.md).
+[request and reply](request-reply.md), replay, ordering, consumer groups, routing
+slips, pipelines, schemas and [streams](streams.md). Required separately, because
+none of it is protocol. See [patterns](patterns.md).
 
 ## What is identical, and what is not
 
@@ -172,23 +173,30 @@ has to happen before it is.
 
 ## Where to go next
 
-- [Getting started](getting-started.md) — the first message, explained
-- [Publishing](publishing.md) and [consuming](consuming.md)
-- [Exchanges, queues and bindings](topology.md)
-- [The envelope](envelope.md) — what travels with a message
-- [Codecs](serialization.md) — turning a payload into bytes and back, in JSON,
-  YAML, TOML, XML, Protobuf, Avro, text or raw bytes, and
-  [encrypted](serialization.md#encrypting-the-body) with AES-GCM
-- [Interceptors](interceptors.md) — the seam around publish and handle
-- [Security](security.md) — TLS, trust, credentials and
-  [development certificates](security.md#development-certificates) that cannot
-  reach production
-- [Retries, dead letters and shutdown](reliability.md)
-- [Patterns](patterns.md) — idempotency, outbox, request-reply, replay and nine more
-- [Metrics, tracing and health](observability.md) — including the
-  [OpenTelemetry adapter](observability.md#tracing)
-- [Testing without a broker](testing.md)
-- [API reference](api/index.html) — every public class and method, from YARD
+Start at one of two doors. [Getting started](getting-started.md) explains the
+first message line by line; the [tutorials](tutorials.md) are four sittings that
+end with a service that publishes, retries, deduplicates and says so.
+
+Then the guide:
+
+| | |
+|---|---|
+| [Getting started](getting-started.md) | the first message, explained |
+| [Tutorials](tutorials.md) | four, in order, each ending with something that runs |
+| [Publishing](publishing.md) | one message, [a batch](publishing.md#publishing-a-batch), and what a confirm does and does not promise |
+| [Consuming](consuming.md) | handlers, acks, prefetch and concurrency |
+| [Exchanges, queues and bindings](topology.md) | where a message can actually go, and why a queue is quorum |
+| [The envelope](envelope.md) | what travels with a message |
+| [Codecs](serialization.md) | JSON, YAML, TOML, XML, Protobuf, Avro, text or raw bytes, and [encrypted](serialization.md#encrypting-the-body) with AES-GCM |
+| [Interceptors](interceptors.md) | the seam around publish and handle |
+| [Security](security.md) | TLS, trust, credentials and [development certificates](security.md#development-certificates) that cannot reach production |
+| [Retries, dead letters and shutdown](reliability.md) | the retry ladder, the dead-letter queue and the parking lot |
+| [Patterns](patterns.md) | idempotency, outbox, replay, ordering and nine more |
+| [Request and reply](request-reply.md) | asking a question and blocking for the answer, and what that costs |
+| [Streams](streams.md) | a queue that keeps what it delivered, and the machinery that does not apply to one |
+| [Metrics, tracing and health](observability.md) | including the [OpenTelemetry adapter](observability.md#tracing) |
+| [Testing without a broker](testing.md) | the transport seam, and where it stops being enough |
+| [API reference](api/index.html) | every public class and method, from YARD |
 
 ## Status
 

@@ -355,6 +355,12 @@ Patterns.reply_address(message)   # => the header, or the property, or ""
 sees, so a responder could never read them if they lived there. A handler can
 also read the native property directly as `message.reply_to`.
 
+[Request and reply](request-reply.md) is the page-length version: why `call`
+blocks rather than handing back a future, what the generated reply queue is and
+why it is the one classic queue this library declares, what a responder's block
+returning rather than acking actually settles, and which of Java's four counters
+Ruby does not have.
+
 ## Replay
 
 ```ruby
@@ -926,6 +932,11 @@ consumer with no prefetch at all, and the error it gives does not explain why.
 Retention is **unbounded by default**, which for a stream means until the disk is
 full — a mistake an ordinary queue cannot make. Set at least one of `max_age:`
 or `max_bytes:` on anything that will run for long.
+
+[Streams](streams.md) is the page-length version: how retention arguments are
+rendered and why segment size is the granularity of all of them, how to resume
+from a saved offset, and the table of everything in this library's failure
+handling that does not apply to a stream at all.
 
 ## SQL-backed stores
 
