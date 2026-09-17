@@ -50,6 +50,48 @@ While the version is `0.x` the public API may change in any release.
   unaffected: a rung is checked by name before it is used, and asking the broker
   the same question twice would buy nothing.
 
+### Documentation
+
+- **Seven pages the documentation site was missing**, all of them in the
+  navigation: `docs/request-reply.md`, `docs/streams.md`, and four tutorials
+  behind `docs/tutorials.md` — your first message, surviving failure, never
+  processing twice, and seeing what happens.
+
+  The two guide pages are the ones Java and .NET have had and this site did not.
+  They are not translations of those. `request-reply.md` describes a `call` that
+  blocks a Ruby thread on a condition variable rather than handing back a future,
+  and says why there is no future to hand back; it describes a generated reply
+  queue that is exclusive and therefore dies with the connection, where Java needs
+  `x-expires`; and it says plainly that `Patterns.serve` does not declare the
+  request queue, which is the first thing anybody hits. `streams.md` carries the
+  broker's own refusals as they actually read, the offsets as they actually
+  arrive — `x-stream-offset` is an `Integer` counting from zero, in an ordinary
+  application header — and the checkpointing you have to write yourself, because
+  Ruby has no `last_handled_offset` and no `skip_failures`.
+
+  Both pages say where Ruby has less than the other libraries rather than leaving
+  it to be discovered: request and reply has none of Java's four counters, and
+  `Telemetry::OpenTelemetry#request` is the only place `answered` and `timed_out`
+  are ever written.
+
+  The tutorials are the same four subjects the Java, .NET, Go and Python sets
+  teach, in the same order, so tutorial 3 is about the same thing in every
+  language. Every sample in all six pages was run: the small ones against the
+  loopback transport the specs use, and every complete program against a real
+  RabbitMQ. Two did not survive that and are not in the published pages — a
+  dead-letter inspection loop that requeued into itself for ever, and a metrics
+  endpoint built on WEBrick, which has not been in the standard library since
+  Ruby 3.0.
+
+  Tutorial 1 publishes with `publish_all` and says what a batch does not bound;
+  tutorial 2 reaches `reader_schema:` by way of the one failure retrying cannot
+  fix.
+
+  `README.md` keeps its request-reply and streams sections as summaries and
+  points at the two pages for the rest, rather than holding a second copy that
+  drifts. Its description of the documentation site was also wrong: the README has
+  not been the site's front page for some time.
+
 ### Added
 
 - **`publish_all`, which sends a batch in one round trip instead of one per
