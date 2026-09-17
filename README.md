@@ -93,7 +93,22 @@ ProtobufCodec.new(Acme::Order)                             # application/x-proto
 AvroCodec.of(schema_json)                                  # avro/binary
 AvroCodec.registered(registry, subject: "order.placed",    # …/vnd.acemq.avro
                      schema: schema_json)
+AvroCodec.registered(registry, subject: "order.placed",    # resolved onto v1
+                     schema: v3_json, reader_schema: v1_json)
 ```
+
+`reader_schema:` is what makes schema evolution work on the read side: the codec
+publishes and registers `schema:`, and resolves every message it reads — written
+by whichever version — onto `reader_schema:`. A field the writer added that the
+reader has never heard of is skipped rather than shifting every field after it,
+and a field the reader expects that the writer never sent is filled in from the
+reader's own default. A change Avro cannot resolve — a field whose type changed,
+a field added without a default — raises `DecodeError` naming both schemas, and
+quoting the writer's in full because that one was registered by somebody else's
+process. Left out, `schema:` is both, which is what it has always been. Java's
+`registered(registry, readerSchema)`, .NET's `ReaderSchema`, Go's
+`avro.ReadAs` and Python's `reader_schema=` are the same thing under different
+names.
 
 Each reads more content types than it writes — `application/x-yaml`,
 `text/yaml`, `text/x-yaml` and `…+yaml` as well as `application/yaml` — because

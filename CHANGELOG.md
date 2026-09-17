@@ -52,6 +52,56 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`reader_schema:` on `AvroCodec.registered`, which is schema evolution on the
+  read side.** A registered Avro codec resolves every message onto the schema it
+  holds, and that schema used to be the same one it writes with, with no way to
+  separate them:
+
+  ```ruby
+  AvroCodec.registered(registry, subject: "order.placed",
+                       schema: v3_json, reader_schema: v1_json)
+  ```
+
+  The codec now publishes and registers `schema:`, while resolving every message
+  it reads — written by whichever version — onto `reader_schema:`. A field the
+  writer added that the reader has never heard of is skipped rather than
+  shifting every field after it, and a field the reader expects that the writer
+  never sent is filled in from the reader's own default: a value that was never
+  on the wire at all, which is the difference between resolving two schemas and
+  re-parsing one.
+
+  This matters because the two schemas were never the same thing and pretending
+  otherwise cost something real. A consumer that wanted to go on reading `v1`
+  had to pass `v1` as `schema:`, and then any message it published registered
+  `v1` as a new version of the subject and walked the subject backwards —
+  a consumer quietly rewriting the producer's history to stand still itself. The
+  choice was that or redeploying every consumer the same afternoon a producer
+  added a field, which is the thing Avro exists to avoid.
+
+  A change Avro cannot resolve — a field whose type changed, a field added
+  without a default — now raises `DecodeError` naming both schemas and quoting
+  the writer's in full, because the writer's is the one nobody has in front of
+  them: it was registered by another process, possibly in another language.
+  Before this, a resolution failure and a truncated body said much the same
+  thing, and they call for opposite responses: one message to park, against
+  every message from that producer until somebody changes a schema.
+
+  **Nothing existing changes.** Left out, `schema:` goes on being both, so every
+  call written before this reads and writes exactly what it did. The wire format
+  is untouched — same framing byte, same four bytes of identifier, same body,
+  and the cross-language fixtures in `spec/fixtures/codec-samples.json` still
+  match Java's and Go's bytes exactly. A reader schema on a fixed-schema codec
+  raises `ArgumentError` rather than being accepted and ignored, since there is
+  no writer's schema there to resolve against. `avro` remains an optional gem,
+  required lazily and named when it is missing.
+
+  **If you have a consumer pinned to an old schema**, move that schema from
+  `schema:` to `reader_schema:` and put the version you publish in `schema:`.
+  Ruby was the last library without this. Java spells it
+  `registered(registry, readerSchema)`, .NET `ReaderSchema`, Go
+  `avro.ReadAs(schema)` and Python `reader_schema=`, which is the spelling
+  followed here.
+
 - **`mandatory:` on `publish`, and the `unroutable` outcome behind it.** A
   confirm says the broker has the message; it does not say the message reached a
   queue. An exchange with no matching binding, a typo in a routing key, a

@@ -55,6 +55,33 @@ module AceMQ
     #   registry = Patterns::InMemorySchemaRegistry.new
     #   codec = AvroCodec.registered(registry, subject: "order.placed", schema: schema_json)
     #
+    # == Reading against a schema of your own
+    #
+    # A registered codec resolves every message onto the schema it holds, and by
+    # default that is the same schema it writes with. Where the two want to be
+    # different, +reader_schema:+ says so:
+    #
+    #   codec = AvroCodec.registered(registry, subject: "order.placed",
+    #                                schema: v3_json, reader_schema: v1_json)
+    #
+    # The codec then publishes +v3+ and registers +v3+ under the subject, while
+    # every message it reads — whatever version wrote it — is resolved onto
+    # +v1+. That is the shape a consumer usually wants, and it is not the same
+    # as passing +v1+ as +schema:+: a codec that both reads and publishes would
+    # then register +v1+ as a new version of the subject and walk the subject
+    # backwards. Every library has this: Java spells it
+    # +registered(registry, readerSchema)+, .NET +ReaderSchema+, Go
+    # +avro.ReadAs(schema)+ and Python +reader_schema=+, which is the spelling
+    # followed here.
+    #
+    # What resolution buys is Avro's, not this library's: a field the writer
+    # added that the reader has never heard of is skipped rather than shifting
+    # every field after it, and a field the reader expects that the writer never
+    # sent is filled in from the reader's own default. A change Avro cannot
+    # resolve — a field whose type changed, a field added without a default —
+    # raises {DecodeError} naming both schemas, because no reader schema will
+    # make those bytes readable and the sooner that is said the better.
+    #
     # == Why each mode claims only its own content type
     #
     # The two framings are not interchangeable and the difference is invisible
@@ -100,26 +127,42 @@ module AceMQ
         #   resolved; {Patterns::InMemorySchemaRegistry} is one
         # @param subject [String] groups the versions of one message type,
         #   conventionally the type itself: "order.placed"
-        # @param schema [String, Hash] the schema this consumer was written
-        #   against, and the one it writes with. Every message is resolved onto
-        #   it from whatever the writer used, which is what schema evolution
-        #   actually needs: a field the reader does not know is skipped, and one
-        #   the writer omitted is filled in from the reader's default.
+        # @param schema [String, Hash] the schema this codec writes with, and
+        #   the one it registers under +subject+. Also what it reads against,
+        #   unless +reader_schema+ says otherwise.
+        # @param reader_schema [String, Hash, nil] the schema this consumer was
+        #   written against. Every message is resolved onto it from whatever the
+        #   writer used, which is what schema evolution actually needs: a field
+        #   the reader does not know is skipped, and one the writer omitted is
+        #   filled in from the reader's default. Left out, +schema+ serves as
+        #   both, which is what this did before the keyword existed.
         # @return [AvroCodec]
-        def registered(registry, subject:, schema:)
+        def registered(registry, subject:, schema:, reader_schema: nil)
           unless registry.respond_to?(:register) && registry.respond_to?(:by_id)
             raise ArgumentError,
                   "#{registry.inspect} is not a schema registry: it needs register and by_id"
           end
 
-          new(schema: schema, registry: registry, subject: subject)
+          new(schema: schema, registry: registry, subject: subject,
+              reader_schema: reader_schema)
         end
       end
 
       # @api private
-      def initialize(schema:, registry: nil, subject: nil)
+      def initialize(schema:, registry: nil, subject: nil, reader_schema: nil)
         load_runtime!
         @schema = parse(schema)
+        # Only a registered codec learns the writer's schema per message, so
+        # only a registered codec has two schemas to resolve. A fixed one reads
+        # what it writes by definition, and a reader schema there would be a
+        # setting that quietly did nothing.
+        if reader_schema && registry.nil?
+          raise ArgumentError,
+                "a reader schema only means something with a registry, which is where the " \
+                "writer's schema comes from. Use registered(registry, ...) to read against it."
+        end
+
+        @reader_schema = reader_schema.nil? ? @schema : parse(reader_schema)
         @registry = registry
         @subject = subject
         @lock = Mutex.new
@@ -152,18 +195,23 @@ module AceMQ
       # @param body [String]
       # @param content_type [String, nil] what the sender said these bytes are,
       #   which is the only reliable way to tell the two framings apart
-      # @return [Object] the datum, resolved onto this codec's schema
-      # @raise [DecodeError] when the bytes are not Avro this codec can read
+      # @return [Object] the datum, resolved onto this codec's reader schema
+      # @raise [DecodeError] when the bytes are not Avro this codec can read, or
+      #   when the writer's schema cannot be resolved onto the reader's
       def decode(body, content_type = nil)
         bytes = body.to_s.b
         writer_schema, offset = registered? ? framed(bytes) : unframed(bytes, content_type)
-        reader = Avro::IO::DatumReader.new(writer_schema, @schema)
+        # Both schemas go to Avro, which is the whole point: it resolves the
+        # difference rather than trusting that there is none.
+        reader = Avro::IO::DatumReader.new(writer_schema, @reader_schema)
         reader.read(Avro::IO::BinaryDecoder.new(StringIO.new(bytes[offset..].to_s)))
       rescue DecodeError
         raise
       rescue StandardError => e
+        raise DecodeError, unresolvable(writer_schema, e) if unresolvable?(writer_schema, e)
+
         raise DecodeError,
-              "this message is not Avro that reads as #{schema_name}: #{e.message}"
+              "this message is not Avro that reads as #{reader_schema_name}: #{e.message}"
       end
 
       # Accepts the Avro content types, and only the framing this codec writes.
@@ -222,8 +270,61 @@ module AceMQ
       # A record schema has a full name; a schema that is a bare +string+ or an
       # array of them has only a type, and an error message still has to say
       # what was being read.
-      def schema_name
-        @schema.respond_to?(:fullname) ? @schema.fullname : @schema.type_sym
+      def name_of(schema)
+        return "an unknown schema" if schema.nil?
+
+        schema.respond_to?(:fullname) ? schema.fullname : schema.type_sym
+      end
+
+      def schema_name = name_of(@schema)
+
+      def reader_schema_name = name_of(@reader_schema)
+
+      # Whether a failure inside Avro's reader is the two schemas disagreeing
+      # rather than the bytes being wrong.
+      #
+      # Asked only once something has already gone wrong, so the compatibility
+      # check is off the ordinary path entirely and nothing that decodes today
+      # stops decoding because a checker was stricter than the reader. Asked at
+      # all because the difference is the whole of what the reader has to do
+      # next: bad bytes are one message to park, and an incompatible schema is
+      # every message from that producer until somebody changes a schema.
+      #
+      # +SchemaMatchException+ is the clear case. The rest are not: a reader
+      # field the writer never sent and that has no default fails as a plain
+      # +Avro::AvroError+, indistinguishable by class from a truncated body, so
+      # the schemas themselves are asked rather than the message text.
+      #
+      # The two are compared as text rather than with +==+, which two record
+      # schemas of the same full name satisfy however differently their fields
+      # are declared — exactly the pair being asked about here.
+      def unresolvable?(writer_schema, cause)
+        return false if writer_schema.nil? || writer_schema.to_s == @reader_schema.to_s
+        return true if cause.is_a?(Avro::IO::SchemaMatchException)
+
+        !Avro::SchemaCompatibility.can_read?(writer_schema, @reader_schema)
+      rescue StandardError
+        # A compatibility checker that cannot answer is not a reason to lose the
+        # error that got us here.
+        false
+      end
+
+      # What to say when Avro will not resolve one schema onto the other.
+      #
+      # Both schemas are named, and the writer's is quoted in full, because the
+      # two are usually two versions of one type and the full name alone names
+      # them identically. The reader's is not quoted: it is in the caller's own
+      # code, and it is the writer's — a version registered by some other
+      # process, possibly some other language — that nobody has in front of
+      # them.
+      def unresolvable(writer_schema, cause)
+        # Avro's own messages end with a full stop about half the time.
+        said = cause.message.to_s.sub(/\s*\.?\z/, "")
+        "this message was written against #{name_of(writer_schema)} and this codec reads " \
+          "#{reader_schema_name}, and Avro cannot resolve one onto the other: #{said}. " \
+          "That is an incompatible change rather than an evolution — a field whose type " \
+          "changed, or one added without a default — and no reader schema makes those bytes " \
+          "readable. The writer's schema was #{writer_schema}"
       end
 
       # The writer's schema for a message that carries an identifier.

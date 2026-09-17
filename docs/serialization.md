@@ -83,6 +83,39 @@ AvroCodec.registered(registry, subject: "order.placed",     # …vnd.acemq.avro
                      schema: schema_json)
 ```
 
+**`reader_schema:` is where that resolution actually happens.** A registered
+codec resolves every message onto the schema it holds, and by default that is
+the same schema it writes with. Where the two want to be different — a consumer
+still written against `v1` in a process that publishes `v3` — say so:
+
+```ruby
+AvroCodec.registered(registry, subject: "order.placed",
+                     schema: v3_json, reader_schema: v1_json)
+```
+
+The codec then publishes `v3` and registers `v3` under the subject, while every
+message it reads is resolved onto `v1` from whatever version wrote it. That is
+not the same as passing `v1` as `schema:`: a codec that both reads and publishes
+would then register `v1` as a new version of the subject and walk the subject
+backwards.
+
+What resolution buys is Avro's rather than this library's. A field the writer
+added that the reader has never heard of is skipped, rather than shifting every
+field after it and handing back a record whose every value is wrong. A field the
+reader expects that the writer never sent is filled in from the reader's own
+default — a value that was never on the wire at all, which is the difference
+between resolving two schemas and re-parsing one. A change Avro cannot resolve —
+a field whose type changed, a field added without a default — raises
+`DecodeError`, which is fatal, naming both schemas and quoting the writer's in
+full, because that is the one nobody has in front of them: it was registered by
+another process, possibly in another language. A reader schema on a
+fixed-schema codec is refused rather than accepted and ignored, because there is
+no writer's schema there to resolve against.
+
+Every library has this. Java spells it `registered(registry, readerSchema)`,
+.NET `ReaderSchema`, Go `avro.ReadAs(schema)` and Python `reader_schema=`, which
+is the spelling followed here.
+
 `registered` frames each message with one zero byte, four bytes of schema
 identifier big-endian, then the body — Confluent's layout, so messages written
 here are read by their clients and by the Java, Go and .NET libraries, and the
