@@ -235,6 +235,39 @@ While the version is `0.x` the public API may change in any release.
 
 ### Documentation
 
+- **When an Avro message is resolved onto a reader schema, pinned by a fixture
+  all five libraries share.** `docs/serialization.md` has a `## Schema
+  resolution` section, worded identically in the Java, .NET, Go, Python and Ruby
+  pages down to its last two paragraphs, which are this library's own.
+
+  There is one rule and it is the same everywhere: **resolution happens when the
+  library has a reader schema to resolve onto.** What differs is where a reader
+  schema comes from, and so how often there is one — a Go struct carries none
+  until the caller passes one, a Java `GenericRecord` asks for nothing in
+  particular, and .NET, Python and Ruby build the codec around a schema and
+  therefore always hold one. That is a difference in what each language can
+  know, not a disagreement about Avro, and it is documented rather than
+  flattened.
+
+  `spec/fixtures/avro-resolution-fixtures.json` carries the bytes: two messages,
+  the schema that wrote each, the schema a reader declares, and what the message
+  decodes to under **both** behaviours, as `resolved` and `writerShape`. It is
+  the Java library's file, byte for byte, and
+  `acemq-amqp-libraries/scripts/check-fixtures.sh` fails if any copy drifts.
+
+  `spec/codec_avro_resolution_spec.rb` asserts both columns. Ruby is in
+  `resolved` — `registered` defaults `reader_schema:` to the schema it was given,
+  so there is always one — and reaches `writerShape` by passing the writer's own
+  schema as `reader_schema:`, which is the only way from here to a decode that
+  reconciles nothing. The case worth knowing is a field the writer removed that
+  the reader declares with a default: resolved, it arrives carrying that default;
+  unresolved, the key is simply absent. The fixture defaults it to `"GBP"` rather
+  than `""` on purpose, since a default that is also the zero value passes
+  whether resolution happened or not.
+
+  Nothing about the codec changed, and nothing about the wire: resolution is a
+  reader-side decision, and both bodies were written by a plain registered codec.
+
 - **Stream prefetch is a per-library choice, and `docs/streams.md` now says so
   outright.** The number is unchanged: `Patterns::DEFAULT_STREAM_PREFETCH` is
   still 10, as it is in Go and Python, where Java and .NET use 100.

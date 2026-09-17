@@ -191,6 +191,78 @@ right value while recording that a YAML message had arrived — the sort of wron
 found much later. Protobuf and Avro are worse: their bytes are not recognisable,
 and they parse into nonsense more often than they fail.
 
+## Schema resolution
+
+Handed the writer's schema and the reader's, Avro reconciles the two: a field the
+writer added that the reader does not declare is skipped, and a field the writer
+omitted is filled in from the reader's default. Handed only the writer's, there is
+nothing to reconcile, and the record arrives in the shape it was written.
+
+So there is one rule, and it is the same rule in all five AceMQ libraries:
+
+> **Resolution happens when the library has a reader schema to resolve onto.**
+
+What differs between the languages is where a reader schema comes from, and
+therefore how often there is one. Nothing about the bytes differs.
+
+| Library | Resolves | Where its reader schema comes from |
+|---|---|---|
+| Go | When asked | A Go struct carries no schema, so there is nothing to resolve onto until the caller passes `avro.ReaderSchema(...)` |
+| Java | Sometimes | A generated `SpecificRecord` class carries a schema of its own, and `AvroCodec.registered(registry, readerSchema)` is handed one. A `GenericRecord` through a plain registry codec asks for nothing in particular, so the reader schema is the writer's and nothing resolves |
+| .NET | Always | The codec is constructed with a schema |
+| Python | Always | The codec is constructed with a schema |
+| Ruby | Always | The codec is constructed with a schema |
+
+This is not an inconsistency waiting to be flattened. A library that resolves and
+a library that does not are both right about the same bytes — they are answering
+different questions, because only one of them was told what the reader expects.
+
+**The case that bites is a field the writer removed that the reader declares with
+a default.** With resolution, the field arrives carrying that default. Without it,
+the field is simply absent: a missing key, whatever the language calls one. A
+consumer written against the reader schema then reads a value that was never on
+the wire, or fails to read a field it is sure it declared, and which of those
+happens is decided entirely by whether a reader schema was in play.
+
+The other direction is the one people expect to be dangerous and is not. A field
+the writer added that the reader does not declare is skipped under resolution and
+present without it, and either way the fields the reader does declare come back
+correct — the unknown field does not shift the ones after it.
+
+Both cases are pinned, with the bytes, in
+`spec/fixtures/avro-resolution-fixtures.json`, which every AceMQ library carries
+a copy of. It records the decoded value under each behaviour, as `resolved` and
+`writerShape`, and which library lands on which.
+
+### Asking for resolution in Ruby
+
+```ruby
+# Resolves: reader_schema: defaults to the schema given, so this codec both
+# writes and reads order.placed v3, and resolves anything older onto it.
+codec = AvroCodec.registered(registry, subject: "order.placed", schema: v3_json)
+
+# Resolves onto a schema of its own: publishes and registers v3, reads
+# everything — whatever version wrote it — as v1.
+consumer = AvroCodec.registered(registry, subject: "order.placed",
+                                schema: v3_json, reader_schema: v1_json)
+```
+
+Being able to redeploy a producer without its consumers is the whole point of
+putting a schema id on the front of the message, and resolution is the half of
+that which happens on the read side. Ruby is in the `resolved` column either way,
+so there is nothing to reach for: leaving `reader_schema:` out means the schema
+given is both the one written and the one read, and a registry codec here can
+never be left without one.
+
+One edge worth knowing before you meet it: `reader_schema:` on a **fixed-schema**
+codec — `AvroCodec.of(schema_json)` — is refused with an `ArgumentError` rather
+than accepted and ignored. A fixed-schema codec reads what it writes by
+definition, since nothing in those bytes says what wrote them, so there is no
+writer's schema for a reader schema to resolve against and the setting would
+quietly do nothing. The `writerShape` column is still reachable from Ruby, by
+passing the writer's own schema as `reader_schema:`; `spec/codec_avro_resolution_spec.rb`
+asserts both columns against the shared fixture that way.
+
 ## Proving it, rather than asserting it
 
 A codec that encodes and decodes its own output proves nothing about reading
