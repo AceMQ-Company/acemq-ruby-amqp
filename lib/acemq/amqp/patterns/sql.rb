@@ -104,6 +104,44 @@ module AceMQ
           # @return [String] the instant as fixed-width UTC text
           def at_utc(time) = time.utc.strftime(TIMESTAMP)
 
+          # An identifier as a database will compare it.
+          #
+          # Two Ruby strings that are +==+ have to be one key. Under the sqlite3
+          # gem they are not: a String tagged +ASCII-8BIT+ is bound with
+          # +sqlite3_bind_blob+ and everything else with +sqlite3_bind_text+,
+          # and SQLite never considers a blob equal to a text value however
+          # identical the bytes. +typeof()+ is the only way to see the
+          # difference — a blob key prints as the same characters as a text one,
+          # so +SELECT *+ shows a row that +WHERE message_id = ?+ then cannot
+          # find.
+          #
+          # That is not a theoretical encoding: **every string bunny hands back
+          # off the wire is ASCII-8BIT**, message ids included, so a key taken
+          # from a delivery is a blob key and a key typed into a console or read
+          # from anywhere else is a text one. Without this, the two are different
+          # rows in a table whose primary key is supposed to make that
+          # impossible.
+          #
+          # +force_encoding+ rather than +encode+: this re-tags and does not
+          # transcode, so the bytes reaching the column are the bytes handed in.
+          # A key that is not valid UTF-8 is still bound as text and SQLite
+          # compares text byte by byte, so it still matches itself. Duplicated
+          # only when the tag has to change, because +to_s+ on a String is that
+          # same String and +force_encoding+ would otherwise edit the caller's.
+          #
+          # PostgreSQL has never had the problem — pg binds by the connection's
+          # client encoding rather than by the Ruby tag — and this is harmless
+          # there, which is why it lives here rather than in one driver's wrapper.
+          #
+          # @param value [Object]
+          # @return [String]
+          def key(value)
+            text = value.to_s
+            return text if text.encoding == Encoding::UTF_8
+
+            text.dup.force_encoding(Encoding::UTF_8)
+          end
+
           # @return [Time] whatever a driver handed back for a timestamp column
           def time(value)
             return value if value.is_a?(Time)

@@ -183,7 +183,13 @@ module AceMQ
           body, encoding = encoded(record.body)
           sql = "INSERT INTO #{@table} (#{COLUMNS}, published_at, locked_by, locked_until) " \
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)"
-          run_unless_taken(sql, [record.id.to_s, record.exchange.to_s, record.routing_key.to_s,
+          # SQL.key rather than to_s: an id that came off the wire is
+          # ASCII-8BIT, sqlite3 binds that as a blob, and a blob never matches
+          # the text the same id was written as. Here that would turn "adding
+          # the same record twice is not an error" into two rows and two
+          # published messages. See SQL.key.
+          run_unless_taken(sql, [SQL.key(record.id), record.exchange.to_s,
+                                 record.routing_key.to_s,
                                  body, encoding, record.content_type.to_s,
                                  JSON.generate(record.headers || {}),
                                  SQL.at_utc(record.created_at || Time.now), 0, nil],
@@ -221,7 +227,7 @@ module AceMQ
         # reading the table during an incident.
         def mark_published(id)
           run("UPDATE #{@table} SET published_at = ?, locked_by = NULL, locked_until = NULL " \
-              "WHERE id = ?", [SQL.at_utc(Time.now), id.to_s])
+              "WHERE id = ?", [SQL.at_utc(Time.now), SQL.key(id)])
           nil
         end
 
@@ -234,7 +240,7 @@ module AceMQ
         def mark_failed(id, reason)
           run("UPDATE #{@table} SET attempts = attempts + 1, last_error = ?, " \
               "locked_by = NULL, locked_until = NULL WHERE id = ?",
-              [truncate(reason), id.to_s])
+              [truncate(reason), SQL.key(id)])
           nil
         rescue StandardError
           # Swallowed on purpose. This is already the failure path, and a relay

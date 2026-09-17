@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require "fileutils"
+require "sqlite3"
 require "tmpdir"
 
 require "acemq/amqp"
@@ -719,6 +720,49 @@ RSpec.describe "against a real broker", :integration do
       expect(body.bytes.first(3)).to eq([0xAC, 0x01, 0x00])
       expect(AceMQ::AMQP::Patterns::ClaimCheckCodec.key_of(body)).to be_nil
       expect(Dir.children(directory)).to be_empty
+    end
+  end
+
+  # The anomaly this describe block exists for, reproduced through the thing
+  # that produced it. Nothing but a real broker can: the message id has to come
+  # back off the wire through bunny, which hands every string over as
+  # ASCII-8BIT, and the sqlite3 gem binds an ASCII-8BIT String as a blob. A blob
+  # never matches the text the same id was written as, so the store's own
+  # parameterised SELECT could not find a row `SELECT *` showed plainly.
+  describe "an idempotency store keyed by an id off the wire" do
+    let(:queue) { queue_named("dedupe") }
+    let(:db) { SQLite3::Database.new(":memory:") }
+    let(:store) { AceMQ::AMQP::Patterns::SQLIdempotencyStore.new(connection: db) }
+
+    before do
+      scrub(queue)
+      AceMQ::AMQP::Topology.new.queue(queue).apply(mq)
+      store.create_schema
+    end
+
+    after do
+      scrub(queue)
+      db.close
+    end
+
+    it "answers for a message it really did handle" do
+      handled = []
+      mq.consume(queue, &AceMQ::AMQP::Patterns.idempotent(store) do |message|
+        handled << message.id
+        AceMQ::AMQP::Ack.accept
+      end)
+
+      sent = mq.publish({ "order_id" => "A-1" }, to: queue, type: "order.placed.v2")
+      # The same message three times, as a redelivery storm delivers it.
+      2.times { mq.publish({ "order_id" => "A-1" }, to: queue, envelope: sent) }
+
+      expect(wait_for { handled.size == 1 && store.size == 1 }).to be(true)
+      # Deduplication was always right, because every delivery arrived with the
+      # same encoding. What was wrong was asking the store anything from
+      # anywhere else — here, with the id the publish handed back.
+      expect(store.confirmed?(sent.id)).to be(true)
+      expect(db.execute("SELECT typeof(message_id) FROM acemq_idempotency").flatten)
+        .to eq(["text"])
     end
   end
 

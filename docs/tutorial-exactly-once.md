@@ -162,6 +162,13 @@ somebody working on it".
 `Patterns.idempotent` calls `confirm` when the store answers to it, and does not
 when it does not — which is what lets a two-method store stay a two-method store.
 
+`confirmed?` answers for the key you give it, and the key is the message id
+whatever encoding you happen to be holding it in — a delivery hands one over as
+`ASCII-8BIT`, a console or a test hands over UTF-8, and the store treats them as
+the one key they are. That took a fix; see
+[the connection is yours](patterns.md#the-connection-is-yours) for what SQLite
+does with a binary string and why it mattered.
+
 ## Step 4 — The other duplicate, and the harder one
 
 Deduplicating the *consumer* leaves the *publisher*:

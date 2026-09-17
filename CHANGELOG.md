@@ -132,6 +132,65 @@ While the version is `0.x` the public API may change in any release.
   as `Requester.unmatched()`. It is dropped silently here.
   `acemq.request.total{outcome="timed_out"}` is most of that signal now.
 
+### Fixed
+
+- **`SQLIdempotencyStore` could answer "not seen" for a message it had seen, and
+  could let the same message be handled twice.** Both from one cause, and it is
+  worth reading in full because the second half is the failure the class exists
+  to prevent.
+
+  Every string bunny hands a consumer off the wire is tagged `ASCII-8BIT` —
+  message ids included. The sqlite3 gem binds an `ASCII-8BIT` String with
+  `sqlite3_bind_blob` and everything else with `sqlite3_bind_text`, and **SQLite
+  never considers a blob equal to a text value**, however identical the bytes.
+  Nothing in a printed row shows it:
+
+  ```ruby
+  db.execute("SELECT message_id, state FROM acemq_idempotency")
+  # => [["m-1", "CONFIRMED"]]          looks like text
+  db.execute("SELECT typeof(message_id) FROM acemq_idempotency")
+  # => [["blob"]]                      is not
+  ```
+
+  So a key that arrived on a delivery was written as a blob, and the same key
+  typed into a console, read from a `publish` return value or handed over by a
+  test was a text one. `confirmed?("m-1")` ran its own parameterised
+  `SELECT … WHERE message_id = ? AND state = ?`, matched nothing, and answered
+  **false** for a row sitting there `CONFIRMED` with a future `expires_at`.
+
+  The half that costs money is `first_time?`. Two encodings of one identifier
+  are two rows in a table whose primary key is supposed to make that impossible,
+  so the insert succeeded twice and **the handler ran twice** — a charge made
+  twice by the guard that exists to stop exactly that. It needed the same id to
+  reach the store from two places, which is why it had not been seen: an
+  ordinary consumer takes every delivery from the same place and stays
+  consistently wrong.
+
+  Keys now go through `SQL.key`, which re-tags to UTF-8 rather than transcoding,
+  so the bytes reaching the column are the bytes handed in and a key that is not
+  valid UTF-8 still matches itself. Every statement in `SQLIdempotencyStore` uses
+  it, and so does `SQLOutboxStore`, where the same trap turned "adding the same
+  record twice is not an error" into two rows and two published messages.
+  PostgreSQL never had the problem — `pg` binds by the connection's client
+  encoding rather than by the Ruby tag — so nothing changes there.
+
+  **If you are running a SQLite-backed store**, rows already written with blob
+  keys will not be matched by the text lookups after this change. For the
+  idempotency table that self-corrects within `retention` (a day by default) at a
+  cost of at most one extra handling per key, and `purge_expired` clears the rest.
+  For an outbox, unpublished rows with blob ids are still selected, claimed and
+  published normally — the id is only ever compared on the way back in, and
+  `mark_published` now normalises it the same way. `SELECT typeof(id)` finds any
+  that are left.
+
+  Three other explanations were tested and ruled out: sharing one
+  `SQLite3::Database` across a bunny consumer thread and the main thread (eight
+  threads on one handle, no errors, every key found); a reading thread inside a
+  transaction that began before the write committed; and the `expires_at`
+  comparison across a timezone, which is an instant against an instant and holds
+  at `TZ=Pacific/Auckland`. The consumer thread in the original sighting was a
+  coincidence — it is the only path on which the id came off the wire.
+
 ### Changed
 
 - **A message that cannot be set aside is now rejected to the broker rather than

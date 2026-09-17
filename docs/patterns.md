@@ -987,6 +987,29 @@ database orders instants the way instants are ordered. There is no timestamp
 type spelled the same way in SQLite and PostgreSQL and no portable way to bind a
 `Time`; this is understood by both.
 
+**Keys are normalised to UTF-8 before they are bound**, and that is not
+tidiness. Every string bunny hands a consumer off the wire is `ASCII-8BIT` —
+message ids included — and the sqlite3 gem binds an `ASCII-8BIT` string with
+`sqlite3_bind_blob` and everything else with `sqlite3_bind_text`. **SQLite never
+considers a blob equal to a text value**, however identical the bytes, and
+nothing in a printed row shows the difference:
+
+```ruby
+db.execute("SELECT message_id, state FROM acemq_idempotency")
+# => [["m-1", "CONFIRMED"]]          looks like text
+db.execute("SELECT typeof(message_id) FROM acemq_idempotency")
+# => [["blob"]]                      is not
+```
+
+Untreated, an id from a delivery and the same id from anywhere else were two
+different keys: `confirmed?` answered "not seen" for a message the store had
+demonstrably seen, and — worse — `first_time?` answered true twice for one
+identifier in a table whose primary key exists to make that impossible. It is
+`SQL.key` now, at every statement in every store, and it re-tags rather than
+transcodes, so the bytes reaching the column are the bytes handed in. PostgreSQL
+never had the problem: `pg` binds by the connection's client encoding rather than
+by the Ruby tag.
+
 **What has actually been run.** SQLite, by the ordinary specs — no environment
 needed, the sqlite3 gem is a development dependency. PostgreSQL, by
 `spec/integration/postgres_spec.rb`, which runs when `ACEMQ_TEST_POSTGRES` names

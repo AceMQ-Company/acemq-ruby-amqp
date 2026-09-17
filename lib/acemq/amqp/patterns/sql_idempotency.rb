@@ -166,7 +166,14 @@ module AceMQ
         # @param key [String]
         # @return [Boolean] true for the caller that may do the work
         def first_time?(key)
-          key = key.to_s
+          # Every key that reaches a statement goes through SQL.key, and it is
+          # not tidiness: a message id off the wire is ASCII-8BIT, sqlite3 binds
+          # that as a blob, and SQLite never matches a blob against a text
+          # value. Two strings that are == in Ruby were two rows in a table
+          # whose primary key exists to make that impossible — so the same
+          # message could be handled twice, which is the one failure this class
+          # exists to prevent.
+          key = SQL.key(key)
           now = Time.now.utc
           return true if take(key, now)
 
@@ -184,7 +191,7 @@ module AceMQ
         # lease would simply expire and the next duplicate would be handled
         # again, which is the whole failure a shared store is for.
         def confirm(key)
-          key = key.to_s
+          key = SQL.key(key)
           now = Time.now.utc
           updated = run(
             "UPDATE #{@table} SET state = ?, claimed_by = NULL, recorded_at = ?, " \
@@ -206,14 +213,14 @@ module AceMQ
         # confirmation would undo it.
         def forget(key)
           run("DELETE FROM #{@table} WHERE message_id = ? AND state = ? AND claimed_by = ?",
-              [key.to_s, CLAIMED, @worker])
+              [SQL.key(key), CLAIMED, @worker])
           nil
         end
 
         # Whether a key is recorded as done and still within retention.
         def confirmed?(key)
           rows = run("SELECT expires_at FROM #{@table} WHERE message_id = ? AND state = ?",
-                     [key.to_s, CONFIRMED]).rows
+                     [SQL.key(key), CONFIRMED]).rows
           return false if rows.empty?
 
           # An expired row is answered as false rather than deleted: a read that

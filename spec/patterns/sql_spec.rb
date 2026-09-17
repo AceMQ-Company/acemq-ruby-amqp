@@ -44,6 +44,25 @@ RSpec.describe "the database-backed stores" do
                                                 exchange: "orders-events", **fields)
     end
 
+    it "counts a record added twice as one, whichever encoding its id arrived in" do
+      # "Adding the same record twice is not an error, because the caller may be
+      # retrying its own transaction, but it must not become two messages." An
+      # id off the wire is ASCII-8BIT, sqlite3 binds that as a blob, and a blob
+      # never collides with the text the same id was written as — so the primary
+      # key let it through and the relay published the message twice.
+      record = recorded
+      again = AceMQ::AMQP::Patterns::OutboxRecord.new(
+        id: record.id.dup.force_encoding(Encoding::ASCII_8BIT), exchange: record.exchange,
+        routing_key: record.routing_key, body: record.body,
+        content_type: record.content_type, headers: record.headers,
+        created_at: record.created_at
+      )
+      store.add(record)
+      store.add(again)
+
+      expect(store.pending_count).to eq(1)
+    end
+
     describe "the guarantee the pattern exists for" do
       it "writes the message inside the caller's transaction" do
         # Visible to the connection that wrote it, before any commit. If it were
@@ -375,6 +394,69 @@ RSpec.describe "the database-backed stores" do
         expect(store.first_time?("m-13")).to be(true)
       end
     end
+
+    # Every string bunny hands back off the wire is ASCII-8BIT — message ids
+    # included — and the sqlite3 gem binds an ASCII-8BIT String with
+    # sqlite3_bind_blob and everything else with sqlite3_bind_text. SQLite never
+    # considers a blob equal to a text value however identical the bytes, and
+    # nothing shows the difference: a blob key prints as the same characters, so
+    # `SELECT *` showed a CONFIRMED row that the store's own parameterised
+    # SELECT could not find. The key is normalised now; these say so.
+    describe "a key that came off the wire" do
+      # What bunny hands a consumer, and what anything else hands the store.
+      # They are `==` in Ruby, and the store has to agree.
+      let(:from_wire) { "m-wire".dup.force_encoding(Encoding::ASCII_8BIT) }
+      let(:from_anywhere_else) { "m-wire" }
+
+      it "is the same key as one that did not" do
+        expect(from_wire).to eq(from_anywhere_else)
+
+        store.first_time?(from_wire)
+        store.confirm(from_wire)
+
+        expect(store.confirmed?(from_anywhere_else)).to be(true)
+        expect(store.confirmed?(from_wire)).to be(true)
+      end
+
+      it "is one row, not two, which is what the primary key is for" do
+        # The half that actually loses money. Two rows for one identifier means
+        # first_time? answers true twice and the handler runs twice — the one
+        # failure this class exists to prevent.
+        expect(store.first_time?(from_anywhere_else)).to be(true)
+        expect(store.first_time?(from_wire)).to be(false)
+        expect(store.size).to eq(1)
+      end
+
+      it "goes into the column as text, so the table reads as it looks" do
+        store.first_time?(from_wire)
+        store.confirm(from_wire)
+
+        types = db.execute("SELECT typeof(message_id) FROM acemq_idempotency").flatten
+        expect(types).to eq(["text"])
+      end
+
+      it "is released by forget the way any other key is" do
+        store.first_time?(from_wire)
+        store.forget(from_anywhere_else)
+
+        expect(store.first_time?(from_wire)).to be(true)
+      end
+    end
+
+    describe "confirmed on another thread, read on this one" do
+      it "is seen by the thread that did not confirm it" do
+        # The shape the anomaly was first seen in: the confirm happened on a
+        # bunny consumer thread sharing one SQLite3::Database with the main
+        # thread. The thread was a coincidence — it is the only path on which
+        # the id came off the wire — and this pins both halves at once.
+        key = "m-threaded".dup.force_encoding(Encoding::ASCII_8BIT)
+        store.first_time?(key)
+        Thread.new { store.confirm(key) }.join
+
+        expect(store.confirmed?("m-threaded")).to be(true)
+        expect(store.size).to eq(1)
+      end
+    end
   end
 
   describe AceMQ::AMQP::Patterns::SQLSchemaRegistry do
@@ -474,6 +556,36 @@ RSpec.describe "the database-backed stores" do
     it "reads back what either driver hands over for a timestamp" do
       expect(described_class.time("2026-09-08T10:11:12.000000Z").utc.year).to eq(2026)
       expect(described_class.time("2026-09-08 10:11:12.000000+00").utc.hour).to eq(10)
+    end
+
+    describe "a key" do
+      it "is tagged so that sqlite3 binds it as text rather than as a blob" do
+        binary = "m-1".dup.force_encoding(Encoding::ASCII_8BIT)
+
+        expect(described_class.key(binary).encoding).to eq(Encoding::UTF_8)
+        expect(described_class.key("m-1").encoding).to eq(Encoding::UTF_8)
+        expect(described_class.key(:"m-1")).to eq("m-1")
+      end
+
+      it "re-tags without transcoding, so the bytes are the ones handed in" do
+        # Both halves matter. A key that is not valid UTF-8 must still reach the
+        # column unchanged — SQLite compares text byte by byte, so it goes on
+        # matching itself — and a transcode here would either corrupt it or
+        # raise on a message id nobody chose the bytes of.
+        invalid = "m-\xFF".dup.force_encoding(Encoding::ASCII_8BIT)
+
+        expect(described_class.key(invalid).bytes).to eq(invalid.bytes)
+        expect(described_class.key(invalid).valid_encoding?).to be(false)
+      end
+
+      it "leaves the caller's string alone" do
+        # to_s on a String is that same String, so force_encoding without a dup
+        # would re-tag a string the caller still holds.
+        binary = "m-1".dup.force_encoding(Encoding::ASCII_8BIT)
+        described_class.key(binary)
+
+        expect(binary.encoding).to eq(Encoding::ASCII_8BIT)
+      end
     end
   end
 end
