@@ -308,6 +308,12 @@ While the version is `0.x` the public API may change in any release.
   than flattened. The table's .NET row now spells out the "unless": that library
   can be handed a different reader schema than it writes with, or none at all,
   and a row reading only "the codec is constructed with a schema" said neither.
+  The Python and Ruby rows read **Always**, which overstated both the same way.
+  They now read *By default* and say where the "unless" lives: `reader_schema=`
+  and `reader_schema:` name a different reader schema, and the fixed-schema
+  constructors — Python's `AvroCodec(schema)`, Ruby's `AvroCodec.of` — hold one
+  schema for the codec's whole life, read what they write, and resolve nothing.
+  The five pages agree word for word again.
 
   `spec/fixtures/avro-resolution-fixtures.json` carries the bytes: two messages,
   the schema that wrote each, the schema a reader declares, and what the message
