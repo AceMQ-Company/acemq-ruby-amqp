@@ -89,13 +89,13 @@ RSpec.describe AceMQ::AMQP::EncryptedCodec do
     end
   end
 
-  # The five libraries do not agree on this format yet — Go writes no magic byte
-  # and a two-byte length, .NET writes no magic byte, a 16-byte IV and
-  # AES-CBC with a 32-byte HMAC — and all three put the same content type on the
-  # message. This block is what the other two have to be converged against: a
-  # complete frame built from a fixed key, a fixed nonce and a fixed plaintext,
-  # so "does your implementation write these bytes?" is a question with a yes or
-  # no answer rather than an afternoon of reading each other's source.
+  # All five libraries write this format — Java, Go, .NET and Python frame a
+  # message exactly as this one does, and .NET's AES-CBC-with-HMAC framing is
+  # history it still reads and no longer writes. This block is what they are all
+  # held to: a complete frame built from a fixed key, a fixed nonce and a fixed
+  # plaintext, so "does your implementation write these bytes?" is a question
+  # with a yes or no answer rather than an afternoon of reading each other's
+  # source.
   #
   # Built with raw OpenSSL rather than with this codec, so it is not the codec
   # asserted against itself, and confirmed to decrypt under the Java library's

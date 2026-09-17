@@ -235,6 +235,35 @@ While the version is `0.x` the public API may change in any release.
 
 ### Documentation
 
+- **Corrected: the encryption framing table said a Ruby producer and a Go or
+  .NET consumer could not share an encrypted body. They can, and have been able
+  to since 0.5.0.** Nothing about this library's bytes changed; what was wrong was
+  the page somebody would check before deciding they had to convert or re-encrypt.
+
+  `docs/serialization.md` carried a table headed *The other libraries do not agree
+  about this yet*, giving Go no magic byte and a two-byte key id length, and .NET
+  no magic byte with a 16-byte IV, AES-256-CBC and a 32-byte HMAC-SHA-256. Both
+  rows described framings that were retired in the 0.5.0 round, when all five
+  libraries converged on the one this library writes:
+
+  ```
+  0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
+  ```
+
+  That is what Java, Go, .NET and Python write now, byte for byte, and the same
+  vector is pinned by all five test suites — `spec/crypto_spec.rb` holds Ruby's
+  copy. The table now says so, and the heading with it. The README's *"This
+  library interoperates with Java and with nothing else yet"* and the comment
+  above the pinned vector in `spec/crypto_spec.rb` said the same stale thing and
+  have been corrected too.
+
+  What remains true is narrower than the table made it sound: .NET wrote a
+  .NET-only AES-256-CBC-with-HMAC framing up to its own 0.3.0, and its codec still
+  *reads* those bodies so a queue holding them can be drained. Nothing writes
+  them, no other library has ever read them, and the two are told apart rather
+  than guessed at — the family framing begins `0xAE`, that one begins `0x01`. That
+  framing is now shown as the history it is rather than as .NET's current one.
+
 - **The docs build now checks the links in `docs/*.md` as well as the links in
   the rendered site**, and found one that had been dead on GitHub since the page
   was written.

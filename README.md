@@ -184,7 +184,7 @@ EncryptedCodec.key_id_of(body)   # => "orders-2026-06", from the bytes, without 
 ```
 
 AES-GCM through Ruby's OpenSSL binding, a fresh nonce per message, and the
-framing the Java library writes:
+framing all five libraries write:
 
 ```
 0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
@@ -197,10 +197,12 @@ identifier altered in flight makes the message fail to open rather than opening
 as something else. A `Keyring` holds the key that writes and every key that
 still has to read.
 
-**Go and .NET write different bytes under the same content type.** Go omits the
-magic byte and uses a two-byte length; .NET omits it too and uses AES-CBC with
-an HMAC tag. This library interoperates with Java and with nothing else yet.
-[docs/serialization.md](docs/serialization.md#the-other-libraries-do-not-agree-about-this-yet)
+**Java, Go, .NET and Python write these same bytes**, so an encrypted body
+crosses all five libraries given the same key. .NET used to be the exception and
+no longer is: it wrote AES-CBC with an HMAC tag up to its own 0.3.0 and moved to
+this framing in 0.5.0. What does not cross is .NET's own bodies from before that,
+which it still reads and nothing writes.
+[docs/serialization.md](docs/serialization.md#the-other-libraries-write-the-same-bytes)
 has the table.
 
 ## What is identical, and what is not

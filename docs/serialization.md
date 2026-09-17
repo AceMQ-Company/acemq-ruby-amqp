@@ -490,22 +490,31 @@ nothing else. It never contains the plaintext or the key, and it says the same
 thing for a wrong key as for a tampered message, because GCM cannot tell them
 apart and an error that could would be an oracle.
 
-### The other libraries do not agree about this yet
+### The other libraries write the same bytes
 
-Java, Go and .NET all write `application/vnd.acemq.encrypted` and all three
-write different bytes:
+Java, Go, .NET and Python all write `application/vnd.acemq.encrypted`, and all
+four frame it the way this library does:
 
 | | magic | key id length | IV / nonce | cipher | tag |
 | --- | --- | --- | --- | --- | --- |
-| **Java, Ruby** | `0xAE` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes, AAD = header |
-| Go | none | 2 bytes, big-endian | 12-byte nonce | AES-GCM | 16 bytes, AAD = header |
-| .NET | none | 1 byte | 16-byte IV | AES-256-CBC | 32-byte HMAC-SHA-256 |
+| **Java, Ruby, Go, .NET, Python** | `0xAE` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes, AAD = header |
+| .NET up to its 0.3.0 — read-only, nothing writes it | none | 1 byte | 16-byte IV | AES-256-CBC | 32-byte HMAC-SHA-256 |
 
-This library writes Java's, which is the only one of the three whose first byte
-identifies the format at all. A Ruby consumer reads a Java producer's encrypted
-messages and neither reads Go's or .NET's, and `spec/crypto_spec.rb` pins the
-exact layout so that whoever converges the other two has something to converge
-against.
+A Ruby consumer reads a Java, Go, .NET or Python producer's encrypted messages
+and every one of them reads Ruby's, given the same key, and `spec/crypto_spec.rb`
+pins the exact layout — the same vector the other four test suites pin.
+
+**.NET used to be the exception and no longer is.** It wrote AES-256-CBC with a
+separate HMAC-SHA-256 up to its own 0.3.0 and moved to AES-GCM in this framing in
+0.5.0, so a .NET producer and a Ruby consumer can share a key. What does not
+cross is .NET's own *old* bodies: its codec still reads them so a queue holding
+them can be drained, nothing writes them any more, and no other library has ever
+read them. The two are told apart rather than guessed at — this framing begins
+`0xAE`, that one begins `0x01`.
+
+This library writes one framing and reads one framing. A body that does not begin
+`0xAE` is refused as what it is rather than reported as a decryption failure, so
+a consumer pointed at a plaintext queue is told what has actually happened.
 
 ## Next
 

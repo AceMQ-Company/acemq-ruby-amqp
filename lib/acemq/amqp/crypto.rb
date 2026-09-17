@@ -297,7 +297,8 @@ module AceMQ
     #
     #   0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
     #
-    # Byte for byte what the Java library writes, and what it reads. *The key
+    # Byte for byte what the Java, Go, .NET and Python libraries write, and what
+    # they read. *The key
     # identifier is in the message, in the clear.* That is deliberate, and it
     # is what makes rotation possible: a consumer reads which key a message
     # needs rather than assuming the current one, so a new key can be
