@@ -283,11 +283,12 @@ observability the thing that caused the outage.
 
 What is **not** instrumented, so you know not to look for it:
 
-- **Request/reply has no counters of its own.** No `timed_out`, no `unmatched`,
-  no `answered`, no `unanswerable` — Java has all four and Ruby has none. What
-  you get is the ordinary publish and consume series under the queues involved,
-  plus whatever `tracing.request` records. See [what is not
-  counted](request-reply.md#what-is-not-counted).
+- **A reply nobody was waiting for is not counted.** Java's requester exposes
+  `unmatched()`; Ruby drops such a reply silently. Everything else about
+  request/reply is counted now — `acemq.request.total` and
+  `acemq.request.duration` for the caller's round trip, and `answered` and
+  `unanswerable` on the responder itself. See [what is
+  counted](request-reply.md#what-is-counted).
 - **Streams** are consumed through the ordinary consumer, so they are counted
   like any other queue. There is no metric for a consumer's offset or for how far
   behind the end of a stream it is.

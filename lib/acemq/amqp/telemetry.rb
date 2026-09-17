@@ -137,6 +137,43 @@ module AceMQ
       # queue, and only the word keeps them apart.
       DEAD_LETTERED_TOTAL = "acemq.messages.dead.lettered.total"
 
+      # Request-reply round trips, tagged with +routing.key+, +message.type+
+      # and +outcome+ — {Outcome::ANSWERED}, {Outcome::TIMED_OUT} or
+      # {Outcome::FAILED}.
+      #
+      # The caller's number rather than the responder's. It counts what the
+      # thread that called {Patterns::Requester#call} experienced, which is the
+      # publish, the responder's work and the reply's trip home added together
+      # — and the three cannot be told apart from in here, which is exactly why
+      # the caller's own view is worth a metric of its own.
+      #
+      # +timed_out+ is not a failure of this library and is deliberately kept
+      # apart from +failed+: it says a reply did not arrive in time, not that
+      # anything went wrong. The request may still be queued, still being
+      # handled, or long since done with the reply lost on the way back.
+      REQUEST_TOTAL = "acemq.request.total"
+
+      # How long a round trip took, in seconds, tagged the same way as
+      # {REQUEST_TOTAL}.
+      #
+      # Recorded for the calls that timed out as well, where it is the deadline
+      # rather than the work — which is the point: a +timed_out+ distribution
+      # sitting exactly on the timeout is what a deadline set too short looks
+      # like from outside.
+      REQUEST_DURATION = "acemq.request.duration"
+
+      # The label a request metric names its destination with, and the one it
+      # names the envelope's type with.
+      #
+      # Spelled with the dots Java and .NET use rather than with underscores,
+      # because these are the same two series read on the same dashboard and a
+      # tag that differs by a punctuation mark is a panel that silently covers
+      # four languages out of five. {Registry} turns them into +routing_key+
+      # and +message_type+ on the way to Prometheus, which is the only place
+      # the dots are illegal.
+      TAG_ROUTING_KEY = :"routing.key"
+      TAG_MESSAGE_TYPE = :"message.type"
+
       # Pipeline runs that finished, tagged with +pipeline+, +step+ and
       # +outcome+ — +completed+ when the route ran out, +ended_early+ when a
       # step decided the message goes no further.

@@ -329,6 +329,14 @@ request that changes anything wants an [idempotent](#idempotency) responder.
 A request carrying no reply address at all is dead-lettered rather than looped:
 retrying cannot make a reply queue appear.
 
+`Patterns.serve` hands back a `Patterns::Responder`, which keeps two numbers —
+`answered`, incremented before each reply is published, and `unanswerable`, the
+requests that named nowhere to reply. Both are readable the instant a round trip
+returns, and both are Java's, name for name. A requester raises
+`acemq.request.total` and `acemq.request.duration` for the round trip as the
+caller experienced it. See
+[what is counted](request-reply.md#what-is-counted).
+
 ### The reply address is written twice, and read either way
 
 A requester sets **both** the `acemq-reply-to` header and AMQP's own `reply-to`

@@ -124,12 +124,28 @@ module AceMQ
           correlation = SecureRandom.uuid
           waiter = Waiter.new
           @lock.synchronize { @waiting[correlation] = waiter }
+          # A monotonic clock, because this is a duration: the wall clock can
+          # step backwards over an NTP correction and hand a round trip a
+          # negative one.
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          # The pessimistic word until something better is known. Every way out
+          # of the block below sets it, including the raise, and a failure that
+          # is none of the three named ones is still a round trip that did not
+          # come back with an answer.
+          outcome = Telemetry::Outcome::FAILED
+          type = nil
 
           begin
-            publish(request, correlation, fields)
-            answer(waiter.await(@timeout), correlation)
+            type = publish(request, correlation, fields).type
+            reply = answer(waiter.await(@timeout), correlation)
+            outcome = Telemetry::Outcome::ANSWERED
+            reply
+          rescue RequestTimedOut
+            outcome = Telemetry::Outcome::TIMED_OUT
+            raise
           ensure
             @lock.synchronize { @waiting.delete(correlation) }
+            record(type, outcome, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
           end
         end
 
@@ -173,6 +189,29 @@ module AceMQ
           )
           @connection.publish(request, to: @to, exchange: @exchange,
                                        reply_to: @reply_queue, **envelope)
+        end
+
+        # The round trip as the caller experienced it.
+        #
+        # One counter and one distribution, named and tagged as Java and .NET
+        # name and tag theirs, because a request-reply dashboard is read across
+        # the fleet rather than per language. The publish and the reply are
+        # already counted by +acemq.publish.total+ and +acemq.consume.total+ —
+        # what neither of them can say is how long the *caller* waited, because
+        # the caller's wait spans two queues, two processes and a responder,
+        # and no single message's metrics see all of it.
+        #
+        # The type is the envelope's own, read off what was really published
+        # rather than off the fields handed in: an interceptor is allowed to
+        # change it, and a tag that disagreed with the message would be worse
+        # than no tag. It is nil only when the publish itself failed, and an
+        # empty string is the honest value there.
+        def record(type, outcome, seconds)
+          tags = { Telemetry::TAG_ROUTING_KEY => @to, Telemetry::TAG_MESSAGE_TYPE => type.to_s,
+                   outcome: outcome }
+          telemetry = @connection.telemetry
+          telemetry.count(Telemetry::REQUEST_TOTAL, 1, **tags)
+          telemetry.observe(Telemetry::REQUEST_DURATION, seconds, **tags)
         end
 
         def answer(message, correlation)
@@ -252,22 +291,131 @@ module AceMQ
       # @param connection [Connection]
       # @param queue [String] where requests arrive
       # @param options [Hash] passed to {Connection#consume}
-      # @return [Consumer]
+      # @return [Responder]
       def self.serve(connection, queue, **options, &handler)
         raise ArgumentError, "Patterns.serve needs a block to answer with" unless handler
 
-        connection.consume(queue, **options) do |message|
+        # Made before the subscribe rather than after it, and closed over by the
+        # handler rather than reached through the responder this returns. A
+        # broker may hand the first request over from inside the subscribe —
+        # which is what a queue with a backlog looks like from in here — and a
+        # handler reaching for a responder the subscribe has not returned yet
+        # would answer that request and count nothing. Silent, and only ever at
+        # start-up, which is the worst place to lose the first number of the
+        # day. .NET had to lift its counters out of the responder for exactly
+        # this, and Java gets it from field initialisers running before the
+        # constructor body.
+        counters = Responder::Counters.new
+        consumer = connection.consume(queue, **options) do |message|
           reply_to = reply_address(message)
           if reply_to.empty?
-            # Retrying cannot make a reply queue appear, so this is
-            # dead-lettered rather than looped.
+            # Counted before the delivery is settled, and settled rather than
+            # retried: retrying cannot make a reply queue appear, so this is
+            # dead-lettered. Anything above zero here means a caller is
+            # publishing where it meant to request.
+            counters.unanswerable!
             next Ack.reject(FatalError.new(
                               "request #{message.id} carries neither the #{REPLY_TO_HEADER} " \
                               "header nor a reply-to property, so there is nowhere to reply"
                             ))
           end
 
-          answer(connection, reply_to, message, handler)
+          answer(connection, reply_to, message, handler, counters)
+        end
+        Responder.new(consumer, counters)
+      end
+
+      # A running responder, and the two numbers it keeps.
+      #
+      #   responder = Patterns.serve(mq, "price.requests") { |m| price(m.payload) }
+      #   responder.answered       # requests answered, counted before each reply left
+      #   responder.unanswerable   # requests that named nowhere to reply
+      #
+      # The same two numbers Java's +Responder.answered()+ and
+      # +unanswerable()+ report, with the same promise about when they can be
+      # read: **never a wait**. Both are in place before the first delivery, and
+      # {#answered} is incremented *before* the reply is published. Code that
+      # sleeps before reading one is working around a defect that is not here.
+      #
+      # Everything else about it is the consumer underneath, which is what
+      # {Patterns.serve} used to return: {#cancel}, {#running?} and {#queue}
+      # are that consumer's, and {#consumer} is the consumer itself for
+      # anything this does not forward.
+      class Responder
+        # @api private
+        def initialize(consumer, counters)
+          @consumer = consumer
+          @counters = counters
+        end
+
+        # The consumer underneath, for whatever this does not forward.
+        attr_reader :consumer
+
+        # How many requests were answered, counted before each reply left.
+        #
+        # A caller holding a reply can rely on this having counted it: the
+        # increment happens before the publish, so there is no interleaving in
+        # which the answer is visible and the number is not. The other order
+        # reads more naturally and is wrong — it leaves a window where a reply
+        # is in the caller's hands and the responder still says nothing has been
+        # answered, which is a dashboard reporting an idle service that is
+        # demonstrably working.
+        #
+        # A publish that fails hands its increment back, so this counts replies
+        # that were sent rather than replies that were attempted.
+        #
+        # A responder that raised is counted here too, because a Ruby responder
+        # *answers* that request: the failure goes back to the caller in
+        # +acemq-error+ and the caller raises {ResponderFailed} rather than
+        # waiting out its deadline. Java's responder does not reply at all in
+        # that case and so does not count it — the divergence is in what the two
+        # do with a failure, not in what the counter means. Split the two apart
+        # with +acemq.consume.total+, where the same delivery is +acked+ or
+        # +rejected+.
+        def answered = @counters.answered
+
+        # How many requests arrived naming nowhere to reply, counted before the
+        # delivery is settled.
+        #
+        # Anything above zero means a caller is publishing where it means to
+        # request. Nothing can answer such a request and nothing about
+        # redelivering it would make a reply address appear, so it is
+        # dead-lettered once rather than looped.
+        def unanswerable = @counters.unanswerable
+
+        # Whether the broker is still sending this responder requests.
+        def running? = @consumer.running?
+
+        # The queue requests arrive on.
+        def queue = @consumer.queue
+
+        # Stops serving, draining the requests already in hand.
+        #
+        # A request being answered right now has a caller blocked on the other
+        # side, and cutting it off turns their call into a timeout.
+        def cancel(timeout: 30) = @consumer.cancel(timeout: timeout)
+
+        # The two numbers, held apart from the responder that reports them.
+        #
+        # A class of its own so the handler can close over it: see
+        # {Patterns.serve} for why reaching them through the responder is a
+        # number lost at start-up.
+        #
+        # @api private
+        class Counters
+          def initialize
+            @lock = Mutex.new
+            @answered = 0
+            @unanswerable = 0
+          end
+
+          def answered = @lock.synchronize { @answered }
+          def unanswerable = @lock.synchronize { @unanswerable }
+          def answered! = @lock.synchronize { @answered += 1 }
+          def unanswerable! = @lock.synchronize { @unanswerable += 1 }
+
+          # Takes back an increment whose publish then failed.
+          def unanswered! = @lock.synchronize { @answered -= 1 }
         end
       end
 
@@ -286,10 +434,10 @@ module AceMQ
       end
 
       # @api private
-      def self.answer(connection, reply_to, message, handler)
+      def self.answer(connection, reply_to, message, handler, counters)
         response = handler.call(message)
         begin
-          reply(connection, reply_to, message, response)
+          reply(connection, reply_to, message, response, counters: counters)
         rescue StandardError => e
           # The work is done but the answer did not get out. A retry repeats the
           # work, which is why a responder that changes anything should be
@@ -300,16 +448,29 @@ module AceMQ
       rescue StandardError => e
         # The failure goes back to the caller, and then the request is settled
         # rather than retried: replying and then retrying would answer twice.
-        reply(connection, reply_to, message, nil, error: describe_failure(e))
+        reply(connection, reply_to, message, nil,
+              error: describe_failure(e), counters: counters)
         Ack.reject(e)
       end
 
       # @api private
-      def self.reply(connection, reply_to, request, response, error: nil)
+      def self.reply(connection, reply_to, request, response, error: nil, counters: nil)
         headers = error.nil? ? {} : { ERROR_HEADER => error }
-        connection.publish(response, to: reply_to,
-                                     correlation_id: request.envelope.correlation_id,
-                                     causation_id: request.envelope.id, headers: headers)
+        # Counted before the reply goes out, and that order is the contract —
+        # see {Responder#answered}. Both replies go through here, the answer and
+        # the failure, so both are counted in the one place rather than in two
+        # that would drift.
+        counters&.answered!
+        begin
+          connection.publish(response, to: reply_to,
+                                       correlation_id: request.envelope.correlation_id,
+                                       causation_id: request.envelope.id, headers: headers)
+        rescue StandardError
+          # A send that never happened must not be counted as an answer, which
+          # is the one failure incrementing early would otherwise introduce.
+          counters&.unanswered!
+          raise
+        end
       end
 
       # @api private

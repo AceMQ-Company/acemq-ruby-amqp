@@ -14,9 +14,10 @@ prices.call({ "sku" => "X-1" })   # => { "price" => 1299 }
 prices.close
 ```
 
-Two objects. `Patterns.serve` answers requests on a queue; `Patterns::Requester`
-asks and waits. Everything else on this page is about what waiting costs and
-what the waiting is allowed to conclude.
+Two objects. `Patterns.serve` answers requests on a queue and hands back a
+`Patterns::Responder`; `Patterns::Requester` asks and waits. Everything else on
+this page is about what waiting costs and what the waiting is allowed to
+conclude.
 
 That first line is not optional. **`Patterns.serve` does not declare the request
 queue** — it is `consume` underneath, and a subscription
@@ -197,7 +198,8 @@ A reply that arrives after its caller gave up is **dropped**. The reply consumer
 looks up the waiter, finds nobody, and moves on rather than blocking — blocking
 there would stall every other caller waiting on the same queue. Nothing counts
 that drop, which is the one piece of instrumentation this library does not have
-and Java does; see [what is not counted](#what-is-not-counted) below.
+and Java does; see [what is still not
+counted](#what-is-still-not-counted) below.
 
 ## Writing a responder
 
@@ -259,10 +261,12 @@ prices.close      # stops consuming replies; the generated queue goes with it
 responder.cancel  # stops delivery, then waits for handlers already running
 ```
 
-`Consumer#cancel` waits up to 30 seconds for in-flight handlers by default. That
-matters more for a responder than for an ordinary consumer: a request being
-answered right now has somebody blocked on the other side, and dropping it turns
-their call into a timeout they will not be able to explain.
+`Responder#cancel` waits up to 30 seconds for in-flight handlers by default — it
+is the consumer's own `cancel`, forwarded. That wait matters more for a responder
+than for an ordinary consumer: a request being answered right now has somebody
+blocked on the other side, and dropping it turns their call into a timeout they
+will not be able to explain. A responder forwards `running?` and `queue` too, and
+`responder.consumer` is the consumer itself for anything else.
 
 `mq.close` cancels every consumer on the connection, requesters' reply consumers
 included, so a process that closes its connection at exit does not need to
@@ -270,15 +274,88 @@ remember each one. Closing a requester twice is harmless.
 
 ## What is counted
 
-A requester and a responder are built out of `publish` and `consume`, so they are
-counted by the ordinary metrics, under the queues they use:
+### The round trip, from the caller's side
+
+```ruby
+metrics = Telemetry::Registry.new
+mq = AceMQ::AMQP::Connection.open(url, telemetry: metrics)
+```
+
+Every `call` raises two series, tagged with `routing.key`, `message.type` and
+`outcome`:
+
+| | |
+|---|---|
+| `acemq.request.total` | round trips, by outcome — `answered`, `timed_out` or `failed` |
+| `acemq.request.duration` | seconds, the same tags; **how long the caller waited** |
+
+The duration is the number nothing else can give you. The publish is already
+counted and so is the responder's delivery, but the caller's wait spans two
+queues, two processes and somebody else's work, and no single message's metrics
+see all of it. Set your timeouts from this and from
+`acemq.consume.duration` on the responder's queue.
+
+`timed_out` is kept apart from `failed` on purpose: it says a reply did not
+arrive in time, not that anything went wrong. The request may still be queued,
+still being handled, or long since done with the reply lost on the way back —
+which is why resending is only safe against an idempotent responder. A duration
+distribution for `timed_out` sitting exactly on the deadline is a deadline set
+too short, not a broken responder.
+
+The label names carry Java's and .NET's dots so that one dashboard panel covers
+all of them. Prometheus does not allow a dot in a label name — a single bad line
+makes the whole scrape unparseable — so `to_prometheus` renders them as
+`routing_key` and `message_type`, which is what Go writes and what a dashboard
+will be asking for.
+
+### The two numbers a responder keeps
+
+```ruby
+responder = Patterns.serve(mq, "price.requests") { |m| price(m.payload) }
+
+responder.answered      # requests answered, counted before each reply left
+responder.unanswerable  # requests that named nowhere to reply
+```
+
+The same two numbers Java's `Responder.answered()` and `unanswerable()` report,
+with the same promise about when they may be read: **never a wait**. Both exist
+before the responder subscribes, so a request the broker hands over during
+start-up — what a queue with a backlog looks like from in here — is counted like
+any other. Code that sleeps before reading one is working around a defect that is
+not here.
+
+`answered` is incremented **before** the reply is published. The other order
+reads more naturally and is wrong: it leaves a window in which the reply is in
+the caller's hands and the responder still says nothing has been answered, which
+is a dashboard reporting an idle service that is demonstrably working. A publish
+that fails hands its increment back, so this counts replies that were *sent*
+rather than replies that were attempted.
+
+A responder that raised is counted in `answered` here, and this is the one place
+Ruby's number differs from Java's. A Ruby responder answers that request — the
+failure goes back in `acemq-error` and the caller raises `ResponderFailed` rather
+than waiting out its deadline — and a reply that was sent is a request that was
+answered. Java's responder does not reply at all in that case and so does not
+count it; the divergence is in what the two *do* with a failure, not in what the
+counter means. Split the two apart with `acemq.consume.total`, where the same
+delivery is `acked` or `rejected`.
+
+`unanswerable` above zero means a caller is using `publish` where it meant to use
+a requester. Nothing can answer such a request, and nothing about redelivering it
+would make a reply address appear, so it is dead-lettered once rather than
+looped.
+
+### And the ordinary metrics
+
+A requester and a responder are still built out of `publish` and `consume`, so
+they are counted by those too, under the queues they use:
 
 | | |
 |---|---|
 | `acemq.publish.total{outcome="confirmed"}` | requests going out, and replies going back |
 | `acemq.consume.total{queue="price.requests",outcome="acked"}` | requests answered |
 | `acemq.consume.total{queue="price.requests",outcome="rejected"}` | requests that raised, or that named nowhere to reply |
-| `acemq.consume.duration{queue="price.requests"}` | how long answering takes — the number a caller's timeout should be set from |
+| `acemq.consume.duration{queue="price.requests"}` | how long answering takes — the responder's half of a caller's timeout |
 
 See [metrics, tracing and health](observability.md) for the registry and the
 Prometheus rendering.
@@ -301,20 +378,14 @@ being long rather than a failure of this process, and a trace view that fills
 with red for slow responders stops meaning anything. The exception still reaches
 you, and you are free to decide it was one.
 
-### What is not counted
+### What is still not counted
 
-Java's `Requester` exposes `timedOut()` and `unmatched()`, and its `Responder`
-exposes `answered()` and `unanswerable()`. **Ruby has none of those.** The
-outcome words `answered` and `timed_out` exist in `Telemetry::Outcome`, shared
-with the other libraries, but nothing in `Requester` or `Patterns.serve` emits
-them — they reach a metrics backend only through `tracing.request` above, and
-only as span outcomes.
-
-The gap that matters most is `unmatched`: a reply that arrives with nobody
-waiting is dropped silently here, and that number rising alongside timeouts is
-the signature of a responder that is slower than its callers expect — nothing is
-broken, the timeout is simply wrong. Until this is counted, the way to see it is
-`acemq.consume.duration` on the responder's queue against the timeout you set.
+Java's `Requester` also exposes `unmatched()`: replies that arrived with nobody
+waiting. **Ruby has no such number.** A reply to a request that already gave up
+is dropped silently, and that count rising alongside timeouts is the signature of
+a responder slower than its callers expect — nothing broken, the timeout simply
+wrong. `acemq.request.total{outcome="timed_out"}` is most of that signal now, and
+reading it against `acemq.consume.duration` on the responder's queue is the rest.
 
 ## Related
 

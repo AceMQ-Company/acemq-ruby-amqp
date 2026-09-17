@@ -67,6 +67,71 @@ While the version is `0.x` the public API may change in any release.
   advice, you can stop — though splitting still bounds how long the batch holds
   this connection's publishing channel, which the ceiling does not.
 
+- **Request and reply counts something at last.** `Telemetry::Outcome::ANSWERED`
+  and `TIMED_OUT` have been in this library since the outcome words were shared
+  across the five, and nothing in `lib/` has ever written either of them. A
+  constant no code reaches reads from the outside as a supported feature, which
+  is the trap the documentation had to keep warning about. It is written now.
+
+  A **responder** keeps two numbers, and `Patterns.serve` hands back a
+  `Patterns::Responder` that reports them:
+
+  ```ruby
+  responder = Patterns.serve(mq, "price.requests") { |m| price(m.payload) }
+
+  responder.answered      # requests answered, counted before each reply left
+  responder.unanswerable  # requests that named nowhere to reply
+  ```
+
+  The same two Java's `Responder.answered()` and `unanswerable()` report, with
+  the same promise about when they may be read: **never a wait**. `answered` is
+  incremented *before* the reply is published, so a caller holding its answer can
+  rely on the count already including it — the other order leaves a window in
+  which the reply is in somebody's hands and the responder still says nothing has
+  been answered, which is a dashboard reporting an idle service that is
+  demonstrably working. A publish that fails hands its increment back, so this
+  counts replies that were sent rather than replies that were attempted. Both
+  counters exist before the responder subscribes, so a request the broker hands
+  over during start-up — what a queue with a backlog looks like from in here — is
+  counted like any other, and code that sleeps before reading one is working
+  around a defect that is not here.
+
+  One number differs from Java's on purpose: a responder that **raised** is
+  counted in `answered` here. A Ruby responder answers that request — the failure
+  goes back in `acemq-error` and the caller raises `ResponderFailed` rather than
+  waiting out its deadline — and a reply that was sent is a request that was
+  answered. Java's responder does not reply at all in that case and so does not
+  count it; the divergence is in what the two *do* with a failure, which was
+  already documented, not in what the counter means. `acemq.consume.total` splits
+  the two, where the same delivery is `acked` or `rejected`.
+
+  A **requester** now raises the two metrics Java and .NET have had:
+  `acemq.request.total` and `acemq.request.duration`, tagged with `routing.key`,
+  `message.type` and an `outcome` of `answered`, `timed_out` or `failed`. The
+  duration is the number nothing else could give you — the caller's wait spans
+  two queues, two processes and somebody else's work, and no single message's
+  metrics see all of it. Set your timeouts from it, read against
+  `acemq.consume.duration` on the responder's queue.
+
+  `timed_out` is kept apart from `failed` deliberately, exactly as the span
+  outcome is: it says a reply did not arrive in time, not that anything went
+  wrong. A `timed_out` duration distribution sitting on the deadline is a
+  deadline set too short rather than a broken responder.
+
+  The two tag names carry Java's dots so that one dashboard panel covers all
+  five. Prometheus allows neither — and one illegal label makes the whole scrape
+  unparseable, not just that series — so `Registry#to_prometheus` renders them as
+  `routing_key` and `message_type`, which is what Go writes.
+
+  **`Patterns.serve` returns a different object.** It used to hand back the
+  `Consumer` underneath; it hands back a `Patterns::Responder` now, which
+  forwards `cancel`, `running?` and `queue` and exposes the consumer itself as
+  `responder.consumer`. Code that called one of those three needs no change.
+
+  Still not counted: a reply that arrives with nobody waiting, which Java reports
+  as `Requester.unmatched()`. It is dropped silently here.
+  `acemq.request.total{outcome="timed_out"}` is most of that signal now.
+
 ### Changed
 
 - **A message that cannot be set aside is now rejected to the broker rather than

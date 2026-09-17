@@ -757,6 +757,41 @@ RSpec.describe "against a real broker", :integration do
       requester.close
     end
 
+    it "counts what it answered, and what the caller waited for" do
+      # The counters on a real broker, where the reply is published on the
+      # consumer's thread while this one is blocked. answered is read the
+      # instant `call` returns, with no sleep between: the increment happens
+      # before the reply is published, so it cannot be behind the answer.
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      counted = AceMQ::AMQP::Connection.open(
+        BROKER, origin: "rspec@rbit", telemetry: metrics
+      )
+      begin
+        responder = AceMQ::AMQP::Patterns.serve(counted, queue) do |message|
+          { "price" => message.payload["sku"].length * 100 }
+        end
+        requester = AceMQ::AMQP::Patterns::Requester.new(
+          counted, to: queue, reply_to: replies, timeout: 10
+        )
+        requester.call({ "sku" => "X-12" }, type: "price.request")
+
+        expect(responder.answered).to eq(1)
+        expect(responder.unanswerable).to eq(0)
+        expect(metrics[AceMQ::AMQP::Telemetry::REQUEST_TOTAL,
+                       AceMQ::AMQP::Telemetry::TAG_ROUTING_KEY => queue,
+                       AceMQ::AMQP::Telemetry::TAG_MESSAGE_TYPE => "price.request",
+                       outcome: AceMQ::AMQP::Telemetry::Outcome::ANSWERED]).to eq(1)
+
+        # A caller that used publish where it meant to request: nothing names a
+        # reply queue, so nothing can answer it.
+        counted.publish({ "sku" => "A" }, to: queue)
+        expect(wait_for { responder.unanswerable == 1 }).to be(true)
+        requester.close
+      ensure
+        counted.close
+      end
+    end
+
     # The three that need a real broker. reply-to is an AMQP property and not a
     # header, so it travels in basic.properties rather than in the field table:
     # a fake transport can be made to carry anything, and only the wire says

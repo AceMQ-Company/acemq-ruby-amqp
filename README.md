@@ -956,10 +956,18 @@ and in AMQP's own `reply-to` property, to the same queue, and a responder reads
 the header first. The rule is identical in all five libraries, and it is what
 lets a requester in any of them be answered by a responder in any other.
 
+A responder reports two numbers, `responder.answered` and
+`responder.unanswerable`, the same two Java reports and with the same promise:
+both are in place before the responder subscribes, and `answered` is incremented
+*before* the reply is published, so a caller holding its answer can rely on the
+count already including it. A requester raises `acemq.request.total` and
+`acemq.request.duration`, tagged `answered`, `timed_out` or `failed` — the round
+trip as the caller experienced it, which no single message's metrics can see.
+
 [docs/request-reply.md](docs/request-reply.md) is the full account: the reply
 queue's shape and why it is the one classic queue this library declares, what a
-responder settles in each case, the queue you have to declare yourself, and which
-of Java's counters Ruby does not have.
+responder settles in each case, the queue you have to declare yourself, and the
+one number of Java's that Ruby still does not have.
 
 ### Replay
 
