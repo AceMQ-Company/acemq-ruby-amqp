@@ -235,6 +235,35 @@ While the version is `0.x` the public API may change in any release.
 
 ### Documentation
 
+- **The docs build now checks the links in `docs/*.md` as well as the links in
+  the rendered site**, and found one that had been dead on GitHub since the page
+  was written.
+
+  The existing check reads `site/`, which is the rewritten copy: cross-page links
+  are written `.md` in the source and rewritten to `.html` on the way out, so a
+  link that is wrong in the source and right after rewriting satisfies it. That
+  is a blind spot in principle rather than an oversight — `guide.html` existing
+  in `site/` says nothing about what the markdown asked for, and the markdown is
+  what somebody reads when they meet these pages in the repository rather than on
+  the site.
+
+  The new pass walks every `](target)` in `docs/*.md`, skips external, `mailto:`
+  and pure-fragment links, and requires everything else to exist as a file inside
+  `docs/`. A `.html` target that is not the YARD reference under `api/` is
+  reported as *a docs page link belongs in `.md`* rather than as a missing file,
+  because that is the mistake it exists to catch. It runs before pandoc and
+  before YARD, since it needs neither and a bad link is cheapest to find before a
+  minute of rendering.
+
+  All 222 links in the 21 pages pass — this repository already wrote every
+  cross-page link as `.md` — except one that was not a cross-page link at all:
+  `docs/licence.md` pointed at `LICENSE` by a bare relative path. The build
+  copies the licence beside the rendered pages, so that resolved on the site and
+  the site check was satisfied; read on GitHub it asked for `docs/LICENSE`, which
+  has never existed. It now links to the file in the repository, which is right in
+  both readings — a path back up out of `site/` would not be, since Pages serves
+  this under a project subdirectory.
+
 - **When an Avro message is resolved onto a reader schema, pinned by a fixture
   all five libraries share.** `docs/serialization.md` has a `## Schema
   resolution` section, worded identically in the Java, .NET, Go, Python and Ruby
@@ -244,16 +273,24 @@ While the version is `0.x` the public API may change in any release.
   library has a reader schema to resolve onto.** What differs is where a reader
   schema comes from, and so how often there is one — a Go struct carries none
   until the caller passes one, a Java `GenericRecord` asks for nothing in
-  particular, and .NET, Python and Ruby build the codec around a schema and
-  therefore always hold one. That is a difference in what each language can
-  know, not a disagreement about Avro, and it is documented rather than
-  flattened.
+  particular, and .NET, Python and Ruby build the codec around a schema and so
+  hold one unless they are told otherwise. That is a difference in what each
+  language can know, not a disagreement about Avro, and it is documented rather
+  than flattened. The table's .NET row now spells out the "unless": that library
+  can be handed a different reader schema than it writes with, or none at all,
+  and a row reading only "the codec is constructed with a schema" said neither.
 
   `spec/fixtures/avro-resolution-fixtures.json` carries the bytes: two messages,
   the schema that wrote each, the schema a reader declares, and what the message
   decodes to under **both** behaviours, as `resolved` and `writerShape`. It is
   the Java library's file, byte for byte, and
-  `acemq-amqp-libraries/scripts/check-fixtures.sh` fails if any copy drifts.
+  `acemq-amqp-libraries/scripts/check-fixtures.sh` fails if any copy drifts. The
+  copy here has been refreshed from Java's: the bytes, the two cases and both
+  columns are unchanged, and what moved is explanatory prose — Ruby's entry now
+  separates `registered` from `AvroCodec.of`, which takes no `reader_schema:` at
+  all, and the `writerShape` column no longer describes itself as where a reader
+  holding *no* reader schema lands, since Ruby arrives there holding one: the
+  writer's own.
 
   `spec/codec_avro_resolution_spec.rb` asserts both columns. Ruby is in
   `resolved` — `registered` defaults `reader_schema:` to the schema it was given,

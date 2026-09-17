@@ -28,6 +28,61 @@ OUT="site"
 
 command -v pandoc >/dev/null || { echo "pandoc is required" >&2; exit 1; }
 
+# The same question as the link check at the bottom of this script, asked of the
+# source instead of the site.
+#
+# Links between pages are written as .md and rewritten to .html further down,
+# for the rendered copy only. That convention exists so the same files read
+# correctly on GitHub, which is where somebody meets these pages before they
+# find the site — and the check at the bottom cannot see that half. It runs on
+# the rewritten output, so it is satisfied by `guide.html` existing in site/
+# whatever the markdown said. A link that is wrong in the source and right after
+# rewriting is invisible to it in principle, not by oversight, and this family
+# of repositories has shipped exactly that: cross-page links written as .html,
+# dead in GitHub's markdown view and green in every build.
+#
+# It runs first because it needs neither pandoc nor YARD, and a bad link is
+# cheapest to find before a minute of rendering.
+python3 - <<'PY'
+import os, re, sys, urllib.parse
+
+DOCS = "docs"
+
+pages = sorted(f for f in os.listdir(DOCS) if f.endswith(".md"))
+broken = []
+links = 0
+
+for page in pages:
+    with open(os.path.join(DOCS, page), encoding="utf-8") as handle:
+        body = handle.read()
+    for target in re.findall(r"\]\(([^)\s]+)\)", body):
+        if target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        path = urllib.parse.unquote(target.partition("#")[0])
+        if not path:
+            continue
+        links += 1
+        # The generated API reference is genuinely HTML: YARD writes it into
+        # site/api, no markdown renders into it, and it is .html on GitHub and
+        # on the site alike. Any other .html target is a docs page written the
+        # wrong way round — it is the mistake this check exists for, so it is
+        # named as that rather than reported as a missing file.
+        if path.endswith(".html"):
+            if not path.startswith("api/"):
+                broken.append("{} -> {}  (a docs page link belongs in .md)".format(page, target))
+            continue
+        if not os.path.exists(os.path.join(DOCS, path)):
+            broken.append("{} -> {}".format(page, target))
+
+if broken:
+    print("::error::docs/ links that are dead when the pages are read on GitHub:")
+    for item in broken:
+        print("  " + item)
+    sys.exit(1)
+print("{} source pages, {} internal links, every one resolves inside docs/"
+      .format(len(pages), links))
+PY
+
 # The option was renamed: --highlight-style in older pandoc,
 # --syntax-highlighting in newer, and each rejects or deprecates the other.
 # Ubuntu's package and a current Homebrew install sit on opposite sides of that
@@ -49,9 +104,16 @@ if compgen -G "docs/assets/*" > /dev/null; then
   cp docs/assets/* "$OUT/assets/"
 fi
 
-# The licence page links to it by a relative path, so it has to be beside the
-# rendered pages rather than only in the repository. Copied as it is: a licence
-# rendered to HTML is a licence somebody has reformatted.
+# The site ships the text it is published under, beside the pages rather than
+# only in the repository. Copied as it is: a licence rendered to HTML is a
+# licence somebody has reformatted.
+#
+# The licence page used to link to this copy by a bare relative path, which
+# resolved on the site and 404'd for anyone reading docs/licence.md on GitHub —
+# the exact defect the source-side link check above now catches. It links to the
+# file in the repository instead, which is right in both readings; a path back
+# up out of site/ would not be, because Pages serves this under a project
+# subdirectory.
 cp LICENSE "$OUT/LICENSE"
 
 cat > "$OUT/style.css" <<'CSS'

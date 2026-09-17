@@ -2,7 +2,8 @@
 
 AceMQ for Ruby is [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 You may use it in production, commercially, without asking and without paying.
-The text as shipped is [here](LICENSE).
+The text as shipped is
+[here](https://github.com/AceMQ-Company/acemq-ruby-amqp/blob/main/LICENSE).
 
 ## No warranty
 
