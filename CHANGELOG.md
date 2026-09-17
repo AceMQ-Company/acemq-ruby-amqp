@@ -8,7 +8,183 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-17
+
 ### Added
+
+- **`publish_all`, which sends a batch in one round trip instead of one per
+  message.** Publishing a thousand messages meant a thousand calls to `publish`,
+  and every one of them waited for its own confirm before the next was written.
+  The wait is the right trade for a single message — it is the difference between
+  "the bytes reached a socket" and "the broker has it" — and the wrong one
+  repeated a thousand times, where nearly all the time is spent waiting for a
+  network with nothing on it:
+
+  ```ruby
+  envelopes = mq.publish_all(orders, to: "order.placed", exchange: "orders-events",
+                             type: "order.placed.v2")
+  ```
+
+  Every message is handed to the broker before any confirm is asked for, and
+  then all of them are waited for together — which is what publisher confirms
+  were designed for and what makes a thousand-message publish take about as long
+  as one. The envelopes come back in the order the payloads were given, whatever
+  order the broker confirmed them in, so a result can be matched to the payload
+  that produced it without anybody sorting anything.
+
+  The batch goes out through a seam of its own, `Transport#publish_all`, which
+  takes one hash of `publish`'s keywords per message and answers with one entry
+  per message in the order they were given: the id it went out with, or the
+  `PublishError` it met. The mapping back is the part worth naming. Bunny hands
+  out a delivery tag per message and the broker answers by tag, out of order and
+  in ranges, so every tag is recorded against the position of the payload that
+  claimed it and every answer — an ack, a nack or a `basic.return` — is charged
+  back to that position rather than to whichever message happens to be waiting.
+  `docs/testing.md` lists `publish_all` in the transport contract; a hand-written
+  double needs it only if its own tests call `publish_all`.
+
+  **It is not atomic**, and no library can make it so: AMQP has no way to publish
+  a hundred messages such that all or none arrive. What it does instead is say
+  how much did arrive. A batch that met a failure is still waited for in full,
+  and the `PublishError` counts what happened:
+
+  ```
+  3 of 500 messages were not confirmed; 497 were. The first failure was: …
+  ```
+
+  That sentence matters more than it looks. A half-arrived batch is the ordinary
+  outcome of a broker problem partway through, and a caller told only "it failed"
+  republishes hundreds of messages that are already on a queue. The failure
+  quoted is the first one *in payload order* rather than the first the broker
+  answered, so the same batch reports the same message twice running rather than
+  whichever one the broker happened to answer first. Java's `sendAll` and .NET's
+  `SendAllAsync` raise that sentence word for word, so one runbook covers all
+  three.
+
+  Everything else works per message, exactly as it does for a single publish:
+  each payload gets an envelope of its own (or pass `envelopes:`, one per
+  payload), the publish interceptors run once for each,
+  `acemq.publish.total` is counted once for each with its own outcome, and
+  `mandatory: true` means what it means for one message — a message the broker
+  had nowhere to route is that message's failure, carrying `unroutable?`, and the
+  batch counts it among the ones that did not arrive. The batch error is itself
+  `unroutable?` only when *every* failure was an unroutable message, since that
+  is the only case in which rescuing it and concluding "nothing is bound" would
+  be right.
+
+  **Nothing existing changes.** `publish` is untouched, down to the wording of
+  every exception it raises — the sentences are now written in one place and a
+  batch raises exactly the ones a single publish does, so an alert matching on
+  them keeps matching. How many of a batch's messages may be unconfirmed at once
+  is bounded by `max_outstanding_publishes`, below: a batch larger than that
+  ceiling is written in waves rather than held whole in this process and on the
+  broker, so there is no size you have to split by hand. A batch does still hold
+  the connection's publishing mutex from its first message to its last confirm,
+  which is the price of delivery tags that belong to it alone, and a reason to
+  think about how large a batch you hand in.
+
+  **If you publish in a loop today**, hand the array to `publish_all` instead and
+  rescue `PublishError` around the batch rather than around each message. Ruby,
+  Go and Python were the three libraries without this; Java has had `sendAll`
+  since the beginning and .NET has `SendAllAsync`.
+
+- **`reader_schema:` on `AvroCodec.registered`, which is schema evolution on the
+  read side.** A registered Avro codec resolves every message onto the schema it
+  holds, and that schema used to be the same one it writes with, with no way to
+  separate them:
+
+  ```ruby
+  AvroCodec.registered(registry, subject: "order.placed",
+                       schema: v3_json, reader_schema: v1_json)
+  ```
+
+  The codec now publishes and registers `schema:`, while resolving every message
+  it reads — written by whichever version — onto `reader_schema:`. A field the
+  writer added that the reader has never heard of is skipped rather than
+  shifting every field after it, and a field the reader expects that the writer
+  never sent is filled in from the reader's own default: a value that was never
+  on the wire at all, which is the difference between resolving two schemas and
+  re-parsing one.
+
+  This matters because the two schemas were never the same thing and pretending
+  otherwise cost something real. A consumer that wanted to go on reading `v1`
+  had to pass `v1` as `schema:`, and then any message it published registered
+  `v1` as a new version of the subject and walked the subject backwards —
+  a consumer quietly rewriting the producer's history to stand still itself. The
+  choice was that or redeploying every consumer the same afternoon a producer
+  added a field, which is the thing Avro exists to avoid.
+
+  A change Avro cannot resolve — a field whose type changed, a field added
+  without a default — now raises `DecodeError` naming both schemas and quoting
+  the writer's in full, because the writer's is the one nobody has in front of
+  them: it was registered by another process, possibly in another language.
+  Before this, a resolution failure and a truncated body said much the same
+  thing, and they call for opposite responses: one message to park, against
+  every message from that producer until somebody changes a schema.
+
+  **Nothing existing changes.** Left out, `schema:` goes on being both, so every
+  call written before this reads and writes exactly what it did. The wire format
+  is untouched — same framing byte, same four bytes of identifier, same body,
+  and the cross-language fixtures in `spec/fixtures/codec-samples.json` still
+  match Java's and Go's bytes exactly. A reader schema on a fixed-schema codec
+  raises `ArgumentError` rather than being accepted and ignored, since there is
+  no writer's schema there to resolve against. `avro` remains an optional gem,
+  required lazily and named when it is missing.
+
+  **If you have a consumer pinned to an old schema**, move that schema from
+  `schema:` to `reader_schema:` and put the version you publish in `schema:`.
+  Ruby was the last library without this. Java spells it
+  `registered(registry, readerSchema)`, .NET `ReaderSchema`, Go
+  `avro.ReadAs(schema)` and Python `reader_schema=`, which is the spelling
+  followed here.
+
+- **`mandatory:` on `publish`, and the `unroutable` outcome behind it.** A
+  confirm says the broker has the message; it does not say the message reached a
+  queue. An exchange with no matching binding, a typo in a routing key, a
+  consumer's queue that was never declared — all of them are confirmed and
+  dropped in the same breath. It is the quietest failure AMQP has: the publisher
+  succeeds, the consumer waits, and nothing anywhere says why.
+
+  ```ruby
+  begin
+    mq.publish(event, to: "order.placed", exchange: "orders-events", mandatory: true)
+  rescue AceMQ::AMQP::PublishError => e
+    raise unless e.unroutable?
+
+    logger.error("nothing is bound to order.placed: #{e.message}")
+  end
+  ```
+
+  **Off by default and per publish**, so nothing existing changes: turning it on
+  for everybody would turn a message nobody happens to be listening for *yet*
+  into an exception in code that has never seen one. It costs a round trip only
+  when a message really is unroutable — the broker's return arrives ahead of the
+  confirm the publish was already waiting for.
+
+- **`PublishError#unroutable?`.** `false` is a message the broker would not take,
+  `true` is one it took and could not route. One class with a flag rather than
+  two classes, so a caller who only wants to know the message did not arrive
+  still rescues one thing. Go and Python split the same failure the same way;
+  Java has it as `PublishOptions.allowUnroutable()`, the same choice made the
+  other way up. `PublishError.new("...")` and `raise PublishError, "..."` are
+  unchanged.
+
+- **`acemq.publish.total{outcome="unroutable"}`**, and `unroutable` on the publish
+  span with the broker's own reply text as `messaging.acemq.reason`. `unroutable`
+  was already in the shared outcome vocabulary and already in the list of
+  outcomes that make a span an error; it was the one word all five libraries
+  claimed to speak that Ruby could not write. It now writes it, off the same
+  failure the counter is read off, so the metric and the trace cannot disagree
+  about which of `unroutable` and `failed` happened.
+
+  Kept apart from `failed` deliberately: `failed` is a broker or a network,
+  `unroutable` is a binding nobody made, and an operator told `failed` goes
+  looking in the wrong place. The series stays at zero until something asks for a
+  mandatory publish.
+
+- **`PublishContext#mandatory`**, readable and writable, so an interceptor that
+  redirects a message can also decide whether reaching nothing is allowed to be a
+  silence.
 
 - **A ceiling on how many publishes may be waiting for a confirm at once**, named
   `max_outstanding_publishes:` and defaulting to 1000 — the same name, the same
@@ -20,18 +196,20 @@ While the version is `0.x` the public API may change in any release.
                                     max_outstanding_publishes: 1000) # the default
   ```
 
-  Nothing bounded this before. `publish_all` wrote every message in the array it
-  was given before waiting for anything, so a batch of half a million was half a
-  million messages held in this process and on the broker at once, and the
-  documentation's answer was "split a very large batch yourself". That is the
-  shape of a memory leak that looks like throughput: it goes faster and faster
-  right up to the moment the process dies, and nothing in between says why.
+  Nothing in this library bounded this, and a batch publish is where that
+  starts to matter. Unbounded, `publish_all` would write every message in the
+  array it was given before waiting for anything, so a batch of half a million
+  would be half a million messages held in this process and on the broker at
+  once, and the only advice to give would be "split a very large batch
+  yourself". That is the shape of a memory leak that looks like throughput: it
+  goes faster and faster right up to the moment the process dies, and nothing in
+  between says why.
 
-  `publish_all` now writes in **waves**. Up to the ceiling goes out, those
+  So `publish_all` writes in **waves**. Up to the ceiling goes out, those
   confirms come back, and only then is the next wave written. A batch that fits
-  inside the ceiling — nearly all of them — is still one wave, still one wait,
-  still exactly as fast as it was; nothing about a batch of fifty changes. A
-  batch larger than the ceiling no longer has to be split by hand. The results
+  inside the ceiling — nearly all of them — is one wave and one wait, as fast as
+  a single round trip; nothing about a batch of fifty is affected. A batch
+  larger than the ceiling does not have to be split by hand. The results
   still come back in payload order, each message still gets its own answer, a
   `basic.return` is still charged to the message whose id it carries, and a
   message the channel refused still consumes no delivery tag.
@@ -63,9 +241,9 @@ While the version is `0.x` the public API may change in any release.
   unconfirmed when the old channel went can never be confirmed on the new one.
 
   **Nothing to do to adopt this.** The default is high enough that an ordinary
-  batch never meets it. If you were splitting large batches by hand on the old
-  advice, you can stop — though splitting still bounds how long the batch holds
-  this connection's publishing channel, which the ceiling does not.
+  batch never meets it, and a batch larger than it needs no splitting by hand —
+  though splitting one does still bound how long the batch holds this
+  connection's publishing channel, which the ceiling does not.
 
 - **Request and reply counts something at last.** `Telemetry::Outcome::ANSWERED`
   and `TIMED_OUT` have been in this library since the outcome words were shared
@@ -123,10 +301,9 @@ While the version is `0.x` the public API may change in any release.
   unparseable, not just that series — so `Registry#to_prometheus` renders them as
   `routing_key` and `message_type`, which is what Go writes.
 
-  **`Patterns.serve` returns a different object.** It used to hand back the
-  `Consumer` underneath; it hands back a `Patterns::Responder` now, which
-  forwards `cancel`, `running?` and `queue` and exposes the consumer itself as
-  `responder.consumer`. Code that called one of those three needs no change.
+  Getting those two numbers out means `Patterns.serve` hands back a different
+  object than it used to, which is a change rather than an addition and is
+  written up under Changed below.
 
   Still not counted: a reply that arrives with nobody waiting, which Java reports
   as `Requester.unmatched()`. It is dropped silently here.
@@ -232,6 +409,15 @@ While the version is `0.x` the public API may change in any release.
   Go and Python publish this one mandatory for the same reason. Retries are
   unaffected: a rung is checked by name before it is used, and asking the broker
   the same question twice would buy nothing.
+
+- **`Patterns.serve` returns a different object.** It used to hand back the
+  `Consumer` underneath; it hands back a `Patterns::Responder` now, which
+  forwards `cancel`, `running?` and `queue` and exposes the consumer itself as
+  `responder.consumer`. Code that called one of those three needs no change;
+  anything else a `Consumer` answered is reached through `responder.consumer`,
+  and so is an `is_a?(Consumer)` check. The object exists so that a responder can
+  report the two counters described under Added, which a bare consumer had
+  nowhere to keep.
 
 ### Documentation
 
@@ -356,9 +542,9 @@ While the version is `0.x` the public API may change in any release.
   The page now carries the table of all five defaults, the reason they differ,
   and the advice that follows from it — **state the number at the call site if it
   matters to you**, the same advice as for the reading position — along with how
-  to set it. The other four libraries are being given the same framing so the
-  five pages agree rather than each hinting at a difference the others do not
-  mention. The constant's own comment says the same thing, and a spec pins the
+  to set it. Go's page carries the same framing already; the remaining three are
+  a matter for those repositories rather than something this release waits on.
+  The constant's own comment says the same thing, and a spec pins the
   10 so that "harmonise the defaults" cannot be done as a tidy-up: it is a
   decision about every Ruby stream consumer's memory.
 
@@ -401,170 +587,6 @@ While the version is `0.x` the public API may change in any release.
   points at the two pages for the rest, rather than holding a second copy that
   drifts. Its description of the documentation site was also wrong: the README has
   not been the site's front page for some time.
-
-### Added
-
-- **`publish_all`, which sends a batch in one round trip instead of one per
-  message.** Publishing a thousand messages meant a thousand calls to `publish`,
-  and every one of them waited for its own confirm before the next was written.
-  The wait is the right trade for a single message — it is the difference between
-  "the bytes reached a socket" and "the broker has it" — and the wrong one
-  repeated a thousand times, where nearly all the time is spent waiting for a
-  network with nothing on it:
-
-  ```ruby
-  envelopes = mq.publish_all(orders, to: "order.placed", exchange: "orders-events",
-                             type: "order.placed.v2")
-  ```
-
-  Every message is handed to the broker before any confirm is asked for, and
-  then all of them are waited for together — which is what publisher confirms
-  were designed for and what makes a thousand-message publish take about as long
-  as one. The envelopes come back in the order the payloads were given, whatever
-  order the broker confirmed them in, so a result can be matched to the payload
-  that produced it without anybody sorting anything.
-
-  **It is not atomic**, and no library can make it so: AMQP has no way to publish
-  a hundred messages such that all or none arrive. What it does instead is say
-  how much did arrive. A batch that met a failure is still waited for in full,
-  and the `PublishError` counts what happened:
-
-  ```
-  3 of 500 messages were not confirmed; 497 were. The first failure was: …
-  ```
-
-  That sentence matters more than it looks. A half-arrived batch is the ordinary
-  outcome of a broker problem partway through, and a caller told only "it failed"
-  republishes hundreds of messages that are already on a queue. The failure
-  quoted is the first one *in payload order* rather than the first the broker
-  answered, so the same batch reports the same message twice running rather than
-  whichever one the broker happened to answer first. Java's `sendAll` and .NET's
-  `SendAllAsync` raise that sentence word for word, so one runbook covers all
-  three.
-
-  Everything else works per message, exactly as it does for a single publish:
-  each payload gets an envelope of its own (or pass `envelopes:`, one per
-  payload), the publish interceptors run once for each,
-  `acemq.publish.total` is counted once for each with its own outcome, and
-  `mandatory: true` means what it means for one message — a message the broker
-  had nowhere to route is that message's failure, carrying `unroutable?`, and the
-  batch counts it among the ones that did not arrive. The batch error is itself
-  `unroutable?` only when *every* failure was an unroutable message, since that
-  is the only case in which rescuing it and concluding "nothing is bound" would
-  be right.
-
-  **Nothing existing changes.** `publish` is untouched, down to the wording of
-  every exception it raises — the sentences are now written in one place and a
-  batch raises exactly the ones a single publish does, so an alert matching on
-  them keeps matching. Nothing bounds how many messages may be unconfirmed at
-  once, because nothing in this library ever has: the batch is as large as the
-  array handed in, and both this process and the broker hold all of it, so split
-  a very large one yourself. A batch holds the connection's publishing mutex from
-  its first message to its last confirm, which is the price of delivery tags that
-  belong to it alone, and another reason not to send a hundred thousand at once.
-
-  **If you publish in a loop today**, hand the array to `publish_all` instead and
-  rescue `PublishError` around the batch rather than around each message. Ruby,
-  Go and Python were the three libraries without this; Java has had `sendAll`
-  since the beginning and .NET has `SendAllAsync`.
-
-- **`reader_schema:` on `AvroCodec.registered`, which is schema evolution on the
-  read side.** A registered Avro codec resolves every message onto the schema it
-  holds, and that schema used to be the same one it writes with, with no way to
-  separate them:
-
-  ```ruby
-  AvroCodec.registered(registry, subject: "order.placed",
-                       schema: v3_json, reader_schema: v1_json)
-  ```
-
-  The codec now publishes and registers `schema:`, while resolving every message
-  it reads — written by whichever version — onto `reader_schema:`. A field the
-  writer added that the reader has never heard of is skipped rather than
-  shifting every field after it, and a field the reader expects that the writer
-  never sent is filled in from the reader's own default: a value that was never
-  on the wire at all, which is the difference between resolving two schemas and
-  re-parsing one.
-
-  This matters because the two schemas were never the same thing and pretending
-  otherwise cost something real. A consumer that wanted to go on reading `v1`
-  had to pass `v1` as `schema:`, and then any message it published registered
-  `v1` as a new version of the subject and walked the subject backwards —
-  a consumer quietly rewriting the producer's history to stand still itself. The
-  choice was that or redeploying every consumer the same afternoon a producer
-  added a field, which is the thing Avro exists to avoid.
-
-  A change Avro cannot resolve — a field whose type changed, a field added
-  without a default — now raises `DecodeError` naming both schemas and quoting
-  the writer's in full, because the writer's is the one nobody has in front of
-  them: it was registered by another process, possibly in another language.
-  Before this, a resolution failure and a truncated body said much the same
-  thing, and they call for opposite responses: one message to park, against
-  every message from that producer until somebody changes a schema.
-
-  **Nothing existing changes.** Left out, `schema:` goes on being both, so every
-  call written before this reads and writes exactly what it did. The wire format
-  is untouched — same framing byte, same four bytes of identifier, same body,
-  and the cross-language fixtures in `spec/fixtures/codec-samples.json` still
-  match Java's and Go's bytes exactly. A reader schema on a fixed-schema codec
-  raises `ArgumentError` rather than being accepted and ignored, since there is
-  no writer's schema there to resolve against. `avro` remains an optional gem,
-  required lazily and named when it is missing.
-
-  **If you have a consumer pinned to an old schema**, move that schema from
-  `schema:` to `reader_schema:` and put the version you publish in `schema:`.
-  Ruby was the last library without this. Java spells it
-  `registered(registry, readerSchema)`, .NET `ReaderSchema`, Go
-  `avro.ReadAs(schema)` and Python `reader_schema=`, which is the spelling
-  followed here.
-
-- **`mandatory:` on `publish`, and the `unroutable` outcome behind it.** A
-  confirm says the broker has the message; it does not say the message reached a
-  queue. An exchange with no matching binding, a typo in a routing key, a
-  consumer's queue that was never declared — all of them are confirmed and
-  dropped in the same breath. It is the quietest failure AMQP has: the publisher
-  succeeds, the consumer waits, and nothing anywhere says why.
-
-  ```ruby
-  begin
-    mq.publish(event, to: "order.placed", exchange: "orders-events", mandatory: true)
-  rescue AceMQ::AMQP::PublishError => e
-    raise unless e.unroutable?
-
-    logger.error("nothing is bound to order.placed: #{e.message}")
-  end
-  ```
-
-  **Off by default and per publish**, so nothing existing changes: turning it on
-  for everybody would turn a message nobody happens to be listening for *yet*
-  into an exception in code that has never seen one. It costs a round trip only
-  when a message really is unroutable — the broker's return arrives ahead of the
-  confirm the publish was already waiting for.
-
-- **`PublishError#unroutable?`.** `false` is a message the broker would not take,
-  `true` is one it took and could not route. One class with a flag rather than
-  two classes, so a caller who only wants to know the message did not arrive
-  still rescues one thing. Go and Python split the same failure the same way;
-  Java has it as `PublishOptions.allowUnroutable()`, the same choice made the
-  other way up. `PublishError.new("...")` and `raise PublishError, "..."` are
-  unchanged.
-
-- **`acemq.publish.total{outcome="unroutable"}`**, and `unroutable` on the publish
-  span with the broker's own reply text as `messaging.acemq.reason`. `unroutable`
-  was already in the shared outcome vocabulary and already in the list of
-  outcomes that make a span an error; it was the one word all five libraries
-  claimed to speak that Ruby could not write. It now writes it, off the same
-  failure the counter is read off, so the metric and the trace cannot disagree
-  about which of `unroutable` and `failed` happened.
-
-  Kept apart from `failed` deliberately: `failed` is a broker or a network,
-  `unroutable` is a binding nobody made, and an operator told `failed` goes
-  looking in the wrong place. The series stays at zero until something asks for a
-  mandatory publish.
-
-- **`PublishContext#mandatory`**, readable and writable, so an interceptor that
-  redirects a message can also decide whether reaching nothing is allowed to be a
-  silence.
 
 ## [0.5.0] - 2026-09-09
 
