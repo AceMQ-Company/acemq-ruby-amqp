@@ -117,6 +117,17 @@ module AceMQ
       #
       # RabbitMQ refuses a stream consumer with no prefetch at all, and the
       # error it gives does not explain why, so there is always one.
+      #
+      # **The number is this library's choice and not part of the
+      # cross-language contract.** Java and .NET default to 100 here, Go, Python
+      # and Ruby to 10, and the disagreement is deliberate: prefetch trades
+      # memory against throughput, the right answer depends on payload size and
+      # handler speed, and both of those belong to the application rather than
+      # to the protocol. A stream one library wrote is read by any of them
+      # whatever this says — the offset, the retention arguments and the message
+      # on the wire are the contract, and prefetch is a consumer-side setting
+      # that never leaves the channel. Do not harmonise this with Java's; state
+      # the number at the call site if it matters. See +docs/streams.md+.
       DEFAULT_STREAM_PREFETCH = 10
 
       # Reads a stream from a chosen position.

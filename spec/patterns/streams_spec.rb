@@ -105,6 +105,16 @@ RSpec.describe "streams" do
       expect(options[:prefetch]).to be_positive
     end
 
+    it "holds ten by default, which is this library's number and not the contract" do
+      # Pinned against being "harmonised" with Java's and .NET's 100. Prefetch
+      # trades memory against throughput, the right number depends on payload
+      # size and handler speed, and neither is a property of the protocol —
+      # docs/streams.md says so, and the five pages agree. Go and Python default
+      # to 10 as well. Changing this is a decision about every Ruby stream
+      # consumer's memory, not a tidy-up.
+      expect(AceMQ::AMQP::Patterns::DEFAULT_STREAM_PREFETCH).to eq(10)
+    end
+
     it "names the consumer when asked, which is what lets the broker track its offset" do
       AceMQ::AMQP::Patterns.read_stream(mq, "events", name: "projection-1") do
         AceMQ::AMQP::Ack.accept

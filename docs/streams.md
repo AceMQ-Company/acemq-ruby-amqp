@@ -186,13 +186,47 @@ to push back with, because nothing is being removed.
 Patterns.read_stream(mq, "orders.log", prefetch: 500) { |message| … }
 ```
 
-The default is **10**, which is low, and lower than the 20 an ordinary consumer
-gets here and the 100 Java's stream consumer gets. Prefetch is not part of the
-cross-language contract — the libraries pick their own numbers and none of them
-is more correct than another — so treat 10 as a floor that keeps a stream
-consumer legal rather than as a recommendation. A projection catching up on a
-year of history wants hundreds, and the number to raise it to is the one at
-which this process still has memory for what it is holding unacknowledged.
+The default is **10** — `Patterns::DEFAULT_STREAM_PREFETCH` — which is lower than
+the 20 an ordinary consumer gets here.
+
+### The number is this library's choice, not the contract
+
+**The default is not part of the cross-language contract, and the five libraries
+deliberately disagree about it:**
+
+| Library | Default stream prefetch |
+|---|---|
+| Java | 100 |
+| .NET | 100 |
+| Go | 10 |
+| Python | 10 |
+| Ruby | 10 |
+
+Nothing is wrong with either number. Prefetch is a trade of **memory against
+throughput** — how many undelivered messages a consumer is willing to hold in
+order to avoid waiting on a round trip for each one — and the right answer
+depends on payload size and handler speed, both of which are properties of your
+application rather than of the protocol. A library picking a different default
+does not make a stream written by one unreadable by another: the offset, the
+retention arguments and the message on the wire are the contract, and prefetch is
+a consumer-side setting that never leaves the channel.
+
+So do not read across from another AceMQ service and expect the same number, and
+do not treat a difference between two languages here as a bug to be filed. **If
+the value matters to you, state it** — the same advice as the reading position:
+
+```ruby
+Patterns.read_stream(mq, "orders.log",
+                     offset: Patterns::StreamOffset.first,
+                     prefetch: 50,        # say it rather than inherit it
+                     name: "projection-1") { |message| … }
+```
+
+Large payloads want a smaller number, because prefetch multiplies them in memory.
+A fast handler on small messages wants a larger one, because the round trip
+starts to dominate — a projection catching up on a year of history wants
+hundreds. The number to raise it to is the one at which this process still has
+memory for everything it is holding unacknowledged.
 
 ## What a stream cannot do
 

@@ -176,6 +176,28 @@ While the version is `0.x` the public API may change in any release.
 
 ### Documentation
 
+- **Stream prefetch is a per-library choice, and `docs/streams.md` now says so
+  outright.** The number is unchanged: `Patterns::DEFAULT_STREAM_PREFETCH` is
+  still 10, as it is in Go and Python, where Java and .NET use 100.
+
+  What was missing was the framing. A reader who had seen Java's 100 and then met
+  Ruby's 10 had nothing telling them whether they had found a bug, a deliberate
+  difference, or something that would make a stream written by one library
+  unreadable by another. It is the second: prefetch trades **memory against
+  throughput**, the right answer depends on payload size and handler speed, and
+  both of those are properties of an application rather than of the protocol.
+  The contract is the offset, the retention arguments and the message on the
+  wire; prefetch is a consumer-side setting that never leaves the channel.
+
+  The page now carries the table of all five defaults, the reason they differ,
+  and the advice that follows from it — **state the number at the call site if it
+  matters to you**, the same advice as for the reading position — along with how
+  to set it. The other four libraries are being given the same framing so the
+  five pages agree rather than each hinting at a difference the others do not
+  mention. The constant's own comment says the same thing, and a spec pins the
+  10 so that "harmonise the defaults" cannot be done as a tidy-up: it is a
+  decision about every Ruby stream consumer's memory.
+
 - **Seven pages the documentation site was missing**, all of them in the
   navigation: `docs/request-reply.md`, `docs/streams.md`, and four tutorials
   behind `docs/tutorials.md` — your first message, surviving failure, never
