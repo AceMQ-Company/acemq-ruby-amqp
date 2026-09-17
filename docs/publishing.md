@@ -219,10 +219,45 @@ broker had nowhere to route — that being the only case where concluding "nothi
 is bound" is right. A batch that met a missing binding and a refused message is
 not an unroutable batch.
 
-Nothing bounds how many messages may be unconfirmed at once: the batch is as
-large as the array you hand in, and both this process and the broker hold all of
-it. Split a very large batch yourself — a few thousand at a time keeps the
-throughput and bounds the memory.
+### How many messages may be unconfirmed at once
+
+A thousand, by default, for the whole connection:
+
+```ruby
+mq = AceMQ::AMQP::Connection.open("amqp://localhost",
+                                  max_outstanding_publishes: 1000) # the default
+```
+
+That ceiling is the difference between backpressure and a memory leak that looks
+like throughput. A publisher that hands over messages faster than the broker
+confirms them is accumulating unconfirmed messages in this process and in the
+broker, and nothing about the accumulation is visible until the process dies of
+it. Java's `maxOutstandingPublishes` and .NET's `MaxOutstandingPublishes` are the
+same number in the same place.
+
+`publish_all` respects it by writing in **waves**: up to the ceiling goes out,
+those confirms come back, and only then is the next wave written. A batch that
+fits inside the ceiling — which is nearly all of them — is one wave and is
+exactly as fast as it always was. A batch of a hundred thousand is a hundred
+waves rather than a hundred thousand messages nobody bounded, and you no longer
+have to split it by hand. The results still come back in payload order and each
+message still gets its own answer.
+
+Room is given back when the broker answers for a message, and an ack, a nack and
+a `basic.return` are all answers. A message the broker has taken and said
+*nothing* about keeps its room, because that message really is still outstanding.
+So when a broker stops confirming altogether, the ceiling fills and the messages
+that cannot be written are told why rather than buffered:
+
+```
+cannot publish message m-4 to exchange "orders-events" with key "order.placed":
+1000 publishes are already waiting for a confirm and none of them completed.
+The broker is not keeping up; publish more slowly rather than buffering more.
+```
+
+Raise the ceiling if you have measured that you need to and have the memory for
+it. Reaching it is a signal about the broker, and buffering more is the one
+response to that signal which cannot help.
 
 ## Publishing and a database in the same breath
 
@@ -242,11 +277,14 @@ that same channel while an application thread may be publishing its own. The
 cost is that publishes on one connection serialise; the alternative is two
 threads interleaving frames into a protocol error.
 
-`publish_all` holds that same mutex for the whole batch — every message and the
-one wait at the end — because the delivery tags it hands back have to belong to
-this batch and to nothing else. A very large batch therefore keeps other threads
-on this connection waiting for as long as it takes, which is another reason to
-split one.
+`publish_all` holds that same mutex for the whole batch — every wave and every
+wait — because the delivery tags it hands back have to belong to this batch and
+to nothing else. A very large batch therefore keeps other threads on this
+connection waiting for as long as it takes. The
+[ceiling](#how-many-messages-may-be-unconfirmed-at-once) bounds the memory a
+batch costs, not the time it holds the mutex for; if other threads on this
+connection must keep publishing while a long batch runs, give the batch a
+connection of its own.
 
 Interceptors are called on whichever thread is publishing, so one that keeps
 state has to be safe to call from several at once.

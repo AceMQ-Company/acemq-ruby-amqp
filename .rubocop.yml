@@ -61,6 +61,14 @@ Metrics/ClassLength:
     # put half of that contract in another file without removing a line of it,
     # and the one place to read "what does this library emit" would become two.
     - lib/acemq/amqp/telemetry/open_telemetry.rb
+    # Transport is the seam the rest of the library is written against: open,
+    # declare, bind, publish, publish a batch, subscribe, pull, count, delete,
+    # close. Its length is the width of that surface rather than a class that
+    # grew — the bookkeeping that could be lifted out of it already has been,
+    # into ReturnedMessages, BatchPublish and PublishPermits alongside it. What
+    # is left is one method per verb, and splitting those in two would mean
+    # answering "which half of the broker is this?" at every call site.
+    - lib/acemq/amqp/transport.rb
 
 # The specs name the fixtures at the top level on purpose: they are the
 # contract, and reading them should not require unpicking a let block.

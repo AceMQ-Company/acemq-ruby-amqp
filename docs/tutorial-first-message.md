@@ -227,13 +227,13 @@ messages were not confirmed; 497 were.` That sentence matters, because a caller
 told only "it failed" republishes hundreds of messages that are already on a
 queue.
 
-**Nothing bounds the batch.** There is no cap on how many messages may be
-unconfirmed at once — the batch is as large as the array you hand in, and both
-this process and the broker hold all of it. The whole batch also holds this
-connection's publishing channel, from the first message to the last confirm, so
-any other thread publishing on this connection waits that long. Split a very
-large batch yourself; a few thousand at a time keeps the throughput and bounds
-both.
+**A thousand messages may be unconfirmed at once**, and no more. A batch larger
+than that is written in waves of a thousand rather than all at once, so the array
+you hand in can be as long as you like without this process and the broker
+holding all of it — `max_outstanding_publishes:` moves the number. What the
+ceiling does not bound is time: the whole batch holds this connection's
+publishing channel from its first message to its last confirm, so any other
+thread publishing on this connection waits that long.
 
 [Publishing](publishing.md#publishing-a-batch) has the rest.
 

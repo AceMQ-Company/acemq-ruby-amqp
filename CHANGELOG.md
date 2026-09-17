@@ -8,6 +8,65 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A ceiling on how many publishes may be waiting for a confirm at once**, named
+  `max_outstanding_publishes:` and defaulting to 1000 — the same name, the same
+  place and the same number as Java's `maxOutstandingPublishes` and .NET's
+  `MaxOutstandingPublishes`.
+
+  ```ruby
+  mq = AceMQ::AMQP::Connection.open("amqp://localhost",
+                                    max_outstanding_publishes: 1000) # the default
+  ```
+
+  Nothing bounded this before. `publish_all` wrote every message in the array it
+  was given before waiting for anything, so a batch of half a million was half a
+  million messages held in this process and on the broker at once, and the
+  documentation's answer was "split a very large batch yourself". That is the
+  shape of a memory leak that looks like throughput: it goes faster and faster
+  right up to the moment the process dies, and nothing in between says why.
+
+  `publish_all` now writes in **waves**. Up to the ceiling goes out, those
+  confirms come back, and only then is the next wave written. A batch that fits
+  inside the ceiling — nearly all of them — is still one wave, still one wait,
+  still exactly as fast as it was; nothing about a batch of fifty changes. A
+  batch larger than the ceiling no longer has to be split by hand. The results
+  still come back in payload order, each message still gets its own answer, a
+  `basic.return` is still charged to the message whose id it carries, and a
+  message the channel refused still consumes no delivery tag.
+
+  Room is given back when the broker answers for a message, and an ack, a nack
+  and a return are all answers. A message the broker has taken and said *nothing*
+  about keeps its room, because that message is still outstanding — which is what
+  makes the ceiling bite on the case it exists for. When a broker stops
+  confirming altogether, the messages that cannot be written are told why instead
+  of being buffered behind it:
+
+  ```
+  cannot publish message m-4 to exchange "orders-events" with key "order.placed":
+  1000 publishes are already waiting for a confirm and none of them completed.
+  The broker is not keeping up; publish more slowly rather than buffering more.
+  ```
+
+  The second sentence is Java's, word for word, so one runbook covers both.
+  Reaching the ceiling is a signal about the broker, and buffering more is the
+  one response to that signal which cannot help — raise it only if you have
+  measured that you need to and have the memory for it.
+
+  A single `publish` is bounded by the same ceiling. It waits for its own
+  confirm, so it can never be more than one message outstanding on its own
+  account and will not notice the limit; what it will notice is a connection
+  whose room has already been taken by messages nothing ever confirmed, and it
+  says so in the same words rather than adding one more to the pile. Reopening
+  the publishing channel gives every one of those back, since a message that was
+  unconfirmed when the old channel went can never be confirmed on the new one.
+
+  **Nothing to do to adopt this.** The default is high enough that an ordinary
+  batch never meets it. If you were splitting large batches by hand on the old
+  advice, you can stop — though splitting still bounds how long the batch holds
+  this connection's publishing channel, which the ceiling does not.
+
 ### Changed
 
 - **A message that cannot be set aside is now rejected to the broker rather than

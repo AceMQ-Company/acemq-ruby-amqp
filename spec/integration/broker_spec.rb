@@ -1128,6 +1128,27 @@ RSpec.describe "against a real broker", :integration do
       expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
                      exchange: "", outcome: "unroutable"]).to eq(3)
     end
+
+    it "writes a batch larger than the ceiling in waves, and loses none of it" do
+      # Four at a time, twenty-five messages: seven waves, six of them confirmed
+      # before the next was written. A real broker is the only thing that can
+      # say the delivery tags still line up across a wave boundary, because the
+      # tags are its and it goes on counting through all seven.
+      bounded = AceMQ::AMQP::Connection.open(
+        BROKER, origin: "rspec@rbit", max_outstanding_publishes: 4
+      )
+      begin
+        expect(bounded.transport.max_outstanding_publishes).to eq(4)
+        envelopes = bounded.publish_all(payloads, to: queue, type: "order.placed.v2")
+
+        expect(envelopes.size).to eq(payloads.size)
+        expect(wait_for { mq.message_count(queue) == payloads.size }).to be(true)
+        # In the order they were given, wave boundaries and all.
+        expect(take_one(queue).last).to eq('{"order_id":"A-1"}')
+      ensure
+        bounded.close
+      end
+    end
   end
 
   # The whole reason the set-aside republish is mandatory, and the behaviour

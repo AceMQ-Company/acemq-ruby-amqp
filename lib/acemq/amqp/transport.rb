@@ -78,6 +78,95 @@ module AceMQ
       end
     end
 
+    # How many messages may be on the wire with no confirm back yet.
+    #
+    # The ceiling is the only backpressure a publisher that does not wait per
+    # message has. Without it a caller who publishes faster than the broker
+    # confirms accumulates unconfirmed messages until the process dies, which
+    # looks like throughput right up to the moment it does not — and the bigger
+    # the array handed to {Transport#publish_all}, the closer that moment.
+    #
+    # A permit is taken *before* the message is written and given back when the
+    # broker has answered for it, whichever way it answered: an ack, a nack and
+    # a +basic.return+ are all answers. A message nothing ever answered for
+    # keeps its permit, because as far as the broker is concerned that message
+    # is still outstanding — which is what makes the ceiling bite when a broker
+    # stops keeping up rather than only when somebody hands in a huge array.
+    # Java holds the permit in exactly the same place, in a +Semaphore+ released
+    # from its confirm listener, and .NET in a +SemaphoreSlim+.
+    #
+    # Nothing waits here. Java can afford to block for its confirm timeout
+    # because its publishes are asynchronous and another thread's confirm can
+    # release a permit while this one waits; Ruby's transport publishes under
+    # the publishing channel's mutex, so the thread that would wait is the only
+    # thread that could ever release one, and a wait would be a deadlock dressed
+    # up as patience. Exhaustion is therefore reported straight away, in the
+    # sentence Java uses for it, rather than stalling silently.
+    #
+    # @api private
+    class PublishPermits
+      # What Java's +ConnectionConfig.maxOutstandingPublishes+ and .NET's
+      # +MaxOutstandingPublishes+ default to. Large enough that an ordinary
+      # batch never notices it, small enough that a runaway publisher is stopped
+      # while the process still has memory to report it with.
+      DEFAULT = 1_000
+
+      # @return [Integer] the ceiling this was built with
+      attr_reader :limit
+
+      # @param limit [Integer] how many publishes may await a confirm at once
+      # @raise [ConfigurationError] when the ceiling is not a positive number
+      def initialize(limit = DEFAULT)
+        @limit = Integer(limit)
+        if @limit < 1
+          raise ConfigurationError,
+                "max_outstanding_publishes must be at least 1, was #{limit.inspect}"
+        end
+
+        @available = @limit
+        @lock = Mutex.new
+      end
+
+      # How many more messages may go out before one has to be answered for.
+      def available = @lock.synchronize { @available }
+
+      # Takes one permit, or answers false when there are none left.
+      def take
+        @lock.synchronize do
+          next false if @available.zero?
+
+          @available -= 1
+          true
+        end
+      end
+
+      # Gives back the permits of messages the broker has answered for.
+      def release(count)
+        return if count.zero?
+
+        @lock.synchronize { @available = [@available + count, @limit].min }
+        nil
+      end
+
+      # Forgets everything outstanding, for a publishing channel that has been
+      # reopened. The messages those permits were held for went down with the
+      # old channel and can no longer be confirmed on the new one, which is the
+      # same conclusion Java's shutdown listener reaches when it fails every
+      # pending publish.
+      def reopened
+        @lock.synchronize { @available = @limit }
+        nil
+      end
+
+      # What to say when there is no room left. The second sentence is Java's,
+      # word for word, so one runbook covers both.
+      def exhausted
+        "#{@limit} publishes are already waiting for a confirm and none of them " \
+          "completed. The broker is not keeping up; publish more slowly rather " \
+          "than buffering more."
+      end
+    end
+
     # The two rules about what a property looks like on the wire, shared by
     # everything here that writes one.
     #
@@ -261,15 +350,40 @@ module AceMQ
         @messages = messages
         @returns = returns
         @results = Array.new(messages.size)
+        # Delivery tag to payload position, for the messages that are on the
+        # wire right now with no answer back yet. Emptied by every wave.
+        @wave = {}
+        @waited = false
       end
 
-      # Publishes every message, waits once, and answers for each of them.
+      # Publishes every message in waves no wider than the permits allow, and
+      # answers for each of them.
       #
+      # A batch that fits inside the ceiling is one wave and behaves exactly as
+      # it always did: every message is written before anything is waited for,
+      # which is the point of the method. What changed is a batch that does not
+      # fit. That used to be written in full, however long the array was, with
+      # this process and the broker both holding all of it; it is now written in
+      # waves, each one confirmed — and its permits handed back — before the
+      # next is written. The results still come back in payload order, each
+      # message still gets its own answer, and a +basic.return+ is still charged
+      # to the message whose id it carries.
+      #
+      # @param permits [PublishPermits] the connection's ceiling, shared with
+      #   every other publish on it
       # @return [Array<String, PublishError>] one entry per message, in the
       #   order they were given
-      def run(channel)
+      def run(channel, permits)
         arm_returns(channel)
-        confirm_each(channel, publish_each(channel))
+        @messages.each_index do |index|
+          unless room_for_one(channel, permits)
+            no_room_for(index, permits)
+            return @results
+          end
+
+          publish_one(channel, index, permits)
+        end
+        settle(channel, permits) unless @wave.empty? && @waited
         @results
       end
 
@@ -282,55 +396,102 @@ module AceMQ
         @returns.arm_all(channel, exchanges.uniq) unless exchanges.empty?
       end
 
-      # Hands every message to the channel, and remembers which delivery tag
-      # each one was given.
+      # Whether there is room on the wire for one more message.
+      #
+      # The permit is taken before the message is written, never after: a
+      # ceiling checked once the bytes are already gone bounds nothing. When
+      # there is none left, the wave already out is confirmed first — which
+      # hands its permits back and is the ordinary way a large batch proceeds.
+      # Only when that returns no room at all is the answer no, and it is the
+      # caller's job to say so rather than to keep buffering.
+      def room_for_one(channel, permits)
+        return true if permits.take
+
+        settle(channel, permits) unless @wave.empty?
+        permits.take
+      end
+
+      # Hands one message to the channel, and remembers which delivery tag it
+      # was given.
       #
       # The tag is read *after* the publish rather than before. bunny takes the
       # next sequence number as part of +basic_publish+, so a publish refused
       # before it got that far has consumed none, and a tag read in advance
       # would belong to the message after it — which is how a batch ends up
       # reporting the wrong message as the failed one.
-      def publish_each(channel)
-        tags = {}
-        @messages.each_with_index do |message, index|
-          channel.basic_publish(message[:body].to_s, message[:exchange],
-                                message[:routing_key], publish_options(message))
-          tags[channel.next_publish_seq_no - 1] = index
-        rescue StandardError => e
-          # One failure out of the batch rather than a reason to abandon the
-          # messages already on the wire. They are going to be confirmed anyway,
-          # and how many of them arrived is what the caller has to act on.
-          @results[index] = PublishError.new(
-            PublishFailure.not_published(message[:message_id], message[:exchange],
-                                         message[:routing_key], e.message)
-          )
-        end
-        tags
+      def publish_one(channel, index, permits)
+        message = @messages[index]
+        channel.basic_publish(message[:body].to_s, message[:exchange],
+                              message[:routing_key], publish_options(message))
+        @wave[channel.next_publish_seq_no - 1] = index
+      rescue StandardError => e
+        # One failure out of the batch rather than a reason to abandon the
+        # messages already on the wire. They are going to be confirmed anyway,
+        # and how many of them arrived is what the caller has to act on.
+        #
+        # Nothing reached the wire, so nothing is outstanding and the permit
+        # goes straight back — the same place Java releases it when
+        # basicPublish throws.
+        permits.release(1)
+        @results[index] = PublishError.new(
+          PublishFailure.not_published(message[:message_id], message[:exchange],
+                                       message[:routing_key], e.message)
+        )
       end
 
-      # Waits once for the whole batch, then reads each message's answer off
-      # the channel.
+      # Every message from +from+ onwards, answered with the reason there was no
+      # room to write it.
+      #
+      # Answered rather than raised, because that is what {#run} promises for
+      # every other failure: a caller told only "the batch failed" republishes
+      # the ones that already arrived. The sentence names the ceiling and what
+      # to do about it, so a log line is enough to act on.
+      def no_room_for(from, permits)
+        (from...@messages.size).each do |index|
+          message = @messages[index]
+          @results[index] = PublishError.new(
+            PublishFailure.not_published(message[:message_id], message[:exchange],
+                                         message[:routing_key], permits.exhausted)
+          )
+        end
+      end
+
+      # Waits once for the wave that is on the wire, reads each of its messages'
+      # answers off the channel, and hands back the permits of the ones the
+      # broker answered for.
       #
       # bunny does not report a failed publish per message. It answers the wait
       # with "were they all acked", leaves the delivery tags of the ones that
       # were not in +nacked_set+, and leaves the ones nothing ever answered for
       # in +unconfirmed_set+. Both are sets of tags rather than of messages,
-      # which is what +tags+ is for: without it a batch could say how many
+      # which is what +@wave+ is for: without it a batch could say how many
       # failed and not which, and its results would no longer line up with the
       # payloads that produced them.
       #
       # +nacked_set+ is never emptied by bunny, so it can hold tags from
-      # publishes that finished long ago. Only this batch's tags are looked up
+      # publishes that finished long ago. Only this wave's tags are looked up
       # in it, which is what keeps an older failure from being reported twice.
-      def confirm_each(channel, tags)
+      #
+      # A tag still in +unconfirmed_set+ keeps its permit. Nothing answered for
+      # that message, so it is still outstanding as far as the broker is
+      # concerned, and a ceiling that forgave it would be a ceiling that never
+      # bites on the one broker it exists to protect this process from.
+      def settle(channel, permits)
+        tags = @wave
+        @wave = {}
+        @waited = true
         broke = wait_for_batch(channel)
         nacked = channel.nacked_set.dup
         silent = channel.unconfirmed_set.dup
-        returned = returns_for
+        returned = returns_for(tags.values)
+        answered = 0
         tags.each do |tag, index|
-          unconfirmed = nacked.include?(tag) || silent.include?(tag)
+          unanswered = silent.include?(tag)
+          answered += 1 unless unanswered
+          unconfirmed = unanswered || nacked.include?(tag)
           @results[index] = answer_for(@messages[index], returned, unconfirmed, broke)
         end
+        permits.release(answered)
       end
 
       # What one message of a batch came to.
@@ -365,13 +526,18 @@ module AceMQ
         e
       end
 
-      # Which of these messages the broker handed back, keyed by message id.
+      # Which of this wave's messages the broker handed back, keyed by message
+      # id.
       #
       # A +basic.return+ carries the returned message's own properties, so a
       # batch can ask which of its messages came back rather than only that one
-      # did.
-      def returns_for
-        ids = @messages.filter_map { |m| m[:message_id].to_s if m[:mandatory] }
+      # did. Only the wave that has just been waited for is considered: a return
+      # always precedes the confirm for the same message, so nothing belonging
+      # to a later wave can have arrived yet, and everything belonging to an
+      # earlier one was taken when that wave settled.
+      def returns_for(indexes)
+        ids = indexes.map { |index| @messages[index] }
+                     .filter_map { |m| m[:message_id].to_s if m[:mandatory] }
         return {} if ids.empty?
 
         @returns.take_all.each_with_object({}) do |(id, reason), by_id|
@@ -445,20 +611,31 @@ module AceMQ
       # @param connection_timeout [Numeric] seconds to wait for the handshake
       # @param security [Security, nil] how to protect the connection
       # @param credentials [Credentials, #call, nil] the broker login
+      # @param max_outstanding_publishes [Integer] how many messages may be
+      #   waiting for a confirm on this connection at once; see
+      #   {PublishPermits}. The same ceiling as Java's
+      #   +maxOutstandingPublishes+ and .NET's +MaxOutstandingPublishes+, and
+      #   the same default
       # @param options [Hash] anything else bunny understands
       # @return [Transport]
       # @raise [DependencyMissing] when bunny is not installed
       # @raise [ConfigurationError] when the security settings cannot be honoured
       # @raise [TransportError] when the broker cannot be reached
       def self.open(url, heartbeat: :server, connection_timeout: 10, security: nil,
-                    credentials: nil, **options)
+                    credentials: nil, max_outstanding_publishes: PublishPermits::DEFAULT,
+                    **options)
         load_driver!
         security = Security.for_connection(url, security: security, credentials: credentials)
+        # Built before the socket is opened: a ceiling of nought is a
+        # configuration mistake, and finding it out after a connection has been
+        # established means an error that mentions the broker for a reason that
+        # has nothing to do with it.
+        permits = PublishPermits.new(max_outstanding_publishes)
         session = Bunny.new(url, heartbeat: heartbeat, connection_timeout: connection_timeout,
                                  **options, **security.to_transport_options)
         security.configure(session)
         session.start
-        new(session)
+        new(session, max_outstanding_publishes: permits.limit)
       rescue DependencyMissing, ConfigurationError
         raise
       rescue StandardError => e
@@ -475,8 +652,10 @@ module AceMQ
       end
 
       # @param session [Bunny::Session] an already started connection
-      def initialize(session)
+      # @param max_outstanding_publishes [Integer] see {PublishPermits}
+      def initialize(session, max_outstanding_publishes: PublishPermits::DEFAULT)
         @session = session
+        @permits = PublishPermits.new(max_outstanding_publishes)
         @lock = Mutex.new
         # A lock of its own, because a pull holds messages unacknowledged across
         # a whole pass and settling one has to reach the channel it came down.
@@ -489,6 +668,10 @@ module AceMQ
 
       # The bunny session, for the things this class deliberately does not wrap.
       attr_reader :session
+
+      # How many publishes may be waiting for a confirm on this connection at
+      # once. See {PublishPermits}.
+      def max_outstanding_publishes = @permits.limit
 
       # Creates an exchange unless it is already there.
       #
@@ -555,14 +738,13 @@ module AceMQ
         returned = nil
         confirmed = publish_channel do |channel|
           @returns.arm(channel, exchange) if mandatory
-          channel.basic_publish(body.to_s, exchange, routing_key,
-                                content_type: content_type, message_id: message_id,
-                                reply_to: presence(reply_to), mandatory: mandatory,
-                                headers: stringify(headers), persistent: persistent)
+          ok = write_and_wait(channel, body.to_s, exchange, routing_key,
+                              content_type: content_type, message_id: message_id,
+                              reply_to: presence(reply_to), mandatory: mandatory,
+                              headers: stringify(headers), persistent: persistent)
           # The return, when there is one, arrives ahead of the confirm and is
           # dispatched on the reader thread while this one waits — so by the
           # time the wait is over it is already waiting to be taken.
-          ok = channel.wait_for_confirms
           returned = @returns.take if mandatory
           ok
         end
@@ -605,7 +787,7 @@ module AceMQ
         return [] if messages.empty?
 
         batch = BatchPublish.new(messages, @returns)
-        publish_channel { |channel| batch.run(channel) }
+        publish_channel { |channel| batch.run(channel, @permits) }
       end
 
       # Delivers messages until the returned subscription is cancelled.
@@ -795,8 +977,48 @@ module AceMQ
             @publish_channel = @session.create_channel
             @publish_channel.confirm_select
             @returns.reopened
+            # Whatever was still unconfirmed went down with the old channel and
+            # can never be confirmed on this one, so holding its permits would
+            # shrink the ceiling a little with every reconnect until publishing
+            # stopped for a reason nothing in the logs explained. Java frees the
+            # same permits from its shutdown listener.
+            @permits.reopened
           end
           yield @publish_channel
+        end
+      end
+
+      # One message written and waited for, under a permit taken before any of
+      # it reaches the wire.
+      #
+      # A single publish waits for its own confirm, so it can only ever be one
+      # message outstanding and the ceiling never refuses it on its own account.
+      # The permits are the connection's, though, and a batch that left messages
+      # nothing answered for is still holding some of them — so a publish that
+      # finds none left is publishing into a broker that has stopped keeping up,
+      # and is told so in those words rather than joining the queue.
+      #
+      # @return [Boolean] bunny's answer to "were they all acked"
+      # @raise [PublishError] when there is no room left on the connection
+      def write_and_wait(channel, body, exchange, routing_key, **properties)
+        # Taken outside the ensure below on purpose: a permit that was never
+        # granted must not be given back, and an ensure that cannot tell the two
+        # apart hands the connection a permit it never had.
+        raise PublishError, @permits.exhausted unless @permits.take
+
+        outstanding = false
+        begin
+          channel.basic_publish(body, exchange, routing_key, **properties)
+          outstanding = true
+          confirmed = channel.wait_for_confirms
+          outstanding = false
+          confirmed
+        ensure
+          # An ack and a nack are both answers and give the permit back; so does
+          # a publish the channel would not even take, since nothing reached the
+          # wire. The one case that keeps it is a message the broker has and has
+          # said nothing about, which is exactly the message still outstanding.
+          @permits.release(1) unless outstanding
         end
       end
 

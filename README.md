@@ -95,7 +95,13 @@ It is **not atomic**; AMQP has no such thing. A batch that half arrived raises a
 `PublishError` that says how much did — `"3 of 500 messages were not confirmed;
 497 were. The first failure was: …"`, the same sentence Java's `sendAll` and
 .NET's `SendAllAsync` raise — and every message is waited for even after the
-first failure, so that count is real. See
+first failure, so that count is real.
+
+A thousand messages may be unconfirmed at once — `max_outstanding_publishes:`,
+the same ceiling and the same default as Java's `maxOutstandingPublishes` and
+.NET's `MaxOutstandingPublishes`. A larger batch is written in waves of that size
+rather than all at once, so an array of any length costs bounded memory here and
+on the broker. See
 [publishing a batch](docs/publishing.md#publishing-a-batch).
 
 ### Codecs

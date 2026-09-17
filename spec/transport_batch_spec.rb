@@ -47,16 +47,25 @@ class FakeChannel
     @refused = []
     @exchanges = {}
     @error = nil
+    @open = true
     @lock = Mutex.new
   end
 
-  def open? = true
+  def open? = @lock.synchronize { @open }
   def close = nil
   def register_exchange(exchange) = @exchanges[exchange.name] = exchange
   def next_publish_seq_no = @lock.synchronize { @next_publish_seq_no }
 
+  # The broker took the channel down, the way it does for an unroutable
+  # declaration or a connection that dropped. The transport notices on its next
+  # publish and opens another — this same object, since a session hands out one.
+  def closed! = @lock.synchronize { @open = false }
+
   def confirm_select(_callback = nil)
-    @lock.synchronize { @next_publish_seq_no = 1 if @next_publish_seq_no.zero? }
+    @lock.synchronize do
+      @open = true
+      @next_publish_seq_no = 1 if @next_publish_seq_no.zero?
+    end
     nil
   end
 
@@ -149,11 +158,17 @@ RSpec.describe AceMQ::AMQP::Transport do
     end
   end
 
-  def batch(outgoing)
-    thread = Thread.new { transport.publish_all(outgoing) }
+  def batch(outgoing, using: transport)
+    thread = Thread.new { using.publish_all(outgoing) }
     thread.report_on_exception = false
     (@batches ||= []) << thread
     thread
+  end
+
+  # A transport whose ceiling is small enough to reach in a test. Everything
+  # about it is the ordinary one; only the number differs.
+  def bounded(limit)
+    described_class.new(FakeSession.new(channel), max_outstanding_publishes: limit)
   end
 
   it "hands every message to the broker before it waits for any confirm" do
@@ -270,5 +285,105 @@ RSpec.describe AceMQ::AMQP::Transport do
   it "sends nothing for an empty batch" do
     expect(transport.publish_all([])).to eq([])
     expect(channel.calls).to be_empty
+  end
+
+  describe "how many publishes may be unconfirmed at once" do
+    it "bounds a connection at a thousand, the number Java and .NET bound at" do
+      expect(transport.max_outstanding_publishes).to eq(1_000)
+    end
+
+    it "refuses a ceiling nothing could ever publish under" do
+      expect { bounded(0) }
+        .to raise_error(AceMQ::AMQP::ConfigurationError, /must be at least 1, was 0/)
+    end
+
+    it "writes a batch in waves of the ceiling rather than all of it at once" do
+      sending = batch(messages(5), using: bounded(2))
+
+      # Two messages, then a wait — not five and one wait. Without the ceiling
+      # the whole batch is on the wire before anything is confirmed, which is
+      # exactly the unbounded buffer this is here to prevent.
+      channel.wait_until_sent(2)
+      channel.answer!
+      channel.wait_until_sent(4)
+      channel.answer!
+      channel.wait_until_sent(5)
+      channel.answer!
+
+      expect(sending.value).to eq(%w[m-1 m-2 m-3 m-4 m-5])
+      expect(channel.calls)
+        .to eq(%i[publish publish wait publish publish wait publish wait])
+    end
+
+    it "keeps payload order and return attribution across the waves" do
+      sending = batch(messages(4, mandatory: true), using: bounded(2))
+      channel.wait_until_sent(2)
+      channel.answer!
+      channel.wait_until_sent(4)
+      # A message of the *second* wave comes back. Reading the returns once for
+      # the whole batch would charge this to the first mandatory message with
+      # nothing against it yet, which is m-1.
+      channel.return!("m-4", exchange: "orders-events")
+      channel.answer!
+      results = sending.value
+
+      expect(results.values_at(0, 1, 2)).to eq(%w[m-1 m-2 m-3])
+      expect(results[3]).to be_a(AceMQ::AMQP::PublishError)
+      expect(results[3].unroutable?).to be(true)
+      expect(results[3].message).to include("nowhere to route message m-4")
+    end
+
+    it "tells the caller the broker is not keeping up when a wave frees nothing" do
+      sending = batch(messages(4), using: bounded(2))
+      channel.wait_until_sent(2)
+      # Neither message was ever answered for, so both are still outstanding as
+      # far as the broker is concerned and neither gives its room back.
+      channel.answer!(silent: [0, 1], error: Timeout::Error.new("the confirm never came"))
+      results = sending.value
+
+      # Only one wave was ever written: the rest was refused rather than
+      # buffered behind a broker that had stopped answering.
+      expect(channel.calls.count(:publish)).to eq(2)
+      expect(results).to all(be_a(AceMQ::AMQP::PublishError))
+      expect(results.first.message).to include("would not confirm message m-1")
+      expect(results.last.message)
+        .to eq("cannot publish message m-4 to exchange \"orders-events\" with key " \
+               "\"order.placed\": 2 publishes are already waiting for a confirm and " \
+               "none of them completed. The broker is not keeping up; publish more " \
+               "slowly rather than buffering more.")
+    end
+
+    it "bounds a single publish against the same ceiling" do
+      mq = bounded(1)
+      # The confirm for this one never comes, so its room is never given back.
+      first = Thread.new { mq.publish(**messages(1).first) }
+      first.report_on_exception = false
+      channel.wait_until_sent(1)
+      channel.answer!(silent: [0], error: Timeout::Error.new("the confirm never came"))
+      expect { first.value }.to raise_error(AceMQ::AMQP::PublishError)
+
+      expect { mq.publish(**messages(1).first) }
+        .to raise_error(AceMQ::AMQP::PublishError, /The broker is not keeping up/)
+      # Nothing more went on the wire, which is the point of saying so.
+      expect(channel.calls.count(:publish)).to eq(1)
+    end
+
+    it "gives the room back when the publishing channel is reopened" do
+      mq = bounded(1)
+      first = Thread.new { mq.publish(**messages(1).first) }
+      first.report_on_exception = false
+      channel.wait_until_sent(1)
+      channel.answer!(silent: [0], error: Timeout::Error.new("the confirm never came"))
+      expect { first.value }.to raise_error(AceMQ::AMQP::PublishError)
+
+      # The unconfirmed message went down with the old channel and can never be
+      # confirmed on the new one. Holding its room would shrink the ceiling by
+      # one at every reconnect until publishing stopped altogether.
+      channel.closed!
+      sending = Thread.new { mq.publish(**messages(1).first) }
+      channel.wait_until_sent(2)
+      channel.answer!
+      expect(sending.value).to eq("m-1")
+    end
   end
 end
