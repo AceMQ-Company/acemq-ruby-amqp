@@ -1063,7 +1063,9 @@ at_exit { group.close }
 Starting workers by hand means remembering to stop every one, and a partial
 shutdown leaves messages held by a consumer nobody is waiting for. A group is
 also sized from configuration, which is the number most often changed after a
-service is running.
+service is running. `close(timeout:)` bounds the whole group rather than each
+member, exactly as `mq.close` does: twenty seconds by default, the same deadline
+and the same code.
 
 **Concurrency, or a group?** `concurrency:` runs several handlers on one
 consumer and one channel. A group runs several consumers, each with its own

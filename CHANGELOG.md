@@ -8,6 +8,54 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Changed
+
+- **`Connection#close` now drains every consumer within one deadline instead of
+  giving each of them its own.** A behaviour change, and the shutdown it fixes
+  is the one that was failing for the reason draining exists to prevent. `close`
+  cancelled its consumers in turn and each `cancel` waited up to thirty seconds
+  for the handlers still running, so the wait was thirty seconds *per consumer*:
+  a process with eight of them could spend four minutes inside `close`.
+  Kubernetes sends SIGTERM, waits `terminationGracePeriodSeconds` — thirty by
+  default — and then SIGKILLs, so what actually happened was that every handler
+  was killed mid-flight and everything in hand was left unsettled.
+
+  ```ruby
+  mq.close              # twenty seconds for the whole drain
+  mq.close(timeout: 8)  # a shorter grace period
+  ```
+
+  The default is **twenty seconds**, the number Go's `docs/lifecycle.md`
+  recommends and for the same reason: it leaves ten of Kubernetes' thirty for
+  the web server, for whatever else is shutting down alongside, and for the
+  process to exit. Setting the two equal means the orchestrator wins the race
+  sometimes, and a shutdown that is correct on most deployments is one nobody
+  debugs until it is not. The deadline is spent in the order the consumers were
+  started, each getting whatever is left of it; one reached with nothing left is
+  stopped without being waited for rather than starting a fresh wait of its own.
+
+  **When the deadline expires with handlers still running**, those consumers are
+  stopped anyway, the socket is closed, and a new `DrainTimeout` is raised:
+
+  ```
+  the drain did not finish within 20s: 3 deliveries were left unsettled
+  and will be redelivered — orders.new (2), orders.shipped (1)
+  ```
+
+  Nothing is lost — an unacknowledged delivery goes back to the broker, which is
+  the ordinary at-least-once case handlers should already be idempotent against
+  — but the drain did not do what it was asked, and reporting success would mean
+  an operator whose grace period is too short never finds out. `DrainTimeout`
+  carries `stranded`, the count per queue, and the `timeout` that expired.
+
+  `Patterns::ConsumerGroup#close` had the same defect and is fixed by the same
+  code: a group is the one place several consumers are started at once, so a
+  per-member wait was multiplied by exactly the size configured. Its default
+  moves from thirty seconds per member to twenty for the group. `Consumer#cancel`
+  and `Patterns::Responder#cancel` — single consumers, so never multiplied —
+  default to the same twenty rather than thirty, so the library has one number
+  for how long a drain may take.
+
 ## [0.6.0] - 2026-09-17
 
 ### Added

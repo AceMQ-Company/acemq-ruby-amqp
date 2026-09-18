@@ -375,8 +375,9 @@ replayed message goes back on attempt one.
 ## Shutdown
 
 ```ruby
-consumer.cancel(timeout: 30)   # stop delivery, then wait for handlers
-mq.close                       # the same, for every consumer, then the socket
+consumer.cancel(timeout: 20)   # stop delivery, then wait for handlers
+mq.close                       # the same, for every consumer, within one deadline
+mq.close(timeout: 8)           # a shorter grace period than the default twenty
 ```
 
 `cancel` stops the subscription **first** and then waits, so nothing new arrives
@@ -387,6 +388,49 @@ either way, and raises the first refusal afterwards. Stopping at the first
 failure would leave the rest running and the socket open, so a shutdown that
 went slightly wrong would become a process that will not exit — which is a worse
 problem than whatever the first consumer objected to.
+
+### One deadline, not one each
+
+**`close(timeout:)` bounds the whole drain, not each consumer.** That is the
+distinction the keyword exists for. A wait spent per consumer is not a bound on
+anything a process can be held to: eight consumers at twenty seconds each is
+nearly three minutes, and no orchestrator waits that long.
+
+| | |
+|---|---|
+| Kubernetes | `terminationGracePeriodSeconds`, thirty by default, then SIGKILL |
+| systemd | `TimeoutStopSec` |
+| Docker | `docker stop -t`, ten by default |
+
+The default is **twenty seconds**, which leaves ten of Kubernetes' thirty for
+the web server, for whatever else is shutting down alongside, and for the
+process to actually exit. Setting the two equal means the orchestrator wins the
+race sometimes, and a shutdown that is correct on most deployments is one nobody
+debugs until it is not. Raise it for handlers that genuinely take longer, and
+raise the grace period with it. `Patterns::ConsumerGroup#close` is bounded the
+same way, by the same code — a group is the one place several consumers are
+started at once, so a per-member wait would be multiplied by exactly the size
+configured.
+
+The deadline is spent in the order the consumers were started, each getting
+whatever is left of it. A consumer reached with nothing left is stopped without
+being waited for.
+
+**When the deadline expires with handlers still running**, `close` stops those
+consumers anyway, closes the socket, and then raises `DrainTimeout`:
+
+```
+the drain did not finish within 20s: 3 deliveries were left unsettled
+and will be redelivered — orders.new (2), orders.shipped (1)
+```
+
+Nothing is lost. Those deliveries were never acknowledged, so the broker hands
+them to whoever is still consuming the queue — the work may be done twice, which
+is the ordinary at-least-once case handlers should already be
+[idempotent](patterns.md#idempotency) against. What is raised is the fact that
+the drain did not finish, and it is raised rather than logged because an
+operator whose grace period is too short has no other way to find out. The error
+carries `stranded`, a count per queue, and the `timeout` that expired.
 
 A message being handled when a process is killed outright is not lost. It was
 never acknowledged, so the broker offers it again — to this consumer or another

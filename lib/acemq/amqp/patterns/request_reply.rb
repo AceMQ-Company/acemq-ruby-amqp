@@ -393,7 +393,7 @@ module AceMQ
         #
         # A request being answered right now has a caller blocked on the other
         # side, and cutting it off turns their call into a timeout.
-        def cancel(timeout: 30) = @consumer.cancel(timeout: timeout)
+        def cancel(timeout: Connection::DRAIN_TIMEOUT) = @consumer.cancel(timeout: timeout)
 
         # The two numbers, held apart from the responder that reports them.
         #

@@ -480,6 +480,12 @@ shutdown leaves messages held by a consumer nobody is waiting for. A group is
 also sized from configuration, which is the number most often changed after a
 service is running.
 
+`close(timeout:)` bounds the whole group rather than each member — twenty
+seconds by default, the same deadline and the same code as
+[`mq.close`](reliability.md#shutdown). A group is the one place this library
+starts several consumers at once, so a per-member wait would be multiplied by
+exactly the size configured.
+
 **Concurrency, or a group?** `concurrency:` runs several handlers on one consumer
 and one channel. A group runs several consumers, each with its own channel and
 prefetch. Reach for the group when handlers are slow enough that one channel's

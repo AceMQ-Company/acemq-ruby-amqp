@@ -191,7 +191,10 @@ running.
 
 `mq.close` stops every consumer **and waits for the handlers already running**,
 so a message being worked on when the process is asked to stop is acknowledged
-rather than returned to the queue for somebody else to redo.
+rather than returned to the queue for somebody else to redo. It waits twenty
+seconds for all of them together — one deadline for the whole drain, sized to
+fit inside an orchestrator's grace period — and `mq.close(timeout: 8)` picks
+another. See [shutdown](reliability.md#shutdown).
 
 ## Step 6 — A thousand of them
 

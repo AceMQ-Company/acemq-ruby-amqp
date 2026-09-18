@@ -70,20 +70,28 @@ module AceMQ
         # Every one is stopped even when one of them refuses, because leaving
         # the rest running after a failed shutdown is worse than the failure.
         # The first refusal is raised once the others are down.
-        def close(timeout: 30)
+        #
+        # **The timeout is for the group, not for each member.** A group is the
+        # one place this library makes several consumers at once, so a
+        # per-consumer wait is multiplied by the size the caller asked for: four
+        # consumers at thirty seconds each is two minutes, which is past every
+        # orchestrator's grace period and therefore a drain that ends in SIGKILL
+        # with everything in flight unsettled. {Connection#close} is bounded the
+        # same way, by the same code.
+        #
+        # @param timeout [Numeric] seconds for the whole group
+        # @raise [DrainTimeout] when the deadline expired with handlers running
+        # @return [nil]
+        def close(timeout: Connection::DRAIN_TIMEOUT)
           running = @lock.synchronize do
             taken = @consumers
             @consumers = []
             taken
           end
 
-          failure = nil
-          running.each do |consumer|
-            consumer.cancel(timeout: timeout)
-          rescue StandardError => e
-            failure ||= e
-          end
+          failure, stranded = Drain.of(running, timeout)
           raise failure if failure
+          raise DrainTimeout.new(stranded, timeout) unless stranded.empty?
 
           nil
         end

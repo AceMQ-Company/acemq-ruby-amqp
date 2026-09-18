@@ -159,6 +159,13 @@ either way, and raises the first refusal afterwards. Stopping at the first
 failure would leave the rest running and the socket open, so a shutdown that
 went slightly wrong would become a process that will not exit.
 
+**`close(timeout:)` bounds the whole drain, not each consumer** — twenty seconds
+by default, which fits inside Kubernetes' thirty-second grace period. A deadline
+spent per consumer would be multiplied by however many there are, which is no
+bound at all. When it expires with handlers still running, those consumers are
+stopped anyway and `DrainTimeout` is raised saying what was left unsettled for
+the broker to redeliver. See [shutdown](reliability.md#shutdown).
+
 A message being handled when a process is killed without any of this is not
 lost — it was never acknowledged, so the broker offers it again. It is just
 handled twice, which is why anything that changes something wants to be

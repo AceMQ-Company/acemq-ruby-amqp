@@ -50,6 +50,92 @@ module AceMQ
       def attempt = envelope.attempt
     end
 
+    # A shutdown that ran out of time with handlers still working.
+    #
+    # Raised by {Connection#close} *after* every consumer has been stopped and
+    # the socket has been closed, because the shutdown still happened — what
+    # this says is that it did not finish. The deliveries those handlers were
+    # holding were never acknowledged, so the broker will give them to whoever
+    # is still consuming the queue: the work may be done twice, which is the
+    # ordinary at-least-once case, and nothing is lost.
+    #
+    # It is raised rather than logged because the alternative is a drain that
+    # reports success having abandoned work in flight, and an operator who has
+    # never seen this error has no way to know their grace period is too short.
+    class DrainTimeout < StandardError
+      # How many deliveries were still in flight when time ran out, by queue.
+      #
+      # @return [Hash{String => Integer}]
+      attr_reader :stranded
+
+      # The deadline that expired, in seconds.
+      attr_reader :timeout
+
+      def initialize(stranded, timeout)
+        @stranded = stranded
+        @timeout = timeout
+        listed = stranded.map { |queue, count| "#{queue} (#{count})" }.join(", ")
+        total = stranded.values.sum
+        super("the drain did not finish within #{timeout}s: #{total} " \
+              "#{total == 1 ? "delivery was" : "deliveries were"} left unsettled " \
+              "and will be redelivered — #{listed}")
+      end
+    end
+
+    # Stopping several consumers against one deadline.
+    #
+    # The one place the shared-deadline rule is written down, because
+    # {Connection#close} and {Patterns::ConsumerGroup#close} both need it and
+    # two copies would be two answers to "how long may a shutdown take".
+    module Drain
+      # Stops every consumer, and says what was left when time ran out.
+      #
+      # Each consumer is given whatever is left of the deadline, in the order
+      # they were started; one reached with nothing left is stopped without
+      # being waited for rather than starting a fresh wait of its own. That is
+      # the whole difference between a drain a process can be held to and one
+      # that is however many consumers there happen to be times thirty seconds.
+      #
+      # Every consumer is stopped even when one of them refuses, and the caller
+      # closes the connection either way. Stopping at the first failure would
+      # leave the rest of them running and the socket open, so a shutdown that
+      # went slightly wrong would become a process that will not exit — which is
+      # a worse problem than whatever the first consumer objected to. A consumer
+      # that raised is not asked what it is holding: the exception is the thing
+      # worth reporting about it, and a second one raised while asking would
+      # bury the first.
+      #
+      # Sequential rather than a thread per consumer. The deadline is what a
+      # shutdown is short of, and threads would shorten it only when several
+      # consumers are busy at once — at the price of that many +basic_cancel+
+      # calls down one bunny session while handlers on it are still publishing
+      # dead letters. One deadline is the fix for the bug; threads would be a
+      # second answer to the same question.
+      #
+      # @param consumers [Array<Consumer>]
+      # @param timeout [Numeric] seconds for all of them together
+      # @return [Array(StandardError, nil, Hash{String => Integer})] the first
+      #   failure, and what each queue still had in flight when time ran out
+      def self.of(consumers, timeout)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+        failure = nil
+        stranded = Hash.new(0)
+        consumers.each do |consumer|
+          left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          consumer.cancel(timeout: left.positive? ? left : 0)
+          # Asked after the cancel rather than before: what is in flight now is
+          # what the deadline did not wait for, which is the number an operator
+          # needs — those deliveries are unacknowledged and will come round
+          # again.
+          in_flight = consumer.in_flight
+          stranded[consumer.queue] += in_flight if in_flight.positive?
+        rescue StandardError => e
+          failure ||= e
+        end
+        [failure, stranded]
+      end
+    end
+
     # A connection to a broker.
     #
     # Everything a service does with AceMQ goes through one of these: it holds
@@ -70,6 +156,23 @@ module AceMQ
     class Connection
       # How many unacknowledged messages a consumer holds by default.
       DEFAULT_PREFETCH = 20
+
+      # Seconds {#close} will spend draining, across every consumer together.
+      #
+      # Twenty, because the number that matters is not this one: it is whatever
+      # will kill the process if the drain outlasts it. Kubernetes sends
+      # SIGTERM, waits +terminationGracePeriodSeconds+ — thirty by default — and
+      # then SIGKILLs; systemd has +TimeoutStopSec+; +docker stop+ waits ten.
+      # Twenty inside a thirty-second grace period leaves ten seconds for the
+      # web server, for whatever else is shutting down alongside this, and for
+      # the process to actually exit. Setting the two equal means the
+      # orchestrator wins the race sometimes, and a shutdown that is correct on
+      # most deployments is one nobody debugs until it is not.
+      #
+      # The same twenty Go's +docs/lifecycle.md+ recommends, for the same
+      # reason. Raise it for handlers that genuinely take longer, and raise the
+      # grace period with it.
+      DRAIN_TIMEOUT = 20
 
       attr_reader :transport, :codec, :origin, :retry_policy, :prefetch,
                   :retry_threshold, :interceptors, :telemetry
@@ -389,31 +492,49 @@ module AceMQ
       def queue_exists?(name) = @transport.queue_exists?(name)
       def delete_queue(name) = @transport.delete_queue(name)
 
-      # Stops every consumer and closes the connection.
+      # Stops every consumer and closes the connection, within one deadline.
       #
       # Consumers are stopped first and their handlers allowed to finish, so a
       # message being worked on when this is called is acknowledged rather than
       # returned to the queue for somebody else to redo.
-      def close
+      #
+      # **The deadline is for the whole drain, not for each consumer.** That
+      # distinction is the entire point of the keyword: a per-consumer wait is
+      # not a bound on anything a process can be held to, because eight
+      # consumers each given thirty seconds is four minutes, and four minutes
+      # into a shutdown Kubernetes has long since sent SIGKILL — killing every
+      # handler mid-flight and leaving everything it was holding unsettled,
+      # which is the exact outcome draining exists to avoid. One deadline,
+      # spent in the order the consumers were started: each gets whatever is
+      # left of it, and a consumer reached with nothing left is stopped without
+      # being waited for.
+      #
+      # When the deadline expires with handlers still running, this stops the
+      # subscription anyway and raises {DrainTimeout} once the socket is shut.
+      # Nothing is lost — an unacknowledged delivery goes back to the broker and
+      # is redelivered — but the drain did not do what it was asked, and saying
+      # so is the honest answer. Reporting success would mean an operator whose
+      # grace period is too short never finds out.
+      #
+      # @param timeout [Numeric] seconds for the whole drain; see
+      #   {DRAIN_TIMEOUT} for why twenty. Zero stops every consumer without
+      #   waiting for any handler
+      # @raise [DrainTimeout] when the deadline expired with handlers running
+      # @return [nil]
+      def close(timeout: DRAIN_TIMEOUT)
         consumers = @lock.synchronize do
           taken = @consumers
           @consumers = []
           taken
         end
 
-        # Every consumer is stopped even when one of them refuses, and the
-        # connection is closed either way. Stopping at the first failure would
-        # leave the rest of them running and the socket open, so a shutdown that
-        # went slightly wrong would become a process that will not exit — which
-        # is a worse problem than whatever the first consumer objected to.
-        failure = nil
-        consumers.each do |consumer|
-          consumer.cancel
-        rescue StandardError => e
-          failure ||= e
-        end
+        failure, stranded = Drain.of(consumers, timeout)
         @transport.close
+        # The transport is closed before either of these is raised, and that
+        # order is deliberate: a shutdown that reports a problem having left the
+        # socket open is a process that will not exit.
         raise failure if failure
+        raise DrainTimeout.new(stranded, timeout) unless stranded.empty?
 
         nil
       end
@@ -688,8 +809,17 @@ module AceMQ
 
       # Stops delivery and waits for handlers already running.
       #
-      # @param timeout [Numeric] seconds to wait for in-flight handlers
-      def cancel(timeout: 30)
+      # The subscription is stopped and closed whether or not the wait ran out,
+      # because a consumer that has been cancelled and is still subscribed is
+      # the worst of both: it is not draining and it is still being sent work.
+      # Whatever a handler was holding when time ran out is unacknowledged, so
+      # the broker redelivers it. {#in_flight} afterwards is how many that was,
+      # and it is what {Connection#close} reports in its {DrainTimeout}.
+      #
+      # @param timeout [Numeric] seconds to wait for in-flight handlers. Zero
+      #   stops the consumer without waiting at all
+      # @return [nil]
+      def cancel(timeout: Connection::DRAIN_TIMEOUT)
         @subscription&.stop
         wait_for_handlers(timeout)
         @subscription&.close
