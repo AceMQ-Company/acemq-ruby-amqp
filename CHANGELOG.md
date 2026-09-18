@@ -56,6 +56,54 @@ While the version is `0.x` the public API may change in any release.
   default to the same twenty rather than thirty, so the library has one number
   for how long a drain may take.
 
+- **A blocked connection is now modelled in `Health`, and reported up with the
+  reason.** RabbitMQ blocks a connection when it is running low on memory or
+  disk; every publish on it stops. The library said nothing about it, so an
+  operator saw a healthy service that could not publish.
+
+  ```json
+  { "status": "up",
+    "detail": "the broker has blocked this connection; publishing is paused: low on disk space",
+    "parts": { "blocked": true, "blocked_reason": "low on disk space" } }
+  ```
+
+  Up, not down, and not degraded: a blocked connection is the broker protecting
+  itself from a producer that is doing nothing wrong. An orchestrator told this
+  instance is unready restarts it into the same blocked broker having thrown
+  away whatever it was holding, and doing that to every replica at once turns a
+  broker under memory pressure into an outage with a crash loop on top. Java's
+  `AceMqHealthIndicator` and Go's actuator make the same call, in the same
+  words. The text before the colon is fixed, because it is what an alert rule
+  matches on; after it are the broker's own words, caught from the
+  `connection.blocked` frame — bunny keeps the flag and drops the reason.
+
+  **The health check's round trip is skipped while the connection is blocked**,
+  which is a behaviour change in its own right and not an optimisation. A
+  blocked connection is one the broker has stopped reading, so the probe's
+  `queue.declare` does not fail, it hangs — until bunny's continuation timeout
+  gives up seconds later and the report says `:down` for a broker that is up and
+  talking. Verified against a real broker with the memory watermark at zero:
+  before this, `mq.health` answered `down: the broker did not answer:
+  Timeout::Error` while `mq.blocked_reason` said `"low on memory"`. A block that
+  arrives *during* a probe is read the same way, as the explanation for the
+  silence rather than a second fault beside it. `round_trip_ms` is absent from
+  the parts when nothing was timed.
+
+  The state is on the transport seam as `blocked_reason`, and forwarded by
+  `Connection#blocked?` and `Connection#blocked_reason` — free, with no round
+  trip, for a publisher that would rather fail fast than hang. A downstream
+  package had been reaching through the connection to `transport.session.blocked?`
+  to get this, which is a bunny detail behind a seam that is meant to be
+  satisfiable by a test double; a double supplies it now by answering
+  `blocked_reason`, and a transport that has never heard of the method is simply
+  never blocked. `docs/testing.md` lists it in the transport contract.
+
+- **`Health.aggregate` names every part that had something to say, not only the
+  ones that were not up.** Summarising by status alone answered `up` with an
+  empty `detail` for an aggregate containing a blocked connection — throwing
+  away, at exactly the line an operator reads first, the one fact the check went
+  to the trouble of finding. The parts themselves were unchanged either way.
+
 ## [0.6.0] - 2026-09-17
 
 ### Added

@@ -94,6 +94,105 @@ RSpec.describe AceMQ::AMQP::Health do
     end
   end
 
+  describe "a blocked connection" do
+    # RabbitMQ blocks a connection when it is low on memory or disk, and every
+    # publish on it stops. The temptation is to fail the probe, and failing it
+    # is exactly wrong — so the rule is the one Java's AceMqHealthIndicator and
+    # Go's actuator both keep: up, with the reason.
+    #
+    # The transport is asked, not bunny. A double that has never heard of bunny
+    # answers `blocked_reason` and that is the whole seam.
+    before { transport.blocked!("low on disk space") }
+
+    it "is up, because restarting into the same blocked broker helps nobody" do
+      # An orchestrator told this instance is unready restarts it into the same
+      # pressured broker, having thrown away whatever it was holding — and doing
+      # that to every replica turns a memory alarm into an outage with a crash
+      # loop on top.
+      expect(mq.health).to be_up
+    end
+
+    it "says why, in fixed words an alert rule can match, with the broker's own" do
+      report = mq.health
+
+      expect(report.detail).to eq("the broker has blocked this connection; " \
+                                  "publishing is paused: low on disk space")
+      expect(report.parts["blocked"]).to be(true)
+      expect(report.parts["blocked_reason"]).to eq("low on disk space")
+    end
+
+    it "does not hide a stopped consumer behind the block, or the block behind it" do
+      mq.consume("orders.new") { AceMQ::AMQP::Ack.accept }
+      mq.consume("orders.shipped") { AceMQ::AMQP::Ack.accept }
+      mq.consumers.first.cancel(timeout: 0)
+
+      report = mq.health
+      expect(report).to be_degraded
+      expect(report.detail).to eq("1 of 2 consumers has stopped; the broker has blocked " \
+                                  "this connection; publishing is paused: low on disk space")
+    end
+
+    it "is down when the connection is shut, because that is the better reason" do
+      mq.close
+      expect(mq.health).to be_down
+    end
+
+    it "does not run the round trip the rest of this check is built on" do
+      # A blocked connection is one the broker has stopped reading, so the
+      # declare does not fail — it hangs until bunny's continuation timeout
+      # gives up, and then this check calls a live broker down. Verified
+      # against a real broker with the memory watermark at zero: the declare
+      # timed out and the report said "the broker did not answer".
+      report = mq.health
+
+      expect(transport.declared_queues).to be_empty
+      expect(report.parts).not_to have_key("round_trip_ms")
+      expect(report).to be_up
+    end
+
+    it "reads a block that arrived while the probe was in flight as the reason for it" do
+      # The race the line above cannot close: not blocked when the check
+      # started, blocked by the time the declare gave up. The block is the
+      # explanation for the silence, not a second fault beside it.
+      transport.unblocked!
+      allow(transport).to receive(:declare_queue) do
+        transport.blocked!("low on memory")
+        raise AceMQ::AMQP::TransportError, "Timeout::Error"
+      end
+
+      report = mq.health
+      expect(report).to be_up
+      expect(report.detail).to match(/publishing is paused: low on memory/)
+    end
+
+    it "is answered off the connection too, for a publisher that would rather not hang" do
+      # A publish on a blocked connection hangs rather than failing: the broker
+      # stops reading the socket. This is a flag in memory, so unlike the report
+      # it costs no round trip.
+      expect(mq).to be_blocked
+      expect(mq.blocked_reason).to eq("low on disk space")
+
+      transport.unblocked!
+      expect(mq).not_to be_blocked
+      expect(mq.blocked_reason).to be_nil
+    end
+  end
+
+  describe "a transport that cannot say whether it is blocked" do
+    let(:transport) { LoopbackTransport.new }
+
+    it "is not asked, and the report says nothing about blocking" do
+      # The seam is deliberately double-friendly: a hand-written transport that
+      # predates this and answers nothing about blocking is a transport that is
+      # simply not blocked, not a health check that raises inside a probe.
+      report = mq.health
+
+      expect(report).to be_up
+      expect(mq).not_to be_blocked
+      expect(report.to_h["parts"]).not_to have_key("blocked")
+    end
+  end
+
   describe "several checks at once" do
     Passing = Struct.new(:name) do
       def check
@@ -137,6 +236,28 @@ RSpec.describe AceMQ::AMQP::Health do
 
     it "is up with nothing to check, which is the honest answer" do
       expect(Health.aggregate).to be_up
+    end
+
+    it "keeps a blocked connection up rather than dragging the aggregate down" do
+      # The failure mode worth naming: a check that reported a blocked broker as
+      # degraded or down would poison every aggregate it is part of, so the
+      # careful answer here would be overruled by whichever check folded a plain
+      # one in beside it.
+      transport.blocked!("low on memory")
+      report = Health.aggregate(Health::Check.new("broker", mq), Passing.new("database"))
+
+      expect(report).to be_up
+      expect(report.parts["broker"].parts["blocked"]).to be(true)
+    end
+
+    it "does not lose the reason a part gave for being up" do
+      # Summarising by status alone would answer "up" with an empty detail and
+      # throw away, at exactly the line an operator reads first, the one fact
+      # the check went to the trouble of finding.
+      transport.blocked!("low on memory")
+      report = Health.aggregate(Health::Check.new("broker", mq), Passing.new("database"))
+
+      expect(report.detail).to eq("broker")
     end
   end
 

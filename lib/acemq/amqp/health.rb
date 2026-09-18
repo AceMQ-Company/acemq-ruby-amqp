@@ -49,6 +49,12 @@ module AceMQ
       # the instance out of rotation on its own.
       DEGRADED = :degraded
 
+      # What a report says when the broker has blocked the connection.
+      #
+      # Fixed wording, because it is what an alert rule will match on. The
+      # broker's own reason follows it after a colon.
+      BLOCKED = "the broker has blocked this connection; publishing is paused"
+
       # What a check found.
       #
       # +parts+ is whatever the check can say about itself — how many consumers
@@ -90,6 +96,36 @@ module AceMQ
       # reading it is a real fault and has to be visible, which is what
       # +:degraded+ is for.
       #
+      # **A blocked connection is reported up, with the reason.** RabbitMQ
+      # blocks a connection when it is low on memory or disk, and every publish
+      # on it stops — so the temptation is to fail the probe, and failing it is
+      # exactly wrong. A blocked connection is the broker protecting itself from
+      # a producer that is doing nothing wrong. An orchestrator told this
+      # instance is unready restarts it into the same blocked broker, having
+      # thrown away whatever it was holding, and doing that to every replica at
+      # once turns a broker under memory pressure into an outage with a crash
+      # loop on top. The state still has to be *visible*, so it is a detail on
+      # an +:up+ report: a dashboard shows it, an alert can match it, and
+      # nothing is taken out of rotation for it. Java's +AceMqHealthIndicator+
+      # and Go's actuator make the same call, in the same words.
+      #
+      # Blocking never changes the status downwards: a report that was
+      # +:degraded+ because a consumer stopped stays +:degraded+ and says both
+      # things, and a connection that is shut is +:down+ for a better reason.
+      #
+      # **The round trip is skipped while the connection is blocked**, and that
+      # is not an optimisation. A blocked connection is one the broker has
+      # stopped reading, so the declare this check is built on does not fail —
+      # it hangs, until bunny's continuation timeout gives up seconds later and
+      # reports +:down+ for a broker that is up and talking. Every careful word
+      # above would then be overruled by the probe: an operator would see
+      # +:down+, an orchestrator would restart into the pressured broker, and
+      # the reason would never be read. The broker told this process it was
+      # blocked over this same socket, which is a livelier proof than a declare
+      # — so when it is blocked, that is the answer, and +round_trip_ms+ is
+      # absent from the parts because nothing was timed. The block arriving
+      # *during* a probe is caught the same way on the failure path.
+      #
       # @param connection [Connection]
       # @return [Report]
       def self.of(connection)
@@ -97,12 +133,22 @@ module AceMQ
         consumers = consumer_parts(connection)
         return closed(checked_at, consumers) unless open?(connection)
 
+        blocked = blocked_reason(connection)
+        return also_blocked(consumer_verdict(checked_at, consumers), blocked) if blocked
+
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         probe(connection)
         consumers["round_trip_ms"] = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) -
                                        started) * 1000).round
         consumer_verdict(checked_at, consumers)
       rescue StandardError => e
+        # Asked again rather than trusted from before the probe: a connection
+        # blocked while the declare was in flight is the ordinary way a probe
+        # meets this, and the block is the explanation for the silence rather
+        # than a second fault beside it.
+        late = blocked_reason(connection)
+        return also_blocked(consumer_verdict(checked_at, consumers), late) if late
+
         Report.new(status: DOWN, detail: "the broker did not answer: #{e.message}",
                    checked_at: checked_at, parts: consumers)
       end
@@ -118,6 +164,14 @@ module AceMQ
       # exception out of a readiness probe — a probe that raises tells the
       # orchestrator nothing at all.
       #
+      # The detail names every part with something to say, which is not the same
+      # as every part that is not up. A blocked connection is reported +:up+
+      # with the reason on it, and an aggregate that summarised by status alone
+      # would answer +up+ with an empty detail — throwing away, at exactly the
+      # level an operator reads first, the one fact the check went to the
+      # trouble of finding. The part is still there in +parts+ either way; this
+      # is about what the top line says.
+      #
       # @param checks [Array<#name, #check>]
       # @return [Report]
       def self.aggregate(*checks)
@@ -129,10 +183,16 @@ module AceMQ
                  elsif worst.include?(DEGRADED) then DEGRADED
                  else UP
                  end
-        troubled = parts.reject { |_, part| part.up? }.keys
-        Report.new(status: status, detail: troubled.join(", "), checked_at: checked_at,
+        noteworthy = parts.reject { |_, part| silent?(part) }.keys
+        Report.new(status: status, detail: noteworthy.join(", "), checked_at: checked_at,
                    parts: parts)
       end
+
+      # Whether a part has nothing the line above it needs to mention: up, and
+      # with no reason written on it.
+      #
+      # @api private
+      def self.silent?(part) = part.up? && part.detail.to_s.empty?
 
       # Adapts a connection to the +name+/+check+ pair {aggregate} wants.
       Check = Struct.new(:name, :connection) do
@@ -174,6 +234,41 @@ module AceMQ
         # A transport that will not say is taken at its word rather than
         # guessed at; the probe below is what actually decides.
         true
+      end
+
+      # Why the broker has blocked this connection, or nil.
+      #
+      # Asked of the transport seam rather than of a driver, the same way
+      # {open?} is. The seam is what a test double satisfies — a fake that
+      # answers +blocked_reason+ with a string is a blocked broker as far as
+      # this is concerned, and one that has never heard of the method is simply
+      # not asked. A downstream package reaching through the connection to
+      # +transport.session.blocked?+ to get this was reaching past the seam into
+      # bunny, which is why it is here.
+      #
+      # Deliberately tolerant: a health check that raises inside a readiness
+      # probe tells an orchestrator nothing at all.
+      #
+      # @api private
+      def self.blocked_reason(connection)
+        transport = connection.respond_to?(:transport) ? connection.transport : connection
+        reason = transport.respond_to?(:blocked_reason) ? transport.blocked_reason.to_s : ""
+        reason.empty? ? nil : reason
+      rescue StandardError
+        nil
+      end
+
+      # The report with the block written onto it, or the report unchanged.
+      #
+      # The status is not touched; see {of} for why a blocked broker is up.
+      #
+      # @api private
+      def self.also_blocked(report, reason)
+        return report unless reason
+
+        said = [report.detail, "#{BLOCKED}: #{reason}"].compact.reject(&:empty?).join("; ")
+        Report.new(status: report.status, detail: said, checked_at: report.checked_at,
+                   parts: report.parts.merge("blocked" => true, "blocked_reason" => reason))
       end
 
       # @api private

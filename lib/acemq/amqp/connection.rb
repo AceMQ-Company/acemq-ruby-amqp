@@ -453,6 +453,30 @@ module AceMQ
       # @return [Health::Report]
       def health = Health.of(self)
 
+      # Why the broker has asked this connection to stop publishing, or nil.
+      #
+      # RabbitMQ blocks a connection when it is running low on memory or disk.
+      # Every publish on a blocked connection hangs rather than failing — the
+      # broker stops reading the socket — so this is the difference between an
+      # operator seeing "the broker is out of disk" and seeing a service that
+      # has silently stopped publishing.
+      #
+      # Free: a flag the broker pushed, read out of memory. Unlike {#health} it
+      # costs no round trip, so it is fine to ask per request — a publisher that
+      # would rather fail fast than hang can check it first.
+      #
+      # It is not a reason to fail a readiness probe, and {Health} deliberately
+      # does not: see there for why restarting a producer into a broker that is
+      # already under pressure helps nobody.
+      #
+      # @return [String, nil] the broker's own words, +"low on disk space"+ or
+      #   +"low on memory"+, or nil when it is not blocked and nil when the
+      #   transport cannot say
+      def blocked_reason = Health.blocked_reason(@transport)
+
+      # Whether the broker has asked this connection to stop publishing.
+      def blocked? = !blocked_reason.nil?
+
       # The consumers started on this connection, as they stand.
       #
       # A copy, taken under the lock. Handing back the list itself would let a

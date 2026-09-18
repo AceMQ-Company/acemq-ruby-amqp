@@ -573,6 +573,18 @@ module AceMQ
     # here so the consumer's retry arithmetic can be tested without a broker,
     # by handing {Connection} something else that answers these methods.
     class Transport
+      # What {#blocked_reason} says when the broker has blocked the connection
+      # and this process cannot say why.
+      #
+      # Two ways that happens: a session started elsewhere and handed to
+      # {#initialize} after RabbitMQ had already blocked it, so the frame
+      # carrying the reason came and went before anything here was listening;
+      # or an application that registered its own +on_blocked+ on the session
+      # afterwards, which replaces the callback below — bunny keeps one.
+      # Neither is worth a silence: that the connection is blocked at all is the
+      # half an operator acts on.
+      UNEXPLAINED_BLOCK = "the broker did not say why"
+
       # How this transport reaches RabbitMQ.
       #
       # Required lazily, and only here. The gem declares no runtime
@@ -664,6 +676,14 @@ module AceMQ
         @pull_lock = Mutex.new
         @subscriptions = []
         @returns = ReturnedMessages.new
+        # A lock of its own again, and the smallest one in the class: the
+        # broker's blocked callback runs on bunny's reader thread, and a health
+        # probe reads it from a web server's. Sharing the publish lock would
+        # mean a readiness probe queuing behind a publish that is itself waiting
+        # for the broker that has just blocked it.
+        @blocked_lock = Mutex.new
+        @blocked_reason = nil
+        watch_blocked
       end
 
       # The bunny session, for the things this class deliberately does not wrap.
@@ -876,6 +896,32 @@ module AceMQ
       # Whether the connection is up.
       def open? = @session.open?
 
+      # Why the broker has asked this connection to stop publishing, or nil.
+      #
+      # RabbitMQ sends +connection.blocked+ when it is low on memory or disk and
+      # +connection.unblocked+ when the alarm clears. Between the two, every
+      # publish on this connection hangs rather than failing — the broker simply
+      # stops reading — so this is the difference between an operator seeing
+      # "the broker is out of disk" and seeing a service that has quietly
+      # stopped publishing for no reason anybody can find.
+      #
+      # The reason is the broker's own words, +"low on disk space"+ or
+      # +"low on memory"+, recorded from the frame that carried it. Bunny keeps
+      # the flag but not the reason, so both are asked for: bunny's +blocked?+
+      # decides *whether*, which means a reason recorded before an automatic
+      # recovery cannot outlive the connection it belonged to, and the callback
+      # below supplies *why*.
+      #
+      # @return [String, nil]
+      def blocked_reason
+        return nil unless @session.respond_to?(:blocked?) && @session.blocked?
+
+        @blocked_lock.synchronize { @blocked_reason } || UNEXPLAINED_BLOCK
+      end
+
+      # Whether the broker has asked this connection to stop publishing.
+      def blocked? = !blocked_reason.nil?
+
       # Cancels every subscription and closes the connection.
       def close
         # Taken out under the lock and cancelled outside it. A handler still
@@ -963,6 +1009,25 @@ module AceMQ
       end
 
       private
+
+      # Records the broker asking this connection to stop publishing.
+      #
+      # Bunny keeps a flag and throws the reason away, so the reason is caught
+      # here as it arrives. Registered rather than polled because there is
+      # nothing to poll: the frame is the only time the broker says why.
+      #
+      # Guarded by +respond_to?+ so a session double in a test — which the
+      # security and batch specs both use — does not have to grow two callbacks
+      # it has no use for.
+      def watch_blocked
+        return unless @session.respond_to?(:on_blocked) && @session.respond_to?(:on_unblocked)
+
+        @session.on_blocked do |blocked|
+          reason = blocked.respond_to?(:reason) ? blocked.reason.to_s : ""
+          @blocked_lock.synchronize { @blocked_reason = reason.empty? ? nil : reason }
+        end
+        @session.on_unblocked { @blocked_lock.synchronize { @blocked_reason = nil } }
+      end
 
       # The channel every publish goes down, opened once and guarded.
       #

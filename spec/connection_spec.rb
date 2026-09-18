@@ -112,6 +112,75 @@ RSpec.describe AceMQ::AMQP::Transport do
       .to raise_error(AceMQ::AMQP::DependencyMissing, /gem "bunny"/)
   end
 
+  # Bunny keeps the flag and throws the reason away, so the transport catches
+  # the reason as the frame arrives. This stands in for the two halves of that:
+  # the flag a health check reads and the callback that carries the words.
+  Blocking = Struct.new(:reason)
+
+  BunnySession = Class.new do
+    def initialize(blocked: false) = @blocked = blocked
+    def blocked? = @blocked
+    def on_blocked(&block) = @on_blocked = block
+    def on_unblocked(&block) = @on_unblocked = block
+
+    def block!(reason)
+      @blocked = true
+      @on_blocked&.call(Blocking.new(reason))
+    end
+
+    def unblock!
+      @blocked = false
+      @on_unblocked&.call(nil)
+    end
+  end
+
+  describe "a broker applying back pressure" do
+    let(:session) { BunnySession.new }
+    let(:transport) { described_class.new(session) }
+
+    it "is not blocked until the broker says so" do
+      expect(transport).not_to be_blocked
+      expect(transport.blocked_reason).to be_nil
+    end
+
+    it "records the broker's own words, which bunny keeps only long enough to drop" do
+      transport
+      session.block!("low on disk space")
+
+      expect(transport).to be_blocked
+      expect(transport.blocked_reason).to eq("low on disk space")
+    end
+
+    it "forgets the reason when the alarm clears" do
+      transport
+      session.block!("low on memory")
+      session.unblock!
+
+      expect(transport).not_to be_blocked
+      expect(transport.blocked_reason).to be_nil
+    end
+
+    it "says so without a reason when the block happened before anything was listening" do
+      # A session started elsewhere and handed over already blocked: the frame
+      # carrying the reason came and went. That it is blocked at all is the half
+      # an operator acts on.
+      already = described_class.new(BunnySession.new(blocked: true))
+
+      expect(already).to be_blocked
+      expect(already.blocked_reason).to eq(described_class::UNEXPLAINED_BLOCK)
+    end
+
+    it "never reports a reason the flag has cleared, so a recovery cannot leave a stale one" do
+      # Bunny resets the flag on a fresh connection, and the connection.unblocked
+      # that would have arrived for the dead one never will.
+      transport
+      session.block!("low on disk space")
+      session.instance_variable_set(:@blocked, false)
+
+      expect(transport.blocked_reason).to be_nil
+    end
+  end
+
   it "keeps the password out of an error that will be logged" do
     # A credential that reaches a log is a credential that has to be rotated.
     expect(described_class.redact("amqps://svc:hunter2@broker:5671/prod"))

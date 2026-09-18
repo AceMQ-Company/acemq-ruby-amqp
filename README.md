@@ -635,9 +635,18 @@ right up until something is asked of it. A **consumer that has stopped under a
 live connection is `:degraded`**, not `:down`: the process can still publish and
 its other consumers still work, so failing the probe would take out something
 doing most of its job, but a queue with nothing reading it is a real fault and
-has to be visible. `Health.aggregate` combines the connection's check with the
-application's own — anything answering `name` and `check` — runs them on
-threads, and takes the worst answer.
+has to be visible. A **connection the broker has blocked is `:up`, with the
+reason** on it and in `parts` as `blocked` and `blocked_reason` — RabbitMQ
+blocks a connection when it is low on memory or disk, and an orchestrator told
+the instance is unready restarts it into the same blocked broker having thrown
+away whatever it was holding. Java and Go make the same call. The round trip is
+skipped while it is blocked, because a blocked connection is one the broker has
+stopped reading, so the declare would hang rather than fail and report `:down`
+for a broker that is up. `mq.blocked?` and `mq.blocked_reason` answer the same
+question off the connection with no round trip at all. `Health.aggregate`
+combines the connection's check with the application's own — anything answering
+`name` and `check` — runs them on threads, and takes the worst answer, naming
+every part that had something to say.
 
 ## TLS and credentials
 

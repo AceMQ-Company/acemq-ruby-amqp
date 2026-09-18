@@ -23,6 +23,7 @@ class FakeTransport
     @refused = []
     @unroutable = []
     @closed = false
+    @blocked_reason = nil
   end
 
   # persistent is accepted and ignored: nothing here survives the process, so
@@ -87,6 +88,13 @@ class FakeTransport
   def open? = !@closed
   def close = @closed = true
 
+  # The blocked half of the transport seam, which is all a health check asks
+  # for. Nothing here knows what bunny is, and that is the point: reaching
+  # through a connection to +transport.session.blocked?+ would make this
+  # untestable without a driver, and a blocked broker untestable without a
+  # broker that has actually run out of disk.
+  attr_reader :blocked_reason
+
   # Pretends a queue was never declared, which is how the consumer's
   # missing-rung path is reached without taking a broker away from it.
   def missing!(*names) = @missing.concat(names)
@@ -101,6 +109,12 @@ class FakeTransport
   # publish notices, which is the point: without it the message is confirmed and
   # dropped, exactly as it is on a real broker.
   def unroutable!(*names) = @unroutable.concat(names)
+
+  # The broker asking this connection to stop publishing, the way RabbitMQ does
+  # when it is low on disk or memory. Everything else still works — a blocked
+  # broker reads nothing new and answers everything already in hand.
+  def blocked!(reason = "low on disk space") = @blocked_reason = reason
+  def unblocked! = @blocked_reason = nil
 
   # What was published to a queue through the default exchange, which is how
   # both dead-lettering and parking get there.

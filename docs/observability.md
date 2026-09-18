@@ -520,6 +520,57 @@ with nothing reading it is a real fault and has to be visible, which is what
 `:down` is for a connection that is closed or a broker that did not answer, and
 the reason is in `detail`.
 
+### Blocked
+
+**A blocked connection is reported `:up`, with the reason.** RabbitMQ blocks a
+connection when it is running low on memory or disk, and every publish on it
+stops — so the temptation is to fail the probe, and failing it is exactly wrong.
+
+```json
+{ "status": "up",
+  "checked": "2026-09-17T11:02:41Z",
+  "detail": "the broker has blocked this connection; publishing is paused: low on disk space",
+  "parts": { "consumers": 3, "consumers_running": 3,
+             "queues": ["orders.new"],
+             "blocked": true, "blocked_reason": "low on disk space" } }
+```
+
+A blocked connection is the broker protecting itself from a producer that is
+doing nothing wrong. An orchestrator told this instance is unready restarts it
+into the same blocked broker, having thrown away whatever it was holding, and
+doing that to every replica at once turns a broker under memory pressure into an
+outage with a crash loop on top. The state still has to be *visible* — so it is
+a detail on an `:up` report, which a dashboard shows and an alert rule can match
+without anything being taken out of rotation. Java's `AceMqHealthIndicator` and
+Go's actuator make the same call, in the same words.
+
+The wording before the colon is fixed, because it is what an alert rule matches
+on; after it are the broker's own words. Blocking never changes the status
+downwards: a report that was `:degraded` because a consumer stopped stays
+`:degraded` and says both things.
+
+**The round trip is skipped while the connection is blocked**, and that is not
+an optimisation. A blocked connection is one the broker has stopped reading, so
+the probe's `queue.declare` does not fail — it *hangs*, until bunny's
+continuation timeout gives up seconds later, at which point a check written as
+carefully as the paragraph above would report `:down` for a broker that is up
+and talking. The broker said it was blocked over this same socket, which is a
+livelier proof than a declare, so that is the answer and `round_trip_ms` is
+absent from the parts. A block that arrives *during* a probe is read the same
+way: it is the explanation for the silence, not a second fault beside it.
+
+The same state is on the connection, free, with no round trip at all — for a
+publisher that would rather fail fast than hang:
+
+```ruby
+mq.blocked?        # => true
+mq.blocked_reason  # => "low on disk space", or nil
+```
+
+It is read off the transport seam rather than out of the driver, so a test
+double supplies it by answering `blocked_reason` and nothing has to know what
+bunny is. See [the transport seam](testing.md#the-seam).
+
 ### Combining checks
 
 ```ruby
@@ -532,8 +583,13 @@ report = Health.aggregate(
 
 A check is anything answering `name` and `check`, where `check` returns a
 `Health::Report`. The combined status is the **worst** of them: a service that
-cannot reach its broker is not ready however healthy the rest of it is, and
-`detail` names the ones that were not up.
+cannot reach its broker is not ready however healthy the rest of it is.
+
+`detail` names every part with something to say, which is not the same as every
+part that is not up. A blocked connection is `:up` with the reason on it, and an
+aggregate that summarised by status alone would answer `up` with an empty
+`detail` — throwing away, at exactly the line an operator reads first, the one
+fact the check went to the trouble of finding.
 
 They run on threads rather than in turn, so a slow one does not add its latency
 to the others, and one that raises becomes a `:down` part rather than an

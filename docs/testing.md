@@ -68,6 +68,7 @@ exactly this reason. A transport is anything answering:
 | `pull(queue)` | a `Delivery`, or nil |
 | `message_count(queue)`, `queue_exists?(name)`, `delete_queue(name)` | |
 | `open?`, `close` | |
+| `blocked_reason` | why the broker has asked this connection to stop publishing, or nil. Optional: a transport that does not answer it is simply never blocked |
 
 Nothing above that seam knows what a channel is. Settling travels with the
 delivery as `on_ack` and `on_nack` rather than as a delivery tag the consumer

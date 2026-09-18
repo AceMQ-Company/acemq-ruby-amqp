@@ -87,7 +87,8 @@ at all. See [queue types](topology.md#queue-types).
 other four libraries, an in-memory registry with a Prometheus renderer, an
 OpenTelemetry adapter that joins a handler's span to the publish that caused it
 across processes and minutes, and a health report that calls a stopped consumer
-under a live connection *degraded* rather than down. See
+under a live connection *degraded* rather than down, and a broker applying back
+pressure *up, with the reason* rather than down. See
 [metrics, tracing and health](observability.md).
 
 **A body the broker cannot read.** `EncryptedCodec` wraps whichever codec you
