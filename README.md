@@ -1442,7 +1442,7 @@ has had before and nothing noticed.
 
 ### Releasing
 
-`release.yml` runs on a `v*` tag: it checks the tag is a `0.6.x` version and that
+`release.yml` runs on a `v*` tag: it checks the tag is a `0.7.x` version and that
 `AceMQ::AMQP::VERSION` agrees with it, runs the specs and RuboCop, builds the
 gem, checks the built gem carries what the gemspec's glob was supposed to
 include, installs it into a clean `GEM_HOME` and requires it there — which is the
