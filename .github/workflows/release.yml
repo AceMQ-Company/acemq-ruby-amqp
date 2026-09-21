@@ -135,13 +135,10 @@ jobs:
   integration:
     name: against a real broker
     runs-on: ubuntu-latest
-    services:
-      broker:
-        image: rabbitmq:4-alpine
-        ports: ['5672:5672']
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+    # Started by a step rather than declared as a service container, and set up
+    # exactly as ci.yml sets it up, for the reason given there: the certificates
+    # the broker presents do not exist until a step has written them, so a
+    # service container could never serve the TLS half of the suite.
 
     steps:
       - uses: actions/checkout@v4
@@ -151,30 +148,101 @@ jobs:
           ruby-version: '3.3'
           bundler-cache: true
 
+      - name: Certificates
+        run: |
+          ./scripts/acemq-certs.rb --out "$RUNNER_TEMP/certs" --broker localhost --days 1
+          # fail_if_no_peer_cert, which the generated config leaves off, because
+          # the mutual-TLS examples prove a connection without a client
+          # certificate is refused and a broker that accepts one proves nothing.
+          sed 's/^ssl_options.fail_if_no_peer_cert.*/ssl_options.fail_if_no_peer_cert = true/' \
+            "$RUNNER_TEMP/certs/rabbitmq.conf" > "$RUNNER_TEMP/certs/rabbitmq-mutual.conf"
+          grep -q 'fail_if_no_peer_cert = true' "$RUNNER_TEMP/certs/rabbitmq-mutual.conf"
+          # The broker runs as another user inside the container, and it reports
+          # a key it is not allowed to read as a listener that never started.
+          chmod 644 "$RUNNER_TEMP"/certs/*.key
+
+      - name: Start the broker
+        run: |
+          docker run -d --name acemq-ruby-release-it -e HOME=/tmp \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$RUNNER_TEMP/certs:/certs:ro" \
+            -v "$RUNNER_TEMP/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          # The broker's own word for it, from this boot only. Docker publishes
+          # the port as soon as the container starts, so a TCP connect succeeds
+          # and is immediately reset for several seconds before RabbitMQ is
+          # listening on it.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          for _ in $(seq 1 60); do
+            if docker logs --since "$started" acemq-ruby-release-it 2>&1 | grep -q "Server startup complete"; then
+              echo "the broker is up"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the broker never became ready"
+          docker logs acemq-ruby-release-it
+          exit 1
+
       - name: Test against the broker
         env:
+          # No trailing slash: `amqp://host:port/` names the vhost called by the
+          # empty string, and bunny asks the broker for exactly that.
           ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672
+          ACEMQ_TEST_BROKER_TLS: amqps://guest:guest@localhost:5671
+          ACEMQ_TEST_BROKER_CA: ${{ runner.temp }}/certs/ca.crt
+          ACEMQ_TEST_BROKER_CLIENT_CERT: ${{ runner.temp }}/certs/client.crt
+          ACEMQ_TEST_BROKER_CLIENT_KEY: ${{ runner.temp }}/certs/client.key
         run: |
           set -o pipefail
           bundle exec rspec --tag integration --format documentation \
             2>&1 | tee "$RUNNER_TEMP/broker-specs.log"
 
       - name: Check nothing skipped
-        # spec_helper skips every integration example when ACEMQ_TEST_BROKER is
-        # unset, and an unset variable looks exactly like a passing run. A
-        # release that silently tested nothing against a broker is the failure
-        # worth spending five lines on.
+        # This check used to say that spec_helper skips every integration
+        # example when ACEMQ_TEST_BROKER is unset, and count examples to catch
+        # it. Neither half held up. `--tag integration` on the command line
+        # overrides the exclusion spec_helper sets, so the examples run whatever
+        # the variable says and fail loudly on a refused connection rather than
+        # vanishing; and the thing that really was going wrong here — thirteen
+        # TLS examples pending on every release, because no step had ever
+        # started a broker speaking TLS — was reported as a `::warning::` and
+        # published anyway. A guard that cannot fail the job it guards is worse
+        # than none, because the job looks protected.
+        #
+        # So: pending is now an error, and the count stays as a second check,
+        # because a run that skips nothing and tests nothing passes the first
+        # one. A mistyped tag gives "0 examples, 0 failures" and exit 0, and a
+        # lost spec file shrinks the suite rather than emptying it. The floor is
+        # under the sixty examples that run today and above the forty-seven left
+        # if the TLS file disappeared; the old floor of fifteen was under both.
+        #
+        # Skipped and pending are counted together by RSpec and both fail here.
+        # A release that says it was tested against a real broker must not be
+        # able to mean "most of it was".
         run: |
           log="$RUNNER_TEMP/broker-specs.log"
-          if grep -qE '^[0-9]+ examples, 0 failures, [0-9]+ pending' "$log"; then
-            echo "::warning::some examples were pending"
-          fi
-          examples=$(grep -oE '^[0-9]+ examples' "$log" | grep -oE '[0-9]+' | tail -1)
-          if [ -z "$examples" ] || [ "$examples" -lt 15 ]; then
-            echo "::error::only ${examples:-0} integration examples ran; expected at least 15"
+          summary=$(grep -E '^[0-9]+ examples?, [0-9]+ failures?' "$log" | tail -1)
+          if [ -z "$summary" ]; then
+            echo "::error::rspec printed no summary line; the run did not finish"
             exit 1
           fi
-          echo "$examples integration examples ran"
+          pending=$(printf '%s\n' "$summary" | sed -nE 's/.*, ([0-9]+) pending$/\1/p')
+          if [ -n "$pending" ] && [ "$pending" -gt 0 ]; then
+            echo "::error::$pending broker examples were skipped or pending while a broker was running"
+            sed -n '/^Pending:/,/^Finished in/p' "$log"
+            exit 1
+          fi
+          examples=$(printf '%s\n' "$summary" | sed -nE 's/^([0-9]+) examples?,.*/\1/p')
+          if [ "$examples" -lt 55 ]; then
+            echo "::error::only $examples broker examples ran; expected at least 55"
+            exit 1
+          fi
+          echo "$examples broker examples ran, none skipped and none pending"
+
+      - name: What the broker said, if anything went wrong
+        if: failure()
+        run: docker logs acemq-ruby-release-it
 
   publish:
     needs: [verify, integration]
