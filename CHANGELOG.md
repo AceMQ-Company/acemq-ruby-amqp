@@ -8,6 +8,16 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Changed
+
+- **RabbitMQ 3.13 is now tested rather than assumed.** CI runs the broker suite
+  twice on every push, once against 4.x and once against 3.13, each with the
+  same broker speaking plaintext, TLS and mutual TLS. Nothing in the library
+  changed: the same sixty examples pass on both, including the ones that read
+  the negotiated protocol version and cipher off the socket. 3.13 is where most
+  production estates still are, and `README.md` now says so under Requirements
+  because a version nothing runs against is a version nobody has checked.
+
 ## [0.7.0] - 2026-09-20
 
 ### Changed

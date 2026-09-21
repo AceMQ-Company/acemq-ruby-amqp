@@ -2,10 +2,14 @@
 #
 # The contract layer has no dependencies and needs no broker, so it runs on the
 # whole matrix and takes seconds. Anything that needs a broker is tagged
-# :integration and runs in its own job against a broker of its own, once —
-# running it four times would learn the same thing four times.
+# :integration and runs in a job with a broker of its own — once per broker
+# version rather than once per Ruby, because running it on four interpreters
+# would learn the same thing four times while running it on 4.x and on 3.13
+# answers two different questions. 3.13 is the release most production estates
+# are still on, and a library claiming to work there should be able to point at
+# a job that proves it.
 #
-# That job ends by checking that nothing in it skipped. A broker example which
+# Those jobs end by checking that nothing in them skipped. A broker example which
 # quietly declines to run is the one kind of failure this workflow cannot see
 # on its own, and CI is where it has to be caught: this runs on every push,
 # while the release runs once and is the last place anybody wants to find out.
@@ -187,3 +191,136 @@ jobs:
       - name: What the broker said, if anything went wrong
         if: failure()
         run: docker logs acemq-ruby-it
+
+  # The same suite again, against the previous major release. "Works on 3.13"
+  # is a thing this library is entitled to say only if something checks it, and
+  # until now nothing did: every job above pins a 4.x image, while 3.13 is the
+  # release most production estates are actually running.
+  #
+  # A job of its own rather than another dimension on a matrix. The matrix above
+  # varies the Ruby interpreter, which is about whether this code loads and
+  # runs; the broker version is about how the thing on the other end of the
+  # socket behaves. Crossing the two would start eight brokers to learn what two
+  # runs already say, and when a crossed cell went red it would not tell you
+  # which axis did it.
+  compatibility:
+    name: integration tests on RabbitMQ 3.13
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Certificates
+        # Certificates here too, and a broker speaking all three of plaintext,
+        # TLS and mutual TLS, rather than the plaintext-only shortcut a
+        # compatibility job could get away with. Two reasons, and the first is
+        # the interesting one: 3.13 is a different Erlang and a different
+        # OpenSSL from 4.x, and TLS is precisely where a change of broker major
+        # shows up. The examples in tls_spec read the negotiated protocol
+        # version, the cipher and the presented chain off the socket, so they
+        # are the examples with something version-specific to say -- one of them
+        # skips itself on a broker that does not offer TLS 1.3, which is a
+        # question only a real 3.13 can answer. Testing 3.13 over plaintext
+        # alone would leave the half most likely to differ untested and still
+        # call itself a compatibility job.
+        #
+        # The second reason is arithmetic. The guard at the end of this job
+        # fails on a skipped example, and tls_spec skips itself wholesale when
+        # ACEMQ_TEST_BROKER_TLS is unset, so a plaintext-only job would have to
+        # either fail or carry a floor thirteen examples lower than the job
+        # above -- and a quietly lowered floor is exactly how those thirteen
+        # examples went unrun for the life of this workflow.
+        run: |
+          ./scripts/acemq-certs.rb --out "$RUNNER_TEMP/certs" --broker localhost --days 1
+          sed 's/^ssl_options.fail_if_no_peer_cert.*/ssl_options.fail_if_no_peer_cert = true/' \
+            "$RUNNER_TEMP/certs/rabbitmq.conf" > "$RUNNER_TEMP/certs/rabbitmq-mutual.conf"
+          grep -q 'fail_if_no_peer_cert = true' "$RUNNER_TEMP/certs/rabbitmq-mutual.conf"
+          chmod 644 "$RUNNER_TEMP"/certs/*.key
+
+      - name: Start the 3.13 broker
+        # rabbitmq:3.13-management, which is the tag the Java library's
+        # compatibility job pins, so that "3.13" means one broker across the
+        # five libraries rather than whichever 3.13 build each repository
+        # happened to reach for. Nothing in this suite talks to the management
+        # API; the plugin simply comes with that tag.
+        #
+        # Started by a step for the same reason the job above is: the
+        # certificates it mounts do not exist until acemq-certs.rb has run, and
+        # a service container is pulled and started before any step of the job.
+        run: |
+          docker run -d --name acemq-ruby-compat -e HOME=/tmp \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$RUNNER_TEMP/certs:/certs:ro" \
+            -v "$RUNNER_TEMP/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:3.13-management
+          # 3.13 boots more slowly than 4.x does -- the management plugin is
+          # part of that -- which is the other half of why readiness is read
+          # out of the log rather than off the published port.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          for _ in $(seq 1 60); do
+            if docker logs --since "$started" acemq-ruby-compat 2>&1 | grep -q "Server startup complete"; then
+              echo "the broker is up"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the broker never became ready"
+          docker logs acemq-ruby-compat
+          exit 1
+
+      - name: Test against the broker
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672
+          ACEMQ_TEST_BROKER_TLS: amqps://guest:guest@localhost:5671
+          ACEMQ_TEST_BROKER_CA: ${{ runner.temp }}/certs/ca.crt
+          ACEMQ_TEST_BROKER_CLIENT_CERT: ${{ runner.temp }}/certs/client.crt
+          ACEMQ_TEST_BROKER_CLIENT_KEY: ${{ runner.temp }}/certs/client.key
+        run: |
+          set -o pipefail
+          bundle exec rspec --tag integration --format documentation \
+            2>&1 | tee "$RUNNER_TEMP/broker-specs.log"
+
+      - name: Check nothing skipped
+        # The same guard, and it earns its place more here than it does above:
+        # this job's entire claim is "the suite passes against 3.13", so an
+        # example that quietly stopped running would leave that claim resting on
+        # nothing at all. Skipped and pending both fail it, for the reasons
+        # spelled out in the job above.
+        #
+        # The floor is 55, the same number as the 4.x job, because the run is
+        # the same run: sixty examples on 3.13-management, sixty on 4-alpine,
+        # the same sixty by name, none failing, none pending on either. Nothing
+        # in this suite needs a 4.x-only feature, and nothing in it declines to
+        # run on 3.13 -- including "reaches TLS 1.3 when the broker offers it",
+        # which would have made itself pending had 3.13's Erlang not offered it.
+        # If a future change makes this floor the lower of the two, the thing to
+        # write down is which examples 3.13 cannot run and why, not a smaller
+        # number.
+        run: |
+          log="$RUNNER_TEMP/broker-specs.log"
+          summary=$(grep -E '^[0-9]+ examples?, [0-9]+ failures?' "$log" | tail -1)
+          if [ -z "$summary" ]; then
+            echo "::error::rspec printed no summary line; the run did not finish"
+            exit 1
+          fi
+          pending=$(printf '%s\n' "$summary" | sed -nE 's/.*, ([0-9]+) pending$/\1/p')
+          if [ -n "$pending" ] && [ "$pending" -gt 0 ]; then
+            echo "::error::$pending broker examples were skipped or pending on RabbitMQ 3.13"
+            sed -n '/^Pending:/,/^Finished in/p' "$log"
+            exit 1
+          fi
+          examples=$(printf '%s\n' "$summary" | sed -nE 's/^([0-9]+) examples?,.*/\1/p')
+          if [ "$examples" -lt 55 ]; then
+            echo "::error::only $examples broker examples ran; expected at least 55"
+            exit 1
+          fi
+          echo "$examples broker examples ran on RabbitMQ 3.13, none skipped and none pending"
+
+      - name: What the broker said, if anything went wrong
+        if: failure()
+        run: docker logs acemq-ruby-compat

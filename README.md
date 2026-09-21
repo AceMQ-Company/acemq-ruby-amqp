@@ -1371,6 +1371,12 @@ else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
 Encryption and the development certificates need nothing at all: both are
 written against Ruby's own OpenSSL binding.
 
+RabbitMQ 3.13 and 4.x both. Every push runs the broker suite twice, once
+against each, and the same sixty examples pass on both — plaintext, TLS and
+mutual TLS alike, since TLS is where a change of broker major would show first.
+3.13 is named rather than assumed because a version nothing runs against is a
+version nobody has checked.
+
 ## Development
 
 ```bash
