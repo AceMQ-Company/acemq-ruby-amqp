@@ -172,7 +172,7 @@ jobs:
           # the port as soon as the container starts, so a TCP connect succeeds
           # and is immediately reset for several seconds before RabbitMQ is
           # listening on it.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for _ in $(seq 1 60); do
             if docker logs --since "$started" acemq-ruby-release-it 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"

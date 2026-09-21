@@ -105,7 +105,7 @@ jobs:
           # RabbitMQ is listening on it. --since bounds the check to this boot,
           # so a container that has been restarted cannot satisfy it with the
           # previous boot's startup line.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for _ in $(seq 1 60); do
             if docker logs --since "$started" acemq-ruby-it 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
@@ -261,7 +261,7 @@ jobs:
           # 3.13 boots more slowly than 4.x does -- the management plugin is
           # part of that -- which is the other half of why readiness is read
           # out of the log rather than off the published port.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for _ in $(seq 1 60); do
             if docker logs --since "$started" acemq-ruby-compat 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
