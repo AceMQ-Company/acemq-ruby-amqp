@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-21
+
 ### Changed
 
 - **RabbitMQ 3.13 is now tested rather than assumed.** CI runs the broker suite
