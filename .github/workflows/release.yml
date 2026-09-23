@@ -21,10 +21,12 @@
 # rather than a token because a token carries its owner's reach across every
 # repository they can see, and this job needs exactly one.
 #
-# # No notification
+# # Notification
 #
-# This workflow tells nobody. A release that is not on a public registry is not
-# news to announce, and the run itself is the record.
+# This workflow sends nothing itself. Its last job creates the GitHub release,
+# and `release-notify.yml` takes it from there — which is the event that
+# workflow was written for and had never once seen, because nothing here
+# created a release for it to hear about.
 name: release
 
 on:
@@ -250,6 +252,13 @@ jobs:
     # short of publishing, which is what makes this workflow safe to try out.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      # Whether anything reached the feed. False for every failure before the
+      # push, which is most of them. The announce job reads this rather than the
+      # job's result, so a release page can never name a version no client can
+      # resolve.
+      published: ${{ steps.push.outputs.published }}
     environment:
       name: gems
       url: https://acemq.org/gems/
@@ -311,6 +320,7 @@ jobs:
       # there". Everything before this leaves the feed untouched; everything
       # after operates on a version consumers can already resolve.
       - name: Commit and push
+        id: push
         working-directory: gem-feed
         env:
           VERSION: ${{ steps.version.outputs.value }}
@@ -319,11 +329,17 @@ jobs:
           git config user.email "noreply@acemq.org"
           if [ -z "$(git status --porcelain)" ]; then
             echo "nothing to publish; $VERSION may already be in the feed"
+            # Already there, so from a client's point of view this version is
+            # published. Saying otherwise would make a re-run of a good release
+            # look like a release that never happened, and would leave it
+            # without the release page it is owed.
+            echo "published=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git add -A
           git commit -m "Publish acemq-amqp $VERSION"
           git push origin HEAD
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Install it back out of the feed
         # The feed is only real if a client can resolve from it. GitHub Pages
@@ -348,3 +364,59 @@ jobs:
           done
           echo "::error::the feed did not serve acemq-amqp $VERSION within five minutes"
           exit 1
+
+  # The releases page. The feed has been correct for six minor versions while
+  # this page told every visitor the newest release was 0.1.0 — the one release
+  # anybody ever created by hand. A page that is wrong is worse than a page that
+  # is empty, because it is read as current and nothing about it looks stale.
+  #
+  # Keyed on the push having happened rather than on the job having got this far.
+  # A release object naming a version the feed never received sends a reader to a
+  # `gem install` that cannot resolve, and RubyGems will blame the source they
+  # typed rather than the version we advertised.
+  #
+  # The gem is attached, and it is the one `verify` built and installed into a
+  # clean prefix rather than a second build. A `.gem` carries its own metadata,
+  # so `gem install ./acemq-amqp-0.7.1.gem` works with no source configured at
+  # all — which is the one thing the feed cannot do for somebody behind a proxy
+  # that will not reach acemq.org. Nothing else goes up: a source archive of a
+  # repository anyone can clone is not worth a download.
+  announce:
+    needs: [verify, publish]
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gem
+          path: gem
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          gh release create "v$VERSION" gem/*.gem \
+            --title "v$VERSION" \
+            --notes "AceMQ for Ruby $VERSION.
+
+          \`\`\`bash
+          gem install acemq-amqp -v $VERSION --source https://acemq.org/gems/
+          \`\`\`
+
+          \`\`\`ruby
+          # Gemfile
+          source \"https://acemq.org/gems/\" do
+            gem \"acemq-amqp\", \"$VERSION\"
+          end
+          \`\`\`
+
+          The feed is a static index served over GitHub Pages, so it needs no credentials. The gem attached below is the same file the feed serves, for an install that cannot reach it.
+
+          Documentation: https://acemq.org/acemq-ruby-amqp/
+          Changelog: https://github.com/AceMQ-Company/acemq-ruby-amqp/blob/v$VERSION/CHANGELOG.md" \
+            || echo "release v$VERSION already exists"
