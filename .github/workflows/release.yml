@@ -345,6 +345,13 @@ jobs:
         # The feed is only real if a client can resolve from it. GitHub Pages
         # takes a moment to serve a new commit, so this retries rather than
         # racing the deploy.
+        #
+        # Twenty minutes, not five. Pages normally serves a new commit within
+        # seconds, but on 21 September 2026 the same site took twenty-five
+        # minutes, and a sibling repository's five-minute wait announced a
+        # release that was on its feed and installable as one that had not
+        # finished. Waiting longer costs nothing on an ordinary day, and the
+        # extraordinary day is the only reason this loop exists.
         env:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
@@ -352,7 +359,7 @@ jobs:
           # resolves through the compact index rather than the classic one.
           gem update --system --silent
           export GEM_HOME="$RUNNER_TEMP/verify-gems"
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 40); do
             if gem install acemq-amqp -v "$VERSION" \
                  --source https://acemq.org/gems/ --no-document >/dev/null 2>&1; then
               ruby -e 'gem "acemq-amqp"; require "acemq/amqp"; puts AceMQ::AMQP::VERSION' \
@@ -360,9 +367,9 @@ jobs:
               echo "installed acemq-amqp $VERSION from the feed"
               exit 0
             fi
-            sleep 15
+            sleep 30
           done
-          echo "::error::the feed did not serve acemq-amqp $VERSION within five minutes"
+          echo "::error::the feed did not serve acemq-amqp $VERSION within twenty minutes"
           exit 1
 
   # The releases page. The feed has been correct for six minor versions while
