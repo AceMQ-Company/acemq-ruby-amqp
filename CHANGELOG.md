@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-27
+
 ### Fixed
 
 - **Publishing no longer destroys the connection it is recovering.** A broker node

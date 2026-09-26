@@ -448,6 +448,39 @@ your *topology* rather than of your handlers, and nothing else shows them. When
 unsettled, which means the delivery ends once instead of being redelivered until
 somebody notices — so this counter is genuinely the only sign that path leaves.
 
+## Step 11 — The failure that is not yours
+
+Everything above is about a handler that failed. One failure on this page belongs
+to the network instead, and it is worth recognising because it looks alarming and
+is not:
+
+```
+the connection is being recovered and its channels are not open yet. ...
+a retry once the recovery completes will go down the recovered connection.
+```
+
+Restart your broker while the publisher on this page is running and you will see a
+burst of these, and then normal service. When a connection drops, bunny rebuilds it
+in two steps — the socket and the handshake, then the channels — and a message
+written in between would land on a channel the broker has not opened yet. The broker
+answers that by closing the connection, which would undo the recovery and start
+another; so publishing is refused for the length of the window instead, usually well
+under a second.
+
+Try it:
+
+```bash
+docker compose restart broker
+```
+
+The retry policy from Step 4 covers it with nothing added, which is the point: this
+arrives as an ordinary `PublishError`, and code that already retries a failed publish
+already handles it. Consumers need nothing — deliveries resume once the channels are
+back.
+
+What you must not do is treat it as a reason to stop publishing for good. It is a
+window, not a state.
+
 ## Next
 
 [Tutorial 3 — Never processing twice](tutorial-exactly-once.md). Everything on

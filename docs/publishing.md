@@ -124,6 +124,33 @@ interceptors are told, so a publish an interceptor refused is counted too. It
 did not reach the broker, which is what the metric is about. See
 [metrics and health](observability.md).
 
+### While the connection is being recovered
+
+One failure is worth knowing by name, because it is brief, expected, and the right
+response to it is a retry rather than an alert:
+
+```
+the connection is being recovered and its channels are not open yet. Publishing
+now would be refused by the broker and would close the connection again; this
+message was not sent, and a retry once the recovery completes will go down the
+recovered connection.
+```
+
+When a broker node restarts or the network drops, bunny rebuilds the connection
+underneath you. That happens in two steps — the socket and the AMQP handshake
+first, the channels after — and a message written in between would arrive on a
+channel the broker has not opened yet. The broker's answer to that is not to
+refuse the message; it closes the whole connection, which would undo the recovery
+in progress and start another one.
+
+So publishing is refused for the length of the window, typically well under a
+second, and the message is not sent. Retry it: by the time a retry lands the
+channels are back. `publish` raises `PublishError` as it does for any other
+failure, so code that already retries needs no change.
+
+Consuming is unaffected — deliveries resume on their own once the channels are
+recovered.
+
 ## When reaching no queue should be an error
 
 A confirm says the broker has the message. It does not say the message reached a
