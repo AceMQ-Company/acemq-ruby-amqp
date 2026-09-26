@@ -8,6 +8,22 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reconnect no longer shrinks the publishing ceiling.** A publish waiting for
+  its confirm when the connection dies keeps its permit, which is correct: the
+  broker may yet have the message, so nothing can say it did not arrive. Freeing
+  those permits was attached to the opening of a new publishing channel — and
+  bunny recovers a session by re-opening the *same* channel objects, so no new
+  channel is ever created and the permits were never given back. The ceiling
+  therefore shrank by every in-flight publish at every reconnect, and a connection
+  that had reconnected enough times would refuse every publish with "1000
+  publishes are already waiting for a confirm" on a healthy broker. The permits are
+  now returned when bunny reports the recovery complete, which is the event that
+  actually happens. Found while investigating a Ruby client that stopped publishing
+  after a fault drill restarted a broker node; that specific failure is not yet
+  explained and this is not a claim to have fixed it.
+
 ## [0.7.1] - 2026-09-21
 
 ### Changed

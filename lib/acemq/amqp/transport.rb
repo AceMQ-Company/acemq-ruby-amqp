@@ -684,6 +684,7 @@ module AceMQ
         @blocked_lock = Mutex.new
         @blocked_reason = nil
         watch_blocked
+        watch_recovery
       end
 
       # The bunny session, for the things this class deliberately does not wrap.
@@ -1027,6 +1028,41 @@ module AceMQ
           @blocked_lock.synchronize { @blocked_reason = reason.empty? ? nil : reason }
         end
         @session.on_unblocked { @blocked_lock.synchronize { @blocked_reason = nil } }
+      end
+
+      # A recovered connection has nothing outstanding on it.
+      #
+      # This is the other half of {PublishPermits#reopened}, and without it the first
+      # half almost never ran. A publish waiting for its confirm when the connection
+      # dies keeps its permit -- correctly, because the broker may yet have the
+      # message and nothing here can say it did not arrive -- so the permit can only
+      # be freed by something that knows the connection itself is gone.
+      #
+      # That was the opening of a new publishing channel. But bunny recovers a session
+      # by re-opening the *same* channel objects on the new transport, so no new
+      # channel is ever created, and the permits of everything in flight were never
+      # given back. The ceiling shrank by that many at every reconnect until it
+      # reached zero, after which every publish failed with "1000 publishes are
+      # already waiting for a confirm" -- for ever, on a healthy broker, over a
+      # connection bunny had successfully recovered.
+      #
+      # A fault drill found it: one broker node restarted under a standing load, and
+      # afterwards this library never published successfully again while four others
+      # in the same drill recovered within seconds.
+      #
+      # Separate from {#watch_blocked} because the two are unrelated, and because
+      # sharing its guard is how this was missed once already: a session offering
+      # recovery but not the blocked callbacks would have lost the hook entirely.
+      def watch_recovery
+        return unless @session.respond_to?(:after_recovery_completed)
+
+        @session.after_recovery_completed do
+          # Nothing published on the old connection can be confirmed on the new one,
+          # which is the conclusion Java's shutdown listener reaches when it fails
+          # every pending publish.
+          @permits.reopened
+          @returns.reopened
+        end
       end
 
       # The channel every publish goes down, opened once and guarded.
