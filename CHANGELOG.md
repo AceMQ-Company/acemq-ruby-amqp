@@ -10,6 +10,33 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **Publishing no longer destroys the connection it is recovering.** A broker node
+  restarting under a busy publisher left this library unable to publish again at
+  all — not for a moment, but permanently, on a healthy broker, over a connection
+  bunny had successfully rebuilt. A fault drill caught it: 45,000 consecutive
+  failures across fourteen minutes, while the Java, Go, Python and .NET clients in
+  the same drill recovered within seconds.
+
+  A recovery has two steps. Bunny rebuilds the socket and completes the AMQP
+  handshake, and re-opens the channels *after* that. A frame written in between
+  arrives on a channel the broker has never seen, and the broker does not refuse
+  just that frame — it answers `CHANNEL_ERROR - expected 'channel.open'` and closes
+  the whole connection. So each recovery was killed by the next publish, bunny
+  started another, and it never converged.
+
+  Bunny's own `recovering_from_network_failure?` cannot be used to avoid this, which
+  is the trap: it is cleared as soon as the handshake succeeds, before the channels
+  are re-opened, so throughout the window that matters the session reports open and
+  not recovering. The window is now tracked from `before_recovery_attempt_starts`
+  and `after_recovery_completed`, the second of which fires once the channels are
+  back, and a publish inside it is refused with a sentence saying the message was
+  not sent and that a retry after the recovery will go through.
+
+  A publisher on its own rarely writes inside the window and usually got away with
+  it; a consumer on the same connection adds channels that also have to be
+  re-opened, and at a few hundred publishes a second the window was hit on every
+  single attempt.
+
 - **A reconnect no longer shrinks the publishing ceiling.** A publish waiting for
   its confirm when the connection dies keeps its permit, which is correct: the
   broker may yet have the message, so nothing can say it did not arrive. Freeing

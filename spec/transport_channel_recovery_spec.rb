@@ -62,12 +62,14 @@ class RecoverableSession
   def create_channel(*) = @channel
   def close = nil
 
+  def before_recovery_attempt_starts(&block) = @on_start = block
   def after_recovery_completed(&block) = @on_recovered = block
 
   # The connection drops and comes back, as bunny does it: the same channel, still
-  # reporting open, and a callback once it is usable again.
+  # reporting open, an attempt that starts, and a completion once it is usable again.
   def recover!
     @open = false
+    @on_start&.call
     @open = true
     @on_recovered&.call
   end
@@ -128,5 +130,69 @@ RSpec.describe AceMQ::AMQP::Transport do
     end.new(channel)
 
     expect { described_class.new(plain) }.not_to raise_error
+  end
+end
+
+# Publishing *during* a recovery is what destroyed the connection being recovered.
+#
+# Bunny's recovery has two steps and only the first shows in `open?`: the socket and
+# the AMQP handshake come back, and each channel is re-opened after that. A frame
+# written in between lands on a channel the broker has never seen, and the broker
+# answers CHANNEL_ERROR "expected 'channel.open'" by closing the whole connection --
+# so the publisher killed the connection bunny had just rebuilt, over and over,
+# without ever converging.
+RSpec.describe AceMQ::AMQP::Transport, "while the connection is recovering" do
+  subject(:transport) { described_class.new(session) }
+
+  # A session in the middle of a recovery: open, because the handshake is done, and
+  # recovering, because its channels are not back yet.
+  let(:session) do
+    Class.new do
+      attr_writer :recovering
+
+      def initialize(channel)
+        @channel = channel
+        @recovering = false
+      end
+
+      def open? = true
+      def create_channel(*) = @channel
+      def close = nil
+      def before_recovery_attempt_starts(&block) = @on_start = block
+      def after_recovery_completed(&block) = @on_recovered = block
+
+      # Drives the window the way bunny does: the attempt starts, and completion
+      # only arrives once the channels are back.
+      def start_recovering = @on_start&.call
+      def finish_recovering = @on_recovered&.call
+    end.new(StubChannel.new)
+  end
+
+  it "refuses to publish, saying the message did not go and a retry will" do
+    transport # built first, because it is what registers the recovery callbacks
+    session.start_recovering
+
+    expect { transport.send(:publish_channel) { |c| c } }
+      .to raise_error(AceMQ::AMQP::TransportError, /not open yet.*was not sent.*retry/m)
+  end
+
+  it "publishes normally once the recovery is over" do
+    transport
+    session.start_recovering
+    expect { transport.send(:publish_channel) { |c| c } }.to raise_error(AceMQ::AMQP::TransportError)
+
+    session.finish_recovering
+    expect(transport.send(:publish_channel) { |c| c }).to be_a(StubChannel)
+  end
+
+  it "says nothing about recovery to a session that cannot be asked" do
+    plain = Class.new do
+      def initialize(channel) = @channel = channel
+      def open? = true
+      def create_channel(*) = @channel
+      def close = nil
+    end.new(StubChannel.new)
+
+    expect { described_class.new(plain).send(:publish_channel) { |c| c } }.not_to raise_error
   end
 end

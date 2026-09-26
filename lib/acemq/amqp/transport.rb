@@ -683,6 +683,10 @@ module AceMQ
         # for the broker that has just blocked it.
         @blocked_lock = Mutex.new
         @blocked_reason = nil
+        # Its own lock again, and for the same reason: this one is written from
+        # bunny's recovery thread and read by every thread that publishes.
+        @recovery_lock = Mutex.new
+        @recovering = false
         watch_blocked
         watch_recovery
       end
@@ -1054,15 +1058,71 @@ module AceMQ
       # sharing its guard is how this was missed once already: a session offering
       # recovery but not the blocked callbacks would have lost the hook entirely.
       def watch_recovery
+        if @session.respond_to?(:before_recovery_attempt_starts)
+          @session.before_recovery_attempt_starts do
+            @recovery_lock.synchronize { @recovering = true }
+          end
+        end
+
         return unless @session.respond_to?(:after_recovery_completed)
 
         @session.after_recovery_completed do
+          @recovery_lock.synchronize { @recovering = false }
           # Nothing published on the old connection can be confirmed on the new one,
           # which is the conclusion Java's shutdown listener reaches when it fails
           # every pending publish.
           @permits.reopened
           @returns.reopened
         end
+      end
+
+      # Refuses to write anything between a connection being lost and its channels
+      # being back.
+      #
+      # A recovery has two steps and only the first is visible in the session's state.
+      # Bunny rebuilds the socket and completes the AMQP handshake -- at which point
+      # the session reports open -- and re-opens each channel after that. A frame
+      # written in between arrives on a channel the broker has never seen, and the
+      # broker's answer is not to refuse the frame: it is CHANNEL_ERROR "expected
+      # 'channel.open'", which closes the whole connection.
+      #
+      # A publisher that kept publishing through a recovery therefore destroyed the
+      # connection bunny had just rebuilt; bunny started another recovery, and the
+      # next publish destroyed that one too. It never converged. The broker's log
+      # shows one of these per attempt, for ever:
+      #
+      #   Recovering from connection.close (CHANNEL_ERROR - expected 'channel.open')
+      #
+      # Bunny's own `recovering_from_network_failure?` cannot be used for this, and
+      # that is the trap: it is cleared as soon as the handshake succeeds and *before*
+      # `recover_channels` runs (bunny 2.24, session.rb), so throughout the window
+      # that actually matters the session reports open and not recovering. A guard
+      # built on it changes nothing, which is exactly what measuring it showed.
+      #
+      # So the window is tracked here instead, from bunny's two recovery callbacks:
+      # `before_recovery_attempt_starts` opens it and `after_recovery_completed`
+      # closes it, and the second of those fires after the channels are back.
+      #
+      # A fault drill found this. One broker node was restarted under a standing load
+      # publishing and consuming on one connection, and afterwards the library never
+      # published successfully again -- 45,000 consecutive failures, while four other
+      # client libraries in the same drill recovered within seconds. A publisher alone
+      # survives, because it seldom writes inside the window; a consumer on the same
+      # connection adds channels that also have to be re-opened, which widens the
+      # window enough to be hit every time at a few hundred publishes a second.
+      #
+      # Refused rather than waited out: the caller is told the message did not go and
+      # that a retry is the right answer, as every other transient failure here does.
+      # Waiting inside the publish lock would hold up nothing useful and would turn a
+      # broker restart into a stalled application.
+      def refuse_while_recovering!
+        return unless @recovery_lock.synchronize { @recovering }
+
+        raise TransportError,
+              "the connection is being recovered and its channels are not open yet. " \
+              "Publishing now would be refused by the broker and would close the " \
+              "connection again; this message was not sent, and a retry once the " \
+              "recovery completes will go down the recovered connection."
       end
 
       # The channel every publish goes down, opened once and guarded.
@@ -1074,6 +1134,7 @@ module AceMQ
       # channel while an application thread may be publishing its own.
       def publish_channel
         @lock.synchronize do
+          refuse_while_recovering!
           if @publish_channel.nil? || !@publish_channel.open?
             @publish_channel = @session.create_channel
             @publish_channel.confirm_select
