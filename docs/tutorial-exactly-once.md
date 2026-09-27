@@ -133,6 +133,14 @@ ActiveRecord connection is a dozen lines of the same shape. SQLite and PostgreSQ
 are what has actually been run; everything else is "should work", which is a
 different claim.
 
+**A Rails application's own connection works, including the one from
+`ActiveRecord::Base.connection.raw_connection`.** That handle arrives with
+`results_as_hash = true` set on it, so it hands rows back as hashes rather than as
+arrays — and until `0.7.3` every store read them positionally and saw nothing at
+all. Inserts succeeded, selects came back empty, and an outbox relay published
+nothing while reporting no error. If you are on `0.7.2` or earlier with a Rails
+connection, upgrade before trusting what these stores tell you.
+
 **The single handle above is a tutorial's shortcut, not a pattern.** Your handler
 runs on the transport's threads, so a store built on one `SQLite3::Database` is
 that connection being used from a consumer thread and from yours at the same time,

@@ -1346,7 +1346,10 @@ own background work.
 only a seam three methods wide — `run(sql, params)`, `placeholder(index)`,
 `constraint_violation?(error)` — and `SQL.connect` recognises what it is handed
 by the methods that object answers rather than by its class. A
-`SQLite3::Database` and a `PG::Connection` both work as they are.
+`SQLite3::Database` and a `PG::Connection` both work as they are, whether the
+driver hands a row back as an array or as a hash — the second of which is what
+ActiveRecord's connection does, and what these stores silently read as nothing at
+all until `0.7.3`.
 
 **What has actually been run:** SQLite, by the ordinary specs (the sqlite3 gem
 is a development dependency, so they need no environment), and PostgreSQL, by

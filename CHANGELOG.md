@@ -8,6 +8,43 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-27
+
+### Fixed
+
+- **The database-backed stores read nothing at all through a connection that
+  hands rows back as hashes, and said nothing about it.** The sqlite3 gem returns
+  a row as an array by default and as a hash when the database has
+  `results_as_hash = true`. ActiveRecord sets that flag on the connection it
+  opens — so a Rails application handing over
+  `ActiveRecord::Base.connection.raw_connection`, which is the documented way to
+  put these stores on the application's own database, got hashes without having
+  asked for anything.
+
+  Every store reads a row positionally, `row[0]`, `row[1]`, and on a hash keyed by
+  column name every one of those is `nil`. Nothing raised anywhere. An insert
+  succeeded, the select that followed came back empty or as a record of nils,
+  `pending_count` read `0` with records sitting in the table, and
+  `SELECT COUNT(*)` — whose column is named `COUNT(*)` in a hash row — read `0`
+  too. So an outbox relay swept, found nothing, published nothing and returned
+  success, run after run, while the outbox filled up: a message a committed
+  transaction had promised to send, dropped with no error in any log. The
+  idempotency store's `confirmed?` answered `false` for every key, which lets a
+  message that was already handled be handled again, and the schema registry read
+  every identifier as `0`, so two registrations asked for the same one.
+
+  Rows are normalised to positional now — in the sqlite3 wrapper, and again at the
+  statement seam so that a connection of your own works too, whether it is built
+  on `exec_query`, on a Sequel dataset or on anything else that hands back hashes.
+  A driver's row shape is the driver's to choose and nothing here turns a caller's
+  setting off behind their back. `Result#rows` documented that it is always an
+  array of arrays; that is now enforced rather than assumed.
+
+  The specs drive all three stores — outbox, idempotency and schema registry — and
+  a relay sweep through a connection with the flag set. Eight of them fail against
+  `0.7.2`, including the one that publishes nothing and reports success. Without
+  the flag set, none of this is visible.
+
 ## [0.7.2] - 2026-09-27
 
 ### Fixed

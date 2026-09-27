@@ -988,6 +988,19 @@ Statements are written with `?` and rendered per driver, so nothing here builds
 SQL out of anything a caller supplied except a table name — which is validated
 as a plain identifier, because no database binds one as a parameter.
 
+**A row may come back as an array or as a hash, and both are read correctly.**
+The sqlite3 gem returns arrays by default and hashes when the database has
+`results_as_hash = true` — which is what ActiveRecord sets on the connection it
+opens, so a Rails application handing over
+`ActiveRecord::Base.connection.raw_connection` gets hashes without having asked
+for anything. The stores read a row positionally, and on a hash keyed by column
+name every positional read is `nil`: until `0.7.3` the insert succeeded, the
+select came back empty, `pending_count` read `0` with records in the table, and
+an outbox relay published nothing and reported no error. Rows are normalised to
+positional now, in the driver wrapper and again at the statement seam, so a
+connection of your own that hands back hashes — one built on `exec_query`, or on
+a Sequel dataset — works as well as one that hands back arrays.
+
 Times are stored as fixed-width ISO-8601 UTC, so that a string comparison in the
 database orders instants the way instants are ordered. There is no timestamp
 type spelled the same way in SQLite and PostgreSQL and no portable way to bind a

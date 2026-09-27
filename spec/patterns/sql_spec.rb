@@ -519,6 +519,158 @@ RSpec.describe "the database-backed stores" do
     end
   end
 
+  # The sqlite3 gem hands a row back as an array by default and as a hash when
+  # the database has `results_as_hash = true`. ActiveRecord sets that flag on the
+  # connection it opens, so a service that hands over
+  # `ActiveRecord::Base.connection.raw_connection` — the documented way to put
+  # these stores on a Rails application's own database — gets hashes without
+  # having asked for anything.
+  #
+  # Every store here reads `row[0]`, `row[1]`, and on a hash keyed by column name
+  # every one of those is nil. Nothing raised. The insert succeeded, the select
+  # came back as a row of nils or as nothing at all, `pending_count` read 0 with
+  # records in the table, and an outbox relay swept, published nothing and
+  # reported success. That is the worst failure this library can have — a message
+  # a committed transaction promised to send, dropped with no error anywhere — and
+  # it is invisible without a spec that sets the flag.
+  describe "a driver that hands rows back as hashes" do
+    let(:db) do
+      database = SQLite3::Database.new(":memory:")
+      # Exactly what ActiveRecord's sqlite3 adapter does to its connection.
+      database.results_as_hash = true
+      database.execute("CREATE TABLE orders (id TEXT PRIMARY KEY)")
+      database
+    end
+
+    it "is the shape this is about, asserted rather than assumed" do
+      db.execute("CREATE TABLE probe (a TEXT, b INTEGER)")
+      db.execute("INSERT INTO probe VALUES ('x', 2)")
+      row = db.execute("SELECT a, b FROM probe").first
+
+      expect(row).to be_a(Hash)
+      expect(row["a"]).to eq("x")
+      # The whole defect in one line: positional reads see nothing.
+      expect(row[0]).to be_nil
+    end
+
+    it "is read positionally by the time a store sees it" do
+      db.execute("CREATE TABLE probe (a TEXT, b INTEGER)")
+      db.execute("INSERT INTO probe VALUES ('x', 2)")
+
+      expect(AceMQ::AMQP::Patterns::SQL.connect(db).run("SELECT a, b FROM probe").rows)
+        .to eq([["x", 2]])
+    end
+
+    describe AceMQ::AMQP::Patterns::SQLOutboxStore do
+      let(:transport) { FakeTransport.new }
+      let(:mq) { AceMQ::AMQP::Connection.new(transport: transport, origin: "checkout@pod-7") }
+      let(:store) { described_class.new(connection: db) }
+
+      before { store.create_schema }
+
+      def recorded(payload = { "order_id" => "A-1" })
+        AceMQ::AMQP::Patterns.record(mq, payload, to: "order.placed",
+                                                  exchange: "orders-events")
+      end
+
+      it "hands back the record it was given, with every field on it" do
+        record = recorded
+        store.add(record, connection: db)
+
+        pending = store.pending
+
+        expect(pending.size).to eq(1)
+        expect(pending.first.id).to eq(record.id)
+        expect(pending.first.exchange).to eq("orders-events")
+        expect(pending.first.routing_key).to eq("order.placed")
+        expect(pending.first.body).to eq('{"order_id":"A-1"}')
+        expect(pending.first.headers).to eq(record.headers)
+      end
+
+      it "counts what is waiting" do
+        store.add(recorded, connection: db)
+
+        expect(store.pending_count).to eq(1)
+      end
+
+      it "publishes what a committed transaction left behind" do
+        # The failure as a service would meet it: the relay reported no error and
+        # sent nothing, run after run, while the table filled up.
+        db.transaction { store.add(recorded, connection: db) }
+        relay = AceMQ::AMQP::Patterns::OutboxRelay.new(mq, store)
+
+        expect(relay.sweep).to eq(1)
+        expect(transport.published.size).to eq(1)
+        expect(transport.published.first[:body]).to eq('{"order_id":"A-1"}')
+        expect(store.pending_count).to eq(0)
+      end
+    end
+
+    describe AceMQ::AMQP::Patterns::SQLIdempotencyStore do
+      let(:store) { described_class.new(connection: db) }
+
+      before { store.create_schema }
+
+      it "sees a confirmation it wrote" do
+        # `confirmed?` reads one column and answered false for every key, so a
+        # duplicate that had already been handled was handled again.
+        store.first_time?("m-1")
+        store.confirm("m-1")
+
+        expect(store.confirmed?("m-1")).to be(true)
+      end
+
+      it "counts the keys it is holding" do
+        store.first_time?("m-2")
+
+        expect(store.size).to eq(1)
+      end
+
+      it "expires what it is holding when asked" do
+        brief = described_class.new(connection: db, claim_timeout: 0.05)
+        brief.first_time?("m-3")
+        sleep 0.1
+
+        expect(brief.purge_expired).to eq(1)
+        expect(brief.size).to eq(0)
+      end
+    end
+
+    describe AceMQ::AMQP::Patterns::SQLSchemaRegistry do
+      let(:registry) { described_class.new(connection: db) }
+      let(:definition) { '{"type":"record","name":"OrderPlaced"}' }
+
+      before { registry.create_schema }
+
+      it "reads back a schema it registered" do
+        id = registry.register("order.placed", "avro", definition).id
+
+        expect(registry.by_id(id).definition).to eq(definition)
+        expect(registry.latest("order.placed").definition).to eq(definition)
+        expect(registry.size).to eq(1)
+      end
+
+      it "numbers identifiers from one across a restart" do
+        # `next_id` reads a single column too, so every registration asked for id
+        # 1 and the second collided with the first.
+        first = registry.register("order.placed", "avro", definition).id
+        second = registry.register("order.shipped", "avro", "{}").id
+
+        expect([first, second]).to eq([1, 2])
+        expect(described_class.new(connection: db).by_id(second).subject)
+          .to eq("order.shipped")
+      end
+
+      it "recognises a definition it already has, rather than versioning it again" do
+        first = registry.register("order.placed", "avro", definition)
+        second = registry.register("order.placed", "avro", definition)
+
+        expect(second.id).to eq(first.id)
+        expect(registry.versions("order.placed").size).to eq(1)
+      end
+    end
+  end
+
   describe AceMQ::AMQP::Patterns::SQL do
     it "recognises a driver by what it answers to, not by its class" do
       expect(described_class.connect(db)).to be_a(described_class::SQLite3Connection)

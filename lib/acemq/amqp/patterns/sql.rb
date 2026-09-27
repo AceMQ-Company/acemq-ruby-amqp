@@ -52,6 +52,10 @@ module AceMQ
         # +affected+ is how many rows a statement changed, which is the answer a
         # conditional update is asked for — a claim is decided by the row count,
         # never by the select that preceded it.
+        #
+        # That shape is now enforced rather than assumed. It was assumed, and a
+        # driver handing back hashes turned every read into a row of nils without
+        # raising anything — see {SQL.positional}.
         Result = Struct.new(:rows, :affected)
 
         # A table name reaches SQL by concatenation because no database lets one
@@ -154,6 +158,42 @@ module AceMQ
             Time.now.utc
           end
 
+          # Rows as this library reads them: an array per row, in the order the
+          # statement named its columns.
+          #
+          # A driver may hand back either shape and both are legitimate. The
+          # sqlite3 gem returns arrays by default and hashes when the database
+          # has +results_as_hash = true+ — which ActiveRecord sets on the
+          # connection it opens, so a service handing over
+          # +ActiveRecord::Base.connection.raw_connection+ gets hashes without
+          # ever asking for them. Sequel and anything built on
+          # +exec_query+ hand back hashes as their only shape.
+          #
+          # Every store here reads +row[0]+, +row[1]+, and on a hash keyed by
+          # column name every one of those is +nil+. Nothing raises: the insert
+          # succeeds, the select "works", and an outbox relay reads a batch of
+          # records whose ids and bodies are all nil, publishes none of them and
+          # reports no error. Silent data loss, and invisible without a spec that
+          # sets the flag.
+          #
+          # The keys of a hash row are its column names in the order the
+          # statement selected them, so the values in insertion order are the
+          # positional row. Integer keys are dropped first: older sqlite3
+          # releases put the column index in the same hash alongside the name,
+          # and counting those would double every row.
+          #
+          # @param rows [Array] whatever a driver handed back
+          # @return [Array<Array>] the same rows, positionally
+          def positional(rows)
+            return rows unless rows.is_a?(Array)
+
+            rows.map do |row|
+              next row unless row.is_a?(Hash)
+
+              row.reject { |column, _| column.is_a?(Integer) }.values
+            end
+          end
+
           # Renders a statement's placeholders in the driver's own style.
           #
           # The templates are written with +?+ and belong to this library, so
@@ -192,7 +232,13 @@ module AceMQ
             rows = @database.execute(sql, params)
             # changes reports the last statement's row count, which is what a
             # conditional update needs and what a select has no use for.
-            Result.new(rows, @database.changes)
+            #
+            # The shape of a row is the database's to choose, not this wrapper's:
+            # +results_as_hash = true+ is a setting on the SQLite3::Database
+            # handed over, ActiveRecord sets it on the connection it opens, and
+            # nothing here may turn a caller's setting off behind their back.
+            # Normalised on the way out instead.
+            Result.new(SQL.positional(rows), @database.changes)
           end
 
           # SQLite numbers its parameters for you.
@@ -257,8 +303,15 @@ module AceMQ
           private
 
           # Runs a statement, rendering its placeholders for this driver.
+          #
+          # Rows are normalised here as well as in the wrappers above, because a
+          # connection may be somebody else's: wrapping a pool, a Sequel database
+          # or an ActiveRecord connection is a dozen lines, and a wrapper built on
+          # anything that hands back hashes would otherwise feed nils to every
+          # store without raising. Arrays pass through untouched.
           def run(sql, params = [], on: connection)
-            on.run(SQL.bind(sql, on), params)
+            result = on.run(SQL.bind(sql, on), params)
+            Result.new(SQL.positional(result.rows), result.affected)
           end
 
           # Runs a statement whose only interesting outcome is whether a key was
