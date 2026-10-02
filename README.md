@@ -1371,15 +1371,12 @@ else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
 `google-protobuf`, `avro` — or the [tracing adapter](#tracing), which wants
 `opentelemetry-api`. Each of those says so by name when it is missing.
 
-**bunny 3.2 or newer, if your Ruby allows it.** Both majors are supported and
-tested, and `">= 2.23", "< 4"` resolves to 3.x on Ruby 3.2 and newer and 2.x on
-Ruby 3.1. They are not equally sound: bunny before 3.2 could start overlapping
-recovery attempts and leave a client permanently disconnected, which is what a
-node closing every connection before a restart provokes. Measured by forcing
-every connection shut ninety times, 15 seconds apart, against a client built on
-bunny alone — 2.24.0 went from 6 threads to 146 and stopped consuming at the
-40th recovery, having published 18,274 messages; 3.4.0 stayed at 6 threads and
-published 174,111. See [getting started](docs/getting-started.md) for the table.
+**Both bunny majors are supported and tested; 2.x is what to run today.** The
+constraint `">= 2.23", "< 4"` resolves to 3.x on Ruby 3.2 and newer and to 2.x on
+Ruby 3.1, and the suite passes on both — but under *repeated* connection recovery
+neither combination is yet where it should be, so pin `"~> 2.23"` if you
+reconnect often and want the better of the two. See
+[getting started](docs/getting-started.md) for the measurements.
 
 Encryption and the development certificates need nothing at all: both are
 written against Ruby's own OpenSSL binding.

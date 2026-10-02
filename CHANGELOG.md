@@ -29,25 +29,40 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
-- **bunny `">= 2.23", "< 4"`, and use 3.2 or newer where your Ruby allows it.** Both
-  majors are supported and tested; the range resolves to 3.x on Ruby 3.2 and newer and
-  to 2.x on Ruby 3.1.
+- **bunny `">= 2.23", "< 4"`.** Both majors are supported and the suite passes on
+  both; the range resolves to 3.x on Ruby 3.2 and newer and to 2.x on Ruby 3.1. Pin
+  `"~> 2.23"` for now if your clients reconnect often — see the known issue below.
 
-  Thread growth under repeated connection recovery, which a soak found in the Ruby
-  standing load, was **bunny's and is fixed in bunny 3.2** ("Connection recovery now
-  uses a mutex to avoid concurrent attempts"). Measured by forcing every connection
-  shut 90 times, 15s apart, against a client built on bunny alone with none of this
-  library in the path:
+  bunny 3.2 fixed a defect of its own ("Connection recovery now uses a mutex to avoid
+  concurrent attempts"): before it, overlapping recovery attempts could leave a client
+  permanently disconnected. Measured by forcing every connection shut 90 times, 15s
+  apart, against a client built on bunny alone with none of this library in the path:
 
   | bunny | threads | published | consumed | state at the end |
   | --- | --- | --- | --- | --- |
   | 2.24.0 | 6 → 146 | 18,274 | 13,535 | stopped consuming at the 40th recovery |
   | 3.4.0 | 6 → 6 | 174,111 | 174,108 | unaffected |
 
-  The threads piled up in `Bunny::Session#handle_network_failure` and
+  Those threads piled up in `Bunny::Session#handle_network_failure` and
   `#recover_channels`, both blocked on bunny's own `@channel_mutex`. Reproduce with
-  `scripts/ruby/bunny_only_leak_probe.rb` in the workspace. On Ruby 3.1 only bunny 2.x
-  installs, so a long-lived client that reconnects many times will still degrade there.
+  `scripts/ruby/bunny_only_leak_probe.rb` in the workspace.
+
+### Known issue
+
+- **This library leaks a channel, and its consumer work pool, somewhere in the
+  recovery path.** Under repeated forced recovery a standing load's thread count
+  climbs until the process is unhealthy: about 54 threads by the 12th recovery on
+  bunny 3.4, or an onset around the 50th on bunny 2.24 reaching 168 over 240. It is
+  ours, not bunny's — a bunny-only client of the same shape (a 4-thread consumer pool,
+  a passive subscribe) stays flat over the same fault stream, and the leaked threads
+  are all parked in `ConsumerWorkPool`. `Transport#subscribe` runs exactly once, so
+  the extra pools come from channels opened elsewhere in the transport and never
+  reclaimed.
+
+  It is the reason bunny 2.x is still the recommended pin despite being the worse
+  transport: 3.x surfaces this faster than 2.x masks it. Reproduce with
+  `scripts/ruby/thread_leak_probe.rb` in the workspace, and compare against
+  `bunny_only_leak_probe.rb` with `PROBE_POOL=4 PROBE_PASSIVE=1`.
 
 ## [0.7.3] - 2026-09-27
 

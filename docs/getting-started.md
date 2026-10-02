@@ -24,24 +24,29 @@ it is missing — so a process that only builds envelopes or checks a retry
 schedule never loads a broker client. That is also why `bunny` goes in your
 Gemfile rather than being pulled in for you.
 
-**Use bunny 3.2 or newer if your Ruby allows it.** The range above resolves to
-bunny 3.x on Ruby 3.2 and newer and to 2.x on Ruby 3.1, which is the best either
-can do, but the two are not equally sound under repeated connection loss. Bunny
-before 3.2 could start overlapping recovery attempts and leave a client
-permanently disconnected — the exact case being a node closing every connection
-before a restart, which is what a rolling upgrade does.
+**Which bunny.** The range above resolves to bunny 3.x on Ruby 3.2 and newer and to
+2.x on Ruby 3.1. Both are supported and the suite passes on both. If your clients
+reconnect often, pin `"~> 2.23"` for now — the reasoning is worth having in full,
+because neither is yet where it should be.
 
-It is not a small difference. Forcing every connection shut every 15 seconds,
-ninety times, against a client built on bunny alone:
+bunny 3.2 fixed a defect of its own: before it, overlapping recovery attempts could
+leave a client permanently disconnected, which is exactly what a node closing every
+connection before a restart provokes. Forcing every connection shut every 15 seconds,
+ninety times, against a client built on **bunny alone**:
 
 | bunny | threads | published | consumed | state at the end |
 |---|---|---|---|---|
 | 2.24.0 | 6 → 146 | 18,274 | 13,535 | stopped consuming at the 40th recovery |
 | 3.4.0 | 6 → 6 | 174,111 | 174,108 | unaffected |
 
-On Ruby 3.1 you are held to bunny 2.x, so a client that reconnects many times
-over a long life will degrade. Raising the Ruby version is the only fix, and
-this library runs on 3.1 so that choice stays yours.
+So bunny 3.x is plainly the better transport. The catch is this library: it leaks a
+channel, and its consumer work pool with it, somewhere in the recovery path — and
+bunny 3.x surfaces that much faster than 2.x masks it. The same standing load reaches
+about 54 threads by the 12th forced recovery on bunny 3.4, where on 2.24 the growth
+does not start until around the 50th. Until that is fixed, 2.x is the less bad of two
+imperfect options, and the recommendation here will change the moment it is.
+
+On Ruby 3.1 the choice is made for you: only bunny 2.x installs there.
 
 ## Opening a connection
 
