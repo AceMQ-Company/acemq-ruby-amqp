@@ -46,14 +46,21 @@ class FakeChannel
     @answers = Thread::Queue.new
     @refused = []
     @exchanges = {}
+    @recorded = []
     @error = nil
     @open = true
     @lock = Mutex.new
   end
 
+  # What bunny 3.x records for topology recovery, and replays as a declaration when a
+  # connection comes back. A real channel has it; this is here so a test can assert
+  # that nothing records the return-watching exchange, whose type is invented.
+  attr_reader :recorded
+
   def open? = @lock.synchronize { @open }
   def close = nil
   def register_exchange(exchange) = @exchanges[exchange.name] = exchange
+  def record_exchange(exchange) = @recorded << exchange.name
   def next_publish_seq_no = @lock.synchronize { @next_publish_seq_no }
 
   # The broker took the channel down, the way it does for an unroutable
@@ -231,6 +238,21 @@ RSpec.describe AceMQ::AMQP::Transport do
     channel.answer!
 
     expect(sending.value).to eq(%w[m-1 m-2])
+  end
+
+  # The object that catches basic.return invents a type: it says :direct because a
+  # return does not carry one and nothing here ever checked what the exchange really
+  # is. bunny 3.x records every exchange it constructs for topology recovery unless it
+  # is passive, and replays each recorded one as a declaration when a connection comes
+  # back -- so recording this would declare a caller's topic or fanout exchange as
+  # direct and be answered PRECONDITION_FAILED on a connection just rebuilt.
+  it "does not record the return-watching exchange for topology recovery" do
+    sending = batch(messages(3, mandatory: true))
+    channel.wait_until_sent(3)
+    channel.answer!
+    sending.value
+
+    expect(channel.recorded).to be_empty
   end
 
   it "reports an unroutable message in a batch the way a single publish does" do

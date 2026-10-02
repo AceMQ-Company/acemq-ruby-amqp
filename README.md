@@ -74,7 +74,7 @@ is not there. Add it to your own Gemfile to use the transport:
 
 ```ruby
 gem "acemq-amqp"
-gem "bunny", "~> 2.23"
+gem "bunny", ">= 2.23", "< 4"
 ```
 
 ### Publishing a batch
@@ -1370,6 +1370,16 @@ Ruby 3.1 or newer. RabbitMQ, and the `bunny` gem, for the transport. Nothing
 else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
 `google-protobuf`, `avro` — or the [tracing adapter](#tracing), which wants
 `opentelemetry-api`. Each of those says so by name when it is missing.
+
+**bunny 3.2 or newer, if your Ruby allows it.** Both majors are supported and
+tested, and `">= 2.23", "< 4"` resolves to 3.x on Ruby 3.2 and newer and 2.x on
+Ruby 3.1. They are not equally sound: bunny before 3.2 could start overlapping
+recovery attempts and leave a client permanently disconnected, which is what a
+node closing every connection before a restart provokes. Measured by forcing
+every connection shut ninety times, 15 seconds apart, against a client built on
+bunny alone — 2.24.0 went from 6 threads to 146 and stopped consuming at the
+40th recovery, having published 18,274 messages; 3.4.0 stayed at 6 threads and
+published 174,111. See [getting started](docs/getting-started.md) for the table.
 
 Encryption and the development certificates need nothing at all: both are
 written against Ruby's own OpenSSL binding.

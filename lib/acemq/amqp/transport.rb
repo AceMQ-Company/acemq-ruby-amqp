@@ -312,7 +312,18 @@ module AceMQ
         name = exchange.to_s
         return if @watched.include?(name)
 
-        ::Bunny::Exchange.new(channel, :direct, name, no_declare: true)
+        # `passive: true` as well as `no_declare: true`, and it is not redundant on
+        # bunny 3.x. `no_declare` is what stops this object declaring anything -- all
+        # it is for is receiving +basic.return+ -- but bunny 3.x also *records* every
+        # exchange it constructs for topology recovery unless it is passive, and a
+        # recorded one is replayed as a declaration when a connection comes back. This
+        # object invents a type it never checked: it says `:direct` because
+        # +basic.return+ does not care, so recording it would have topology recovery
+        # declare a caller's topic or fanout exchange as direct and be answered
+        # PRECONDITION_FAILED on a connection that had just been rebuilt.
+        #
+        # Harmless on bunny 2.x, which has no topology recorder and ignores the key.
+        ::Bunny::Exchange.new(channel, :direct, name, no_declare: true, passive: true)
                          .on_return { |info, properties, _content| record(info, properties) }
         @watched << name
       end

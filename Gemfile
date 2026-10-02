@@ -15,7 +15,17 @@ group :development, :test do
   # client into a process that will never open a socket; the transport requires
   # bunny lazily and says which gem to install when it is missing. The tests do
   # open sockets, so they need it.
-  gem "bunny", "~> 2.23"
+  #
+  # A range rather than `~> 2.23`, so resolution covers both majors across the CI
+  # matrix without a second axis: bunny 3.x needs Ruby 3.2, so a 3.1 leg gets 2.24
+  # and every newer leg gets 3.4, and both are therefore tested. That matters because
+  # the two behave differently in ways this library has to keep working with -- bunny
+  # 3.x records every exchange it constructs for topology recovery, which is why
+  # ReturnedMessages#watch passes `passive: true`.
+  #
+  # Upper bound because bunny 4 does not exist yet and an unbounded dependency is how
+  # a suite starts failing on a morning nobody changed anything.
+  gem "bunny", ">= 2.23", "< 4"
   # The same bargain as avro: the Protobuf codec requires it lazily and says
   # which gem to install when it is absent.
   #

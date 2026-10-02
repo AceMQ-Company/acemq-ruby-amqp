@@ -19,16 +19,35 @@ While the version is `0.x` the public API may change in any release.
   ordinary reconnect never reaches that branch, and a standing load measured with and
   without this change grew threads identically.
 
-### Known issue, upstream
+- The exchange this library registers to catch `basic.return` is no longer recorded
+  for topology recovery. It invents a type — `:direct`, because a return does not
+  carry one and nothing here ever checked — and bunny 3.x replays every exchange it
+  records as a declaration when a connection comes back, so a caller's topic or fanout
+  exchange would have been redeclared as direct and answered PRECONDITION_FAILED on a
+  connection that had just been rebuilt. Passing `passive: true` keeps it out of the
+  recorder. No effect on bunny 2.x, which has no topology recorder.
 
-- **Thread growth under repeated connection recovery is bunny 2.24.0's.** A client
-  built on bunny with none of this library in the path went from 6 threads to 146 over
-  90 forced recoveries and stopped publishing and consuming altogether; this library
-  over the same 90 recoveries reached 49 threads and kept both directions moving. The
-  threads pile up in `Bunny::Session#handle_network_failure` and `#recover_channels`,
-  both blocked on bunny's own `@channel_mutex`. Reproduce either with
-  `scripts/ruby/bunny_only_leak_probe.rb` and `scripts/ruby/thread_leak_probe.rb` in
-  the workspace.
+### Changed
+
+- **bunny `">= 2.23", "< 4"`, and use 3.2 or newer where your Ruby allows it.** Both
+  majors are supported and tested; the range resolves to 3.x on Ruby 3.2 and newer and
+  to 2.x on Ruby 3.1.
+
+  Thread growth under repeated connection recovery, which a soak found in the Ruby
+  standing load, was **bunny's and is fixed in bunny 3.2** ("Connection recovery now
+  uses a mutex to avoid concurrent attempts"). Measured by forcing every connection
+  shut 90 times, 15s apart, against a client built on bunny alone with none of this
+  library in the path:
+
+  | bunny | threads | published | consumed | state at the end |
+  | --- | --- | --- | --- | --- |
+  | 2.24.0 | 6 → 146 | 18,274 | 13,535 | stopped consuming at the 40th recovery |
+  | 3.4.0 | 6 → 6 | 174,111 | 174,108 | unaffected |
+
+  The threads piled up in `Bunny::Session#handle_network_failure` and
+  `#recover_channels`, both blocked on bunny's own `@channel_mutex`. Reproduce with
+  `scripts/ruby/bunny_only_leak_probe.rb` in the workspace. On Ruby 3.1 only bunny 2.x
+  installs, so a long-lived client that reconnects many times will still degrade there.
 
 ## [0.7.3] - 2026-09-27
 

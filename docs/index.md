@@ -150,7 +150,7 @@ if you would rather.
 ```ruby
 # Gemfile
 gem "acemq-amqp"
-gem "bunny", "~> 2.23"   # for the transport
+gem "bunny", ">= 2.23", "< 4"   # for the transport
 ```
 
 Ruby 3.1 or newer. RabbitMQ for the broker.

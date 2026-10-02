@@ -15,7 +15,7 @@ Then, in your `Gemfile`:
 
 ```ruby
 gem "acemq-amqp"
-gem "bunny", "~> 2.23"
+gem "bunny", ">= 2.23", "< 4"
 ```
 
 The gem itself has **no runtime dependencies**. `bunny` is required lazily by
@@ -23,6 +23,25 @@ the transport, at the moment a connection is opened, and named in the error if
 it is missing — so a process that only builds envelopes or checks a retry
 schedule never loads a broker client. That is also why `bunny` goes in your
 Gemfile rather than being pulled in for you.
+
+**Use bunny 3.2 or newer if your Ruby allows it.** The range above resolves to
+bunny 3.x on Ruby 3.2 and newer and to 2.x on Ruby 3.1, which is the best either
+can do, but the two are not equally sound under repeated connection loss. Bunny
+before 3.2 could start overlapping recovery attempts and leave a client
+permanently disconnected — the exact case being a node closing every connection
+before a restart, which is what a rolling upgrade does.
+
+It is not a small difference. Forcing every connection shut every 15 seconds,
+ninety times, against a client built on bunny alone:
+
+| bunny | threads | published | consumed | state at the end |
+|---|---|---|---|---|
+| 2.24.0 | 6 → 146 | 18,274 | 13,535 | stopped consuming at the 40th recovery |
+| 3.4.0 | 6 → 6 | 174,111 | 174,108 | unaffected |
+
+On Ruby 3.1 you are held to bunny 2.x, so a client that reconnects many times
+over a long life will degrade. Raising the Ruby version is the only fix, and
+this library runs on 3.1 so that choice stays yours.
 
 ## Opening a connection
 

@@ -29,7 +29,7 @@ gives.
 source "https://rubygems.org"
 
 gem "acemq-amqp", git: "https://github.com/AceMQ-Company/acemq-ruby-amqp"
-gem "bunny", "~> 2.23"
+gem "bunny", ">= 2.23", "< 4"
 ```
 
 ```bash
