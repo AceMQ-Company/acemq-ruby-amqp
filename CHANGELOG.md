@@ -8,6 +8,28 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A replaced publishing or pulling channel is now closed, and its consumer work pool
+  stopped, instead of being abandoned with its threads. This is resource hygiene on
+  the paths that really do replace a channel — one the broker closed for a
+  channel-level error, or a pull channel dropped between passes — and it is
+  deliberately **not** a fix for thread growth under repeated connection recovery:
+  bunny usually recovers a session by re-opening the same channel objects, so an
+  ordinary reconnect never reaches that branch, and a standing load measured with and
+  without this change grew threads identically.
+
+### Known issue, upstream
+
+- **Thread growth under repeated connection recovery is bunny 2.24.0's.** A client
+  built on bunny with none of this library in the path went from 6 threads to 146 over
+  90 forced recoveries and stopped publishing and consuming altogether; this library
+  over the same 90 recoveries reached 49 threads and kept both directions moving. The
+  threads pile up in `Bunny::Session#handle_network_failure` and `#recover_channels`,
+  both blocked on bunny's own `@channel_mutex`. Reproduce either with
+  `scripts/ruby/bunny_only_leak_probe.rb` and `scripts/ruby/thread_leak_probe.rb` in
+  the workspace.
+
 ## [0.7.3] - 2026-09-27
 
 ### Fixed

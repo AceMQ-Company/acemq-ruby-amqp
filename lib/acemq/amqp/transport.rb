@@ -1136,6 +1136,7 @@ module AceMQ
         @lock.synchronize do
           refuse_while_recovering!
           if @publish_channel.nil? || !@publish_channel.open?
+            discard_channel(@publish_channel)
             @publish_channel = @session.create_channel
             @publish_channel.confirm_select
             @returns.reopened
@@ -1234,8 +1235,60 @@ module AceMQ
       # unacknowledged on it until the pass ends, and a channel per pull would
       # release them the moment it closed.
       def pull_channel
-        @pull_channel = @session.create_channel if @pull_channel.nil? || !@pull_channel.open?
+        if @pull_channel.nil? || !@pull_channel.open?
+          discard_channel(@pull_channel)
+          @pull_channel = @session.create_channel
+        end
         @pull_channel
+      end
+
+      # Hands a replaced channel's threads back.
+      #
+      # Every bunny channel carries a consumer work pool -- its own threads, one by
+      # default and +concurrency+ for a subscription -- so replacing a channel without
+      # closing it leaks them. {#publish_channel} and {#pull_channel} both replace one
+      # whenever the old channel is no longer open, which is what a lost connection can
+      # leave behind, and neither used to close the channel it dropped.
+      #
+      # **This is hygiene, not the fix for the leak the soak found.** Honest about its
+      # own worth: bunny usually recovers a session by re-opening the *same* channel
+      # objects, so the branch this runs from is not reached on an ordinary reconnect,
+      # and measuring a Ruby standing load with and without this change showed the same
+      # thread growth either way. What it removes is a real leak on the paths that *do*
+      # replace a channel -- a channel closed by the broker for a channel-level error,
+      # or a pull channel dropped between passes -- which is worth closing on its own
+      # terms rather than because it was mistaken for something bigger.
+      #
+      # The soak's finding is bunny 2.24.0's: a client built on bunny alone, with none
+      # of this library in the path, went from 6 threads to 146 over 90 forced
+      # recoveries and stopped publishing and consuming altogether, where this library
+      # over the same 90 reached 49 and kept both directions moving. The threads pile
+      # up in +Bunny::Session#handle_network_failure+ and +#recover_channels+, both
+      # blocked on bunny's own +@channel_mutex+.
+      #
+      # Both steps here are needed and neither may raise. `close` is the orderly one,
+      # and it reaches the broker only while the connection is alive -- which it often
+      # is not, because a dead connection is why the channel is being replaced. That
+      # leaves the pool parked on its queue, and `maybe_kill_consumer_work_pool!` is
+      # bunny's own way to stop it. Guarded by +respond_to?+ because it is not part of
+      # bunny's documented surface, and a future version that drops it must cost a
+      # thread rather than a publish.
+      def discard_channel(channel)
+        return if channel.nil?
+
+        begin
+          channel.close if channel.open?
+        rescue StandardError
+          nil
+        end
+
+        return unless channel.respond_to?(:maybe_kill_consumer_work_pool!)
+
+        begin
+          channel.maybe_kill_consumer_work_pool!
+        rescue StandardError
+          nil
+        end
       end
 
       # See {Wire}, which {BatchPublish} writes its properties with too.

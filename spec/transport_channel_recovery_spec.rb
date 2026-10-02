@@ -35,6 +35,11 @@ require "acemq/amqp"
 # at a time leaks at most one permit per reconnect, and reproducing the drill's wedge
 # in isolation did not reproduce it at all. This is a real defect on its own evidence,
 # and the drill's finding remains open.
+#
+# The drill's finding has since been chased down and is not ours: under repeated
+# forced recovery, bunny 2.24.0 accumulates threads blocked on its own
+# +@channel_mutex+ and eventually stops publishing. Reproduced with no AceMQ code in
+# the path at all -- see the note at the bottom of this file.
 
 # A channel that reports open until somebody closes it deliberately, which is what
 # bunny's own channels do -- a connection lost at the socket level closes no channel.
@@ -194,5 +199,167 @@ RSpec.describe AceMQ::AMQP::Transport, "while the connection is recovering" do
     end.new(StubChannel.new)
 
     expect { described_class.new(plain).send(:publish_channel) { |c| c } }.not_to raise_error
+  end
+end
+
+# The threads a replaced channel holds.
+#
+# A bunny channel carries a consumer work pool -- one thread by default -- and both the
+# publishing channel and the pulling channel are replaced whenever the old one is no
+# longer open. Replacing without closing leaks that pool and everything it holds.
+#
+# Scope, stated plainly because this was first written believing it was more: bunny
+# usually recovers a session by re-opening the *same* channel objects, so an ordinary
+# reconnect does not reach the replace branch at all, and a standing load measured with
+# and without the fix grew threads identically. The leak closed here is on the paths
+# that really do replace a channel -- one the broker closed for a channel-level error,
+# or a pull channel dropped between passes.
+#
+# The thread growth a soak found under repeated recovery is bunny 2.24.0's own: a client
+# built on bunny with none of this library in the path went from 6 threads to 146 over
+# 90 forced recoveries and stopped publishing and consuming entirely, where this library
+# over the same 90 reached 49 and kept both directions moving.
+#
+# The stubs here hand out a *new* channel per call, unlike StubChannel above. That
+# matters: a session that returns the same channel object every time cannot show a
+# channel being abandoned, which is why the suite had not covered this.
+RSpec.describe AceMQ::AMQP::Transport, "the threads a replaced channel holds" do
+  # A channel that records what was done to it on the way out, and that can be told
+  # its connection died -- the state a socket-level failure leaves a channel in.
+  class CountingChannel
+    attr_reader :closed, :pool_killed
+
+    def initialize(raise_on_close: false)
+      @open = true
+      @closed = false
+      @pool_killed = false
+      @raise_on_close = raise_on_close
+    end
+
+    def open? = @open
+    def confirm_select = nil
+    def prefetch(*) = nil
+
+    def close
+      @closed = true
+      @open = false
+      raise "the connection this channel belonged to is gone" if @raise_on_close
+    end
+
+    def maybe_kill_consumer_work_pool! = @pool_killed = true
+
+    # What a lost connection does: the channel stops being usable and nothing closed
+    # it deliberately.
+    def die! = @open = false
+  end
+
+  # A session that opens a fresh channel every time it is asked, as bunny does when a
+  # channel is created rather than recovered.
+  class ChannelPerCallSession
+    attr_reader :channels
+
+    def initialize(raise_on_close: false)
+      @channels = []
+      @raise_on_close = raise_on_close
+    end
+
+    def open? = true
+    def close = nil
+
+    def create_channel(*)
+      @channels << CountingChannel.new(raise_on_close: @raise_on_close)
+      @channels.last
+    end
+  end
+
+  subject(:transport) { described_class.new(session) }
+
+  let(:session) { ChannelPerCallSession.new }
+
+  def publish_once = transport.send(:publish_channel) { |c| c }
+  def pull_once = transport.send(:pull_channel)
+
+  it "stops the work pool of the publishing channel it replaces" do
+    publish_once
+    first = session.channels.first
+    first.die!
+
+    publish_once
+
+    expect(session.channels.size).to eq(2)
+    expect(first.pool_killed).to be(true)
+  end
+
+  # The failure as the soak measured it: one thread per reconnect, for as long as the
+  # process runs.
+  it "does not leave a work pool behind on every reconnect" do
+    10.times do
+      publish_once
+      session.channels.last.die!
+    end
+
+    # Ten channels were opened and nine of them replaced: the tenth died at the end of
+    # the loop with nothing asking for a channel afterwards, so it is still the
+    # current one rather than an abandoned one.
+    expect(session.channels.size).to eq(10)
+    abandoned = session.channels[0..-2]
+    expect(abandoned.size).to eq(9)
+    expect(abandoned.map(&:pool_killed)).to all(be(true))
+  end
+
+  it "stops the work pool of the pulling channel it replaces" do
+    pull_once
+    first = session.channels.first
+    first.die!
+
+    pull_once
+
+    expect(first.pool_killed).to be(true)
+  end
+
+  # Closing a channel whose connection has gone raises, and that is the ordinary case
+  # here rather than the exceptional one. It must cost a thread at worst, never a
+  # publish.
+  context "when closing the old channel raises" do
+    let(:session) { ChannelPerCallSession.new(raise_on_close: true) }
+
+    it "still replaces it, and still stops its work pool" do
+      publish_once
+      first = session.channels.first
+      first.die!
+
+      expect { publish_once }.not_to raise_error
+      expect(first.pool_killed).to be(true)
+    end
+  end
+
+  # A channel that predates this fix, or any other object standing in for one, has no
+  # such method. Losing the cleanup is acceptable; raising is not.
+  it "accepts a channel that cannot be asked to stop its pool" do
+    bare = Class.new do
+      def initialize = @open = true
+      def open? = @open
+      def close = @open = false
+      def confirm_select = nil
+      def die! = @open = false
+    end
+
+    plain = Class.new(ChannelPerCallSession) do
+      def initialize(factory)
+        super()
+        @factory = factory
+      end
+
+      def create_channel(*)
+        channels << @factory.new
+        channels.last
+      end
+    end.new(bare)
+
+    transport = described_class.new(plain)
+    transport.send(:publish_channel) { |c| c }
+    plain.channels.first.die!
+
+    expect { transport.send(:publish_channel) { |c| c } }.not_to raise_error
   end
 end
