@@ -66,21 +66,28 @@ While the version is `0.x` the public API may change in any release.
   recovery. Durable queues, which is everything this library creates by default, live
   on the broker and need no replay, and bunny 2.x replays nothing at all.
 
-### Known issue, upstream
+- **A subscription now goes out with a consumer tag of its own, which fixes thread
+  growth under repeated recovery on bunny 3.x.** The tag was left to the broker, and a
+  broker-assigned tag changes on every re-subscribe. bunny 3.x records each consumer
+  for topology recovery keyed by tag, and recovery re-subscribes — so each recovery
+  recorded the consumer under a *new* key and the registry grew instead of being
+  replaced: 1, then 2, then 4 recorded consumers over three recoveries, measured.
 
-- **bunny leaks a consumer work pool on every recovery**, which is why bunny 2.x is
-  still the recommended pin even though 3.x is the better transport. `Channel`'s
-  `maybe_reinitialize_consumer_pool!` (bunny 3.4.0, `channel.rb:2038`) replaces
-  `@work_pool` with a new `ConsumerWorkPool` and starts it without killing the old
-  one, and `Session#recover_consumer` calls it for every recovered consumer. A channel
-  subscribed with `concurrency: 4` therefore gains four parked threads per reconnect:
-  a standing load reaches ~54 threads by its 12th forced recovery on bunny 3.4, and on
-  2.24 an onset around the 50th reaching 168 over 240.
+  Every recorded consumer then gets its own `maybe_reinitialize_consumer_pool!`
+  (`channel.rb:2038`), which replaces the channel's `ConsumerWorkPool` and starts it
+  without killing the old one — so all but the last pool was abandoned with its
+  threads parked in `ConsumerWorkPool#run_loop`. A standing load with `concurrency: 4`
+  reached ~54 threads by its 12th forced recovery.
 
-  Reproduce with `scripts/ruby/thread_leak_probe.rb` in the workspace; the threads are
-  all parked in `ConsumerWorkPool#run_loop`. Nothing here can fix it without taking
-  over consumer recovery from bunny, which is a larger change than it is worth while
-  the upstream fix is a single `kill` call.
+  With a tag of our own the recorded count holds at 1, one pool stays live, and 20
+  forced recoveries leave the thread count where it started — publishing and consuming
+  throughout. A plain bunny consumer never grew this way, which is what showed the tag
+  was ours to fix rather than bunny's.
+
+  The tag is `acemq-{queue}-{random}`, generated once per subscription so it survives
+  every recovery of that subscription, and a caller-supplied `tag:` is still used
+  unchanged. Reproduce the old behaviour with `scripts/ruby/thread_leak_probe.rb` and
+  `pool_churn_probe.rb` in the workspace.
 
 ## [0.7.3] - 2026-09-27
 

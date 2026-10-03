@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require "securerandom"
+
 require_relative "ack"
 require_relative "credentials"
 require_relative "queue_type"
@@ -909,6 +911,22 @@ module AceMQ
       def subscribe(queue, prefetch: 20, concurrency: 1, tag: nil, arguments: {}, &handler)
         channel = @session.create_channel(nil, concurrency)
         channel.prefetch(prefetch) if prefetch.positive?
+        # A consumer tag of our own when the caller gives none, rather than leaving it
+        # to the broker.
+        #
+        # bunny 3.x records every consumer for topology recovery and keys the record by
+        # tag, and recovery re-subscribes -- which records the consumer again. With a
+        # broker-assigned tag the new registration lands under a *new* key, so the
+        # registry grows instead of being replaced: measured at 1, 2, 4 recorded
+        # consumers over three recoveries. Each recorded consumer then gets its own
+        # `maybe_reinitialize_consumer_pool!`, and all but the last of those pools is
+        # orphaned with its threads still parked -- which is the thread growth a soak
+        # found in the Ruby standing load. A plain bunny consumer does not grow this
+        # way, which is what showed the tag was ours to fix.
+        #
+        # Generated once here, so it survives every recovery of this subscription and
+        # the record is replaced rather than added to.
+        tag ||= "acemq-#{queue}-#{SecureRandom.hex(8)}"
         consumer = channel.queue(queue, passive: true).subscribe(
           manual_ack: true, block: false, consumer_tag: tag, arguments: stringify(arguments)
         ) do |info, properties, body|
