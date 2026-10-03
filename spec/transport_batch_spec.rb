@@ -52,15 +52,31 @@ class FakeChannel
     @lock = Mutex.new
   end
 
-  # What bunny 3.x records for topology recovery, and replays as a declaration when a
-  # connection comes back. A real channel has it; this is here so a test can assert
-  # that nothing records the return-watching exchange, whose type is invented.
+  # What bunny 3.x holds for topology recovery and replays as a declaration when a
+  # connection comes back. Here so a test can assert that the return-watching
+  # exchange, whose type is invented, is not left in it.
   attr_reader :recorded
 
   def open? = @lock.synchronize { @open }
   def close = nil
-  def register_exchange(exchange) = @exchanges[exchange.name] = exchange
-  def record_exchange(exchange) = @recorded << exchange.name
+
+  # Recording happens here rather than in `record_exchange`, deliberately: bunny calls
+  # `register_exchange` on every version, and `record_exchange` only on 3.x and only
+  # when the declaration is not passive. A fake that waited for `record_exchange` would
+  # record nothing when the suite runs against bunny 3.3+ — which is where this test
+  # quietly stopped testing anything and a broken `forget_recorded` passed.
+  #
+  # So this fake behaves like the worst supported case, bunny 3.0 to 3.2: it records
+  # whatever is constructed, passive or not. Those are the versions Ruby 3.1 resolves.
+  def register_exchange(exchange)
+    @recorded << exchange.name
+    @exchanges[exchange.name] = exchange
+  end
+
+  # A channel's session, which is where the recorder lives.
+  def connection = self
+
+  def delete_recorded_exchange_named(name) = @recorded.delete(name)
   def next_publish_seq_no = @lock.synchronize { @next_publish_seq_no }
 
   # The broker took the channel down, the way it does for an unroutable
@@ -242,11 +258,18 @@ RSpec.describe AceMQ::AMQP::Transport do
 
   # The object that catches basic.return invents a type: it says :direct because a
   # return does not carry one and nothing here ever checked what the exchange really
-  # is. bunny 3.x records every exchange it constructs for topology recovery unless it
-  # is passive, and replays each recorded one as a declaration when a connection comes
-  # back -- so recording this would declare a caller's topic or fanout exchange as
+  # is. bunny 3.x records every exchange it constructs for topology recovery and
+  # replays each recorded one as a declaration when a connection comes back -- so
+  # leaving this one recorded would declare a caller's topic or fanout exchange as
   # direct and be answered PRECONDITION_FAILED on a connection just rebuilt.
-  it "does not record the return-watching exchange for topology recovery" do
+  #
+  # The assertion is on where the recorder *ends up*, not on whether it was ever
+  # called, and that distinction is the whole bug: `passive: true` keeps it out of the
+  # recorder on bunny 3.3 and newer, and does nothing on 3.0 to 3.2. Ruby 3.1 resolves
+  # bunny 3.2 — 3.3 needs amq-protocol 2.9, which needs Ruby 3.2 — so the version this
+  # has to work on is precisely the one `passive:` does not cover. CI's 3.1 leg caught
+  # it; this fake records unconditionally so the suite does too.
+  it "leaves no record of the return-watching exchange for topology recovery" do
     sending = batch(messages(3, mandatory: true))
     channel.wait_until_sent(3)
     channel.answer!

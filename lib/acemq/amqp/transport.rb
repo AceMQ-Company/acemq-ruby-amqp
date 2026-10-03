@@ -395,7 +395,33 @@ module AceMQ
         # Harmless on bunny 2.x, which has no topology recorder and ignores the key.
         ::Bunny::Exchange.new(channel, :direct, name, no_declare: true, passive: true)
                          .on_return { |info, properties, _content| record(info, properties) }
+        forget_recorded(channel, name)
         @watched << name
+      end
+
+      # Takes this exchange back out of bunny's topology recorder.
+      #
+      # `passive: true` above is enough on bunny 3.3 and newer, where a passive
+      # declaration is not recorded. It is *not* enough on bunny 3.0 to 3.2, which have
+      # the recorder but not that exemption -- and 3.2 is exactly what Ruby 3.1 resolves,
+      # because bunny 3.3 needs amq-protocol 2.9 and that needs Ruby 3.2. CI caught it
+      # on the 3.1 leg after this was written believing `passive` covered every 3.x.
+      #
+      # Removing it by name is safe even when the application declared the same exchange
+      # itself: that declaration is recorded against the short-lived admin channel it
+      # was made on, which {RecoverLiveChannelsOnly} already drops from recovery because
+      # the channel is closed by then. So nothing that would have been replayed is lost,
+      # and the fabricated `:direct` definition this object carries cannot be replayed
+      # over a caller's topic or fanout exchange.
+      def forget_recorded(channel, name)
+        session = channel.respond_to?(:connection) ? channel.connection : nil
+        return unless session.respond_to?(:delete_recorded_exchange_named)
+
+        session.delete_recorded_exchange_named(name)
+      rescue StandardError
+        # A recorder that will not forget costs a redeclaration attempt on recovery,
+        # which bunny logs and carries on from. It must not cost a publish.
+        nil
       end
 
       # Called on bunny's reader thread, so it does nothing but note the reason.
