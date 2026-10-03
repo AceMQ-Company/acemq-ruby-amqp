@@ -1371,12 +1371,25 @@ else, unless you reach for [a codec that needs one](#codecs) — `rexml`,
 `google-protobuf`, `avro` — or the [tracing adapter](#tracing), which wants
 `opentelemetry-api`. Each of those says so by name when it is missing.
 
-**Both bunny majors are supported and tested; 2.x is what to run today.** The
-constraint `">= 2.23", "< 4"` resolves to 3.x on Ruby 3.2 and newer and to 2.x on
-Ruby 3.1, and the suite passes on both — but under *repeated* connection recovery
-neither combination is yet where it should be, so pin `"~> 2.23"` if you
-reconnect often and want the better of the two. See
-[getting started](docs/getting-started.md) for the measurements.
+**Both bunny majors are supported and tested, and from 0.7.4 bunny 3.2 or newer is
+the one to run.** The constraint `">= 2.23", "< 4"` resolves to 3.x on Ruby 3.2 and
+newer and to 2.x on Ruby 3.1, and the suite passes on both.
+
+They are not equally sound under repeated connection recovery. bunny before 3.2 could
+start overlapping recovery attempts and leave a client permanently disconnected —
+which is what a node closing every connection before a restart provokes. Forcing every
+connection shut ninety times, fifteen seconds apart, against a client built on bunny
+alone: 2.24.0 went from 6 threads to 146 and stopped consuming at the fortieth
+recovery, having published 18,274 messages; 3.4.0 held at 6 threads and published
+174,111.
+
+Taking that improvement needed a fix on this side first, which is what 0.7.4 carries:
+a subscription now goes out with a consumer tag of its own, so bunny's topology
+recorder replaces its record of it instead of accumulating one per recovery. Before
+that fix this library leaked a consumer work pool per recovery on bunny 3.x. After it,
+60 forced recoveries end with the thread count where it started and memory growing at
+bunny's own floor. On Ruby 3.1 the choice is made for you: only bunny 2.x installs
+there. See [getting started](docs/getting-started.md).
 
 Encryption and the development certificates need nothing at all: both are
 written against Ruby's own OpenSSL binding.

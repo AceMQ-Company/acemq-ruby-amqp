@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-03
+
 ### Fixed
 
 - A replaced publishing or pulling channel is now closed, and its consumer work pool

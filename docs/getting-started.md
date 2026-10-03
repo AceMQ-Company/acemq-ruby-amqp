@@ -25,9 +25,8 @@ schedule never loads a broker client. That is also why `bunny` goes in your
 Gemfile rather than being pulled in for you.
 
 **Which bunny.** The range above resolves to bunny 3.x on Ruby 3.2 and newer and to
-2.x on Ruby 3.1. Both are supported and the suite passes on both. If your clients
-reconnect often, pin `"~> 2.23"` for now — the reasoning is worth having in full,
-because neither is yet where it should be.
+2.x on Ruby 3.1. Both are supported and the suite passes on both, and from 0.7.4
+**bunny 3.2 or newer is the one to want** if your Ruby allows it.
 
 bunny 3.2 fixed a defect of its own: before it, overlapping recovery attempts could
 leave a client permanently disconnected, which is exactly what a node closing every
@@ -39,14 +38,21 @@ ninety times, against a client built on **bunny alone**:
 | 2.24.0 | 6 → 146 | 18,274 | 13,535 | stopped consuming at the 40th recovery |
 | 3.4.0 | 6 → 6 | 174,111 | 174,108 | unaffected |
 
-So bunny 3.x is plainly the better transport. The catch is this library: it leaks a
-channel, and its consumer work pool with it, somewhere in the recovery path — and
-bunny 3.x surfaces that much faster than 2.x masks it. The same standing load reaches
-about 54 threads by the 12th forced recovery on bunny 3.4, where on 2.24 the growth
-does not start until around the 50th. Until that is fixed, 2.x is the less bad of two
-imperfect options, and the recommendation here will change the moment it is.
+So bunny 3.x is plainly the better transport. Taking that needed a fix on this side
+first, and 0.7.4 carries it.
 
-On Ruby 3.1 the choice is made for you: only bunny 2.x installs there.
+Before 0.7.4 a subscription left its consumer tag to the broker, which assigns a new
+one on every re-subscribe. bunny 3.x records each consumer for topology recovery keyed
+by tag, so every recovery recorded the consumer under a new key and the registry grew
+— 1, then 2, then 4 — each entry recreating the channel's consumer work pool and
+abandoning the one before it. The same standing load reached about 54 threads by its
+12th forced recovery. With a tag of our own, 60 forced recoveries end with the thread
+count where they started and memory grows 0.13MB per recovery, which is bunny's own
+floor measured at 0.12.
+
+On Ruby 3.1 the choice is made for you: only bunny 2.x installs there, so a long-lived
+client that reconnects many times will still meet bunny's own recovery defect. Raising
+Ruby is the only fix for that, and this library runs on 3.1 so the choice stays yours.
 
 ## Opening a connection
 
