@@ -73,6 +73,14 @@ class FakeChannel
     @exchanges[exchange.name] = exchange
   end
 
+  # bunny 3.0 to 3.2 calls this from `Exchange#initialize` for any declaration, and
+  # 3.3+ only for a non-passive one. It has to exist or constructing the
+  # return-watching exchange raises NoMethodError and the publish never happens —
+  # which is exactly how this suite failed on CI's Ruby 3.1 leg, where bunny resolves
+  # 3.2. The recording itself is done in `register_exchange`, so this only has to be
+  # answerable.
+  def record_exchange(_exchange) = nil
+
   # A channel's session, which is where the recorder lives.
   def connection = self
 
