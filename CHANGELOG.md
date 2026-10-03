@@ -47,22 +47,40 @@ While the version is `0.x` the public API may change in any release.
   `#recover_channels`, both blocked on bunny's own `@channel_mutex`. Reproduce with
   `scripts/ruby/bunny_only_leak_probe.rb` in the workspace.
 
-### Known issue
+- Topology bunny recorded against a channel this library has since closed is no longer
+  replayed on recovery. Declarations go on a short-lived channel of their own, because
+  a refused declaration kills the channel it was made on; bunny 3.x records each one
+  against that channel and replayed them after it was gone, logging six
+  `Bunny::ChannelAlreadyClosed: cannot use a closed channel!` errors per recovery,
+  every recovery. `Transport.open` now passes a `topology_recovery_filter` that keeps
+  what is on a live channel and drops the rest.
 
-- **This library leaks a channel, and its consumer work pool, somewhere in the
-  recovery path.** Under repeated forced recovery a standing load's thread count
-  climbs until the process is unhealthy: about 54 threads by the 12th recovery on
-  bunny 3.4, or an onset around the 50th on bunny 2.24 reaching 168 over 240. It is
-  ours, not bunny's — a bunny-only client of the same shape (a 4-thread consumer pool,
-  a passive subscribe) stays flat over the same fault stream, and the leaked threads
-  are all parked in `ConsumerWorkPool`. `Transport#subscribe` runs exactly once, so
-  the extra pools come from channels opened elsewhere in the transport and never
-  reclaimed.
+  **Consumers are never filtered**, and filtering them was much worse than the bug
+  above: a consumer's channel can read as closed at the moment the filter runs, so the
+  first version of this dropped the subscription from recovery and stopped the client
+  consuming — deliveries frozen at 715 while publishing climbed past 17,000. There is
+  a test for that specifically.
 
-  It is the reason bunny 2.x is still the recommended pin despite being the worse
-  transport: 3.x surfaces this faster than 2.x masks it. Reproduce with
-  `scripts/ruby/thread_leak_probe.rb` in the workspace, and compare against
-  `bunny_only_leak_probe.rb` with `PROBE_POOL=4 PROBE_PASSIVE=1`.
+  A queue that exists only because of its connection — an `exclusive` or `auto_delete`
+  one declared through `Transport#declare_queue` — is therefore not re-declared on
+  recovery. Durable queues, which is everything this library creates by default, live
+  on the broker and need no replay, and bunny 2.x replays nothing at all.
+
+### Known issue, upstream
+
+- **bunny leaks a consumer work pool on every recovery**, which is why bunny 2.x is
+  still the recommended pin even though 3.x is the better transport. `Channel`'s
+  `maybe_reinitialize_consumer_pool!` (bunny 3.4.0, `channel.rb:2038`) replaces
+  `@work_pool` with a new `ConsumerWorkPool` and starts it without killing the old
+  one, and `Session#recover_consumer` calls it for every recovered consumer. A channel
+  subscribed with `concurrency: 4` therefore gains four parked threads per reconnect:
+  a standing load reaches ~54 threads by its 12th forced recovery on bunny 3.4, and on
+  2.24 an onset around the 50th reaching 168 over 240.
+
+  Reproduce with `scripts/ruby/thread_leak_probe.rb` in the workspace; the threads are
+  all parked in `ConsumerWorkPool#run_loop`. Nothing here can fix it without taking
+  over consumer recovery from bunny, which is a larger change than it is worth while
+  the upstream fix is a single `kill` call.
 
 ## [0.7.3] - 2026-09-27
 

@@ -167,6 +167,74 @@ module AceMQ
       end
     end
 
+    # Keeps bunny's topology recovery off channels this library has closed.
+    #
+    # bunny 3.x records every declaration for replay when a connection comes back, and
+    # records it *against the channel it was made on*. This library declares queues,
+    # exchanges and bindings on a short-lived channel of their own and closes it —
+    # deliberately, because a refused declaration kills the channel it was made on, and
+    # sharing one would take every later declaration down with the first PRECONDITION
+    # failure. Recovery then tried to replay those declarations on a channel that was
+    # closed minutes earlier, and bunny logged one of these per entity, per recovery:
+    #
+    #   Caught an exception while recovering exchange acemq.dlx:
+    #     #<Bunny::ChannelAlreadyClosed: cannot use a closed channel! Channel id: 1>
+    #
+    # It was not only noise. Every failed replay left a consumer work pool behind, so a
+    # client that reconnected often grew threads until it was unhealthy: a standing load
+    # reached ~54 threads by its 12th forced recovery, against 9 for the same shape built
+    # on bunny alone.
+    #
+    # So entities whose channel has gone are dropped, and everything on a live channel —
+    # the subscription's channel, and the consumers on it — is recovered as bunny
+    # intends.
+    #
+    # **What this gives up.** A queue that only existed because of the connection, an
+    # +exclusive+ or +auto_delete+ one declared through {Transport#declare_queue}, is not
+    # re-declared on recovery. Durable queues, which is everything this library creates
+    # by default, live on the broker and need no replay. Nothing is lost against bunny
+    # 2.x either, which has no topology recorder at all and replays nothing.
+    #
+    # Duck-typed rather than a +Bunny::TopologyRecoveryFilter+ subclass, because bunny is
+    # loaded lazily: naming the constant here would require it at load time and drag a
+    # broker client into a process that only reads envelopes.
+    #
+    # @api private
+    class RecoverLiveChannelsOnly
+      def filter_exchanges(exchanges) = live(exchanges)
+      def filter_queues(queues) = live(queues)
+      def filter_exchange_bindings(bindings) = live(bindings)
+      def filter_queue_bindings(bindings) = live(bindings)
+
+      # Consumers are never filtered, and filtering them was a far worse bug than the
+      # one this class fixes. A consumer's channel can read as closed at the moment the
+      # filter runs, so asking the same question of it dropped the subscription from
+      # recovery: the first version of this took the thread count from 52 to 4 and
+      # stopped the client consuming, which is the failure this whole library exists to
+      # prevent. Deliveries stopped at 715 while publishing climbed past 17,000.
+      #
+      # It is also unnecessary. The leak came from replaying *declarations* recorded on
+      # the short-lived channels this library closes; a consumer is recorded on the
+      # subscription's own channel, which stays open for the life of the subscription.
+      def filter_consumers(consumers) = consumers
+
+      private
+
+      # Arrays out of Sets is allowed: bunny's filter contract takes either back.
+      def live(entities) = entities.select { |entity| live?(entity) }
+
+      # Anything that cannot be asked is kept. A filter is not the place to decide that
+      # an entity bunny recorded is unrecoverable for a reason this does not understand.
+      def live?(entity)
+        return true unless entity.respond_to?(:channel)
+
+        channel = entity.channel
+        return true if channel.nil? || !channel.respond_to?(:open?)
+
+        channel.open?
+      end
+    end
+
     # The two rules about what a property looks like on the wire, shared by
     # everything here that writes one.
     #
@@ -654,7 +722,10 @@ module AceMQ
         # established means an error that mentions the broker for a reason that
         # has nothing to do with it.
         permits = PublishPermits.new(max_outstanding_publishes)
-        session = Bunny.new(url, heartbeat: heartbeat, connection_timeout: connection_timeout,
+        # Ours goes first so a caller's own `topology_recovery_filter` in +options+
+        # replaces it rather than being silently overridden.
+        session = Bunny.new(url, topology_recovery_filter: RecoverLiveChannelsOnly.new,
+                                 heartbeat: heartbeat, connection_timeout: connection_timeout,
                                  **options, **security.to_transport_options)
         security.configure(session)
         session.start
