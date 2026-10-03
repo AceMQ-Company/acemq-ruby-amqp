@@ -8,6 +8,27 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `AceMQ::AMQP::PublishingPausedError`, a subclass of `PublishError` that means
+  "declined, not sent, safe to send again". A publish on a connection the broker has
+  already blocked (low on memory or disk) is now declined with it before anything is
+  written, carrying the broker's reason. Until now that publish was written into a
+  socket the broker had stopped reading and, if bunny gave up waiting, came back as
+  an unconfirmed `PublishError` — indistinguishable from a message that may have been
+  lost. `publish_all` answers every message of a batch on a blocked connection the
+  same way, and raises `PublishingPausedError` only when every failure in the batch
+  was declined unsent. Existing `rescue PublishError` keeps catching it. The
+  counterpart of Go's `isPaused`, .NET's `ConnectionBlockedException` and Java's
+  `PublishingPausedException`.
+
+### Changed
+
+- A publish on a connection that is already blocked no longer waits for the broker
+  to unblock; it raises `PublishingPausedError` straight away, as .NET does. A
+  publish already written when the block arrives still waits and is confirmed once
+  the broker reads the socket again.
+
 ## [0.7.4] - 2026-10-03
 
 ### Fixed

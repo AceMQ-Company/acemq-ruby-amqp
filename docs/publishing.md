@@ -151,6 +151,45 @@ failure, so code that already retries needs no change.
 Consuming is unaffected — deliveries resume on their own once the channels are
 recovered.
 
+### While the broker has blocked the connection
+
+RabbitMQ blocks a publishing connection when it is low on memory or disk, and from
+then on it stops reading the socket. A publish written into that socket is not
+refused — it waits, and if bunny gives up waiting it comes back as an unconfirmed
+message, which is the same `PublishError` a message the broker may have lost
+raises. A caller cannot tell back pressure from loss that way, and should not have
+to.
+
+So a publish on a connection that is already blocked is **declined before anything
+is written**, with its own error:
+
+```ruby
+begin
+  mq.publish(event, to: "order.placed", exchange: "orders-events")
+rescue AceMQ::AMQP::PublishingPausedError => e
+  # not sent: the broker is low on memory or disk. Safe to send again later.
+  back_off_and_retry(event)
+rescue AceMQ::AMQP::PublishError => e
+  # may have been lost: the broker did not confirm it
+end
+```
+
+`PublishingPausedError` is a subclass of `PublishError`, so code that rescues
+`PublishError` keeps working and simply treats back pressure as before. The message
+carries the broker's reason (`low on memory`, `low on disk space`). It is the
+counterpart of Go's `isPaused`, .NET's `ConnectionBlockedException` and Java's
+`PublishingPausedException`.
+
+`publish_all` on a blocked connection answers every message the same way, and the
+batch raises `PublishingPausedError` only when **every** failure in it was declined
+unsent — one message that may have been lost makes it a plain `PublishError`,
+because blindly resending that batch could duplicate.
+
+A block that arrives *after* a publish has been written cannot be undone: that
+publish waits as it always has, and is confirmed once the broker reads the socket
+again. `mq.blocked?` and `mq.blocked_reason` say whether the connection is blocked
+now, without a round trip.
+
 ## When reaching no queue should be an error
 
 A confirm says the broker has the message. It does not say the message reached a

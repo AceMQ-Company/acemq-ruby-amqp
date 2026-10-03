@@ -53,6 +53,21 @@ module AceMQ
       end
     end
 
+    # A publish the library declined because the broker has blocked the
+    # connection. Nothing was written, so nothing can be half-published, and
+    # sending the same message again once the block clears is the right answer.
+    #
+    # Its own class because the alternative is the one thing a caller cannot
+    # act on: a plain {PublishError} may be a message the broker has and never
+    # confirmed, and a load that counts the two together counts back pressure
+    # as loss. Go's +isPaused+, .NET's +ConnectionBlockedException+ and Java's
+    # +PublishingPausedException+ make the same split.
+    #
+    # A subclass, so every +rescue PublishError+ written before it existed
+    # still catches it. It is never unroutable: the message did not get far
+    # enough to be routed.
+    class PublishingPausedError < PublishError; end
+
     # The sentences a publish that did not arrive comes back with.
     #
     # In one place because a batch has to raise exactly what a single publish
@@ -77,6 +92,13 @@ module AceMQ
       def not_published(message_id, exchange, routing_key, reason)
         "cannot publish message #{message_id} to exchange #{exchange.inspect} " \
           "with key #{routing_key.inspect}: #{reason}"
+      end
+
+      def paused(message_id, exchange, routing_key, reason)
+        not_published(message_id, exchange, routing_key,
+                      "the broker has blocked this connection (#{reason}), so the message " \
+                      "was not sent. This is broker capacity, not this message: send it " \
+                      "again once the block clears.")
       end
     end
 
@@ -865,11 +887,14 @@ module AceMQ
       # @param mandatory [Boolean] whether reaching no queue is an error rather
       #   than a silence
       # @return [String] the message id it went out with
+      # @raise [PublishingPausedError] when the broker has blocked the
+      #   connection: nothing was sent, and sending again once it clears is safe
       # @raise [PublishError] when the broker did not confirm it, or when it was
       #   mandatory and reached no queue — {PublishError#unroutable?} tells the
       #   two apart
       def publish(exchange:, routing_key:, body:, content_type: nil, message_id: nil,
                   headers: {}, persistent: true, reply_to: nil, mandatory: false)
+        refuse_while_blocked!(message_id, exchange, routing_key)
         returned = nil
         confirmed = publish_channel do |channel|
           @returns.arm(channel, exchange) if mandatory
@@ -920,6 +945,16 @@ module AceMQ
       #   order they were given: the id it went out with, or the failure it met
       def publish_all(messages)
         return [] if messages.empty?
+
+        # Answered per message rather than raised, because that is what this
+        # method promises for every other failure.
+        if (reason = blocked_reason)
+          return messages.map do |m|
+            PublishingPausedError.new(
+              PublishFailure.paused(m[:message_id], m[:exchange], m[:routing_key], reason)
+            )
+          end
+        end
 
         batch = BatchPublish.new(messages, @returns)
         publish_channel { |channel| batch.run(channel, @permits) }
@@ -1030,11 +1065,11 @@ module AceMQ
       # Why the broker has asked this connection to stop publishing, or nil.
       #
       # RabbitMQ sends +connection.blocked+ when it is low on memory or disk and
-      # +connection.unblocked+ when the alarm clears. Between the two, every
-      # publish on this connection hangs rather than failing — the broker simply
-      # stops reading — so this is the difference between an operator seeing
-      # "the broker is out of disk" and seeing a service that has quietly
-      # stopped publishing for no reason anybody can find.
+      # +connection.unblocked+ when the alarm clears. Between the two the broker
+      # stops reading, so {#publish} declines with {PublishingPausedError}
+      # rather than writing into a socket nobody reads — and this is the
+      # difference between an operator seeing "the broker is out of disk" and
+      # seeing a service whose publishes are being declined.
       #
       # The reason is the broker's own words, +"low on disk space"+ or
       # +"low on memory"+, recorded from the frame that carried it. Bunny keeps
@@ -1249,6 +1284,27 @@ module AceMQ
               "Publishing now would be refused by the broker and would close the " \
               "connection again; this message was not sent, and a retry once the " \
               "recovery completes will go down the recovered connection."
+      end
+
+      # Declines a publish on a connection the broker has blocked, before
+      # anything is written.
+      #
+      # Until this existed the publish was written anyway and sat in
+      # +wait_for_confirms+ until the broker read the socket again or bunny's
+      # timeout gave up, and the second of those came back as an unconfirmed
+      # message: a {PublishError} indistinguishable from one the broker may have
+      # lost. Declining up front is what .NET does, and it is the only point at
+      # which "not sent" can be said truthfully. A block that arrives after the
+      # check finds the message already written, and that publish waits and
+      # answers as it always has.
+      #
+      # @raise [PublishingPausedError] when the connection is blocked
+      def refuse_while_blocked!(message_id, exchange, routing_key)
+        reason = blocked_reason
+        return if reason.nil?
+
+        raise PublishingPausedError,
+              PublishFailure.paused(message_id, exchange, routing_key, reason)
       end
 
       # The channel every publish goes down, opened once and guarded.

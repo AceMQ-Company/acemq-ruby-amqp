@@ -300,6 +300,8 @@ module AceMQ
       # @param fields [Hash] envelope fields, when no envelope is given
       # @return [Envelope] what was actually put on the wire, which is what the
       #   interceptors left rather than what was handed in
+      # @raise [PublishingPausedError] when the broker has blocked the
+      #   connection: nothing was sent, and sending again once it clears is safe
       # @raise [PublishError] when the broker would not take the message, or
       #   when +mandatory+ and it reached no queue
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
@@ -381,7 +383,8 @@ module AceMQ
       # @raise [PublishError] when any message was not confirmed. The message
       #   says how many failed and how many did not, and quotes the first
       #   failure *in payload order*, which is not necessarily the first one the
-      #   broker answered
+      #   broker answered. A {PublishingPausedError} when every failure was a
+      #   message declined unsent because the broker had blocked the connection
       def publish_all(payloads, to:, exchange: "", envelopes: nil, codec: nil, persistent: true,
                       reply_to: nil, mandatory: false, **fields)
         payloads = check_batch!(payloads, envelopes, fields)
@@ -455,15 +458,14 @@ module AceMQ
 
       # Why the broker has asked this connection to stop publishing, or nil.
       #
-      # RabbitMQ blocks a connection when it is running low on memory or disk.
-      # Every publish on a blocked connection hangs rather than failing — the
-      # broker stops reading the socket — so this is the difference between an
-      # operator seeing "the broker is out of disk" and seeing a service that
-      # has silently stopped publishing.
+      # RabbitMQ blocks a connection when it is running low on memory or disk,
+      # and stops reading the socket. A publish on a connection that is already
+      # blocked is declined with {PublishingPausedError} rather than written, so
+      # this is the difference between an operator seeing "the broker is out of
+      # disk" and seeing a service whose publishes are being declined.
       #
       # Free: a flag the broker pushed, read out of memory. Unlike {#health} it
-      # costs no round trip, so it is fine to ask per request — a publisher that
-      # would rather fail fast than hang can check it first.
+      # costs no round trip, so it is fine to ask per request.
       #
       # It is not a reason to fail a readiness probe, and {Health} deliberately
       # does not: see there for why restarting a producer into a broker that is
@@ -694,7 +696,11 @@ module AceMQ
       # an unroutable batch.
       def batch_failure(failures, total)
         met = failures.compact
-        PublishError.new(
+        # Paused only when every failure was declined unsent, for the same reason
+        # as +unroutable?+: one message that may be lost makes the batch one a
+        # blind resend could duplicate.
+        paused = met.all?(PublishingPausedError)
+        (paused ? PublishingPausedError : PublishError).new(
           "#{met.size} of #{total} messages were not confirmed; #{total - met.size} were. " \
           "The first failure was: #{met.first.message}",
           unroutable: met.all? { |e| e.is_a?(PublishError) && e.unroutable? }
