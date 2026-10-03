@@ -896,7 +896,7 @@ module AceMQ
                   headers: {}, persistent: true, reply_to: nil, mandatory: false)
         refuse_while_blocked!(message_id, exchange, routing_key)
         returned = nil
-        confirmed = publish_channel do |channel|
+        confirmed = publish_channel([message_id, exchange, routing_key]) do |channel|
           @returns.arm(channel, exchange) if mandatory
           ok = write_and_wait(channel, body.to_s, exchange, routing_key,
                               content_type: content_type, message_id: message_id,
@@ -958,6 +958,15 @@ module AceMQ
 
         batch = BatchPublish.new(messages, @returns)
         publish_channel { |channel| batch.run(channel, @permits) }
+      rescue PublishingPausedError => e
+        # Refused before anything was written -- a recovery in progress -- so
+        # every message gets the same answer, as it would for a blocked broker.
+        messages.map do |m|
+          PublishingPausedError.new(
+            PublishFailure.not_published(m[:message_id], m[:exchange], m[:routing_key],
+                                         e.message)
+          )
+        end
       end
 
       # Delivers messages until the returned subscription is cancelled.
@@ -1276,14 +1285,19 @@ module AceMQ
       # that a retry is the right answer, as every other transient failure here does.
       # Waiting inside the publish lock would hold up nothing useful and would turn a
       # broker restart into a stalled application.
-      def refuse_while_recovering!
+      #
+      # Raised as PublishingPausedError because that is what it is: declined
+      # before anything was written, and safe to retry. It was a bare
+      # TransportError, which a load counted as a failed publish.
+      def refuse_while_recovering!(context = nil)
         return unless @recovery_lock.synchronize { @recovering }
 
-        raise TransportError,
-              "the connection is being recovered and its channels are not open yet. " \
-              "Publishing now would be refused by the broker and would close the " \
-              "connection again; this message was not sent, and a retry once the " \
-              "recovery completes will go down the recovered connection."
+        reason = "the connection is being recovered and its channels are not open yet. " \
+                 "Publishing now would be refused by the broker and would close the " \
+                 "connection again; this message was not sent, and a retry once the " \
+                 "recovery completes will go down the recovered connection."
+        reason = PublishFailure.not_published(*context, reason) if context
+        raise PublishingPausedError, reason
       end
 
       # Declines a publish on a connection the broker has blocked, before
@@ -1314,9 +1328,9 @@ module AceMQ
       # because a bunny channel is not safe to use from two threads at once,
       # and a consumer thread dead-lettering a message publishes on this same
       # channel while an application thread may be publishing its own.
-      def publish_channel
+      def publish_channel(context = nil)
         @lock.synchronize do
-          refuse_while_recovering!
+          refuse_while_recovering!(context)
           if @publish_channel.nil? || !@publish_channel.open?
             discard_channel(@publish_channel)
             @publish_channel = @session.create_channel

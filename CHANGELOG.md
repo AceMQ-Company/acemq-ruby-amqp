@@ -30,6 +30,11 @@ While the version is `0.x` the public API may change in any release.
   to unblock; it raises `PublishingPausedError` straight away, as .NET does. A
   publish already written when the block arrives still waits and is confirmed once
   the broker reads the socket again.
+- A publish refused because the connection is being recovered now raises
+  `PublishingPausedError` rather than a bare `TransportError`: it was declined
+  before anything was written and is safe to retry, which is what the type means.
+  Existing `rescue TransportError` still catches it. `publish_all` answers every
+  message with it instead of raising, as it already did for a blocked broker.
 
 ## [0.7.4] - 2026-10-03
 

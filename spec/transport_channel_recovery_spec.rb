@@ -181,6 +181,34 @@ RSpec.describe AceMQ::AMQP::Transport, "while the connection is recovering" do
       .to raise_error(AceMQ::AMQP::TransportError, /not open yet.*was not sent.*retry/m)
   end
 
+  # Not sent and safe to retry is exactly what PublishingPausedError means, so a
+  # caller branching on it -- or a load counting refused against failed -- must not
+  # have to know that a recovery, rather than a blocked broker, was the reason.
+  it "declines with the paused type, which is still a PublishError and a TransportError" do
+    transport
+    session.start_recovering
+
+    expect { transport.publish(exchange: "x", routing_key: "k", body: "b", message_id: "m-1") }
+      .to raise_error(AceMQ::AMQP::PublishingPausedError) { |e|
+        expect(e).to be_a(AceMQ::AMQP::PublishError)
+        expect(e).to be_a(AceMQ::AMQP::TransportError)
+      }
+  end
+
+  it "answers every message of a batch as paused rather than raising" do
+    transport
+    session.start_recovering
+
+    results = transport.publish_all([
+                                      { exchange: "x", routing_key: "a", body: "1",
+                                        message_id: "m-1" },
+                                      { exchange: "x", routing_key: "b", body: "2",
+                                        message_id: "m-2" }
+                                    ])
+    expect(results.size).to eq(2)
+    expect(results).to all(be_a(AceMQ::AMQP::PublishingPausedError))
+  end
+
   it "publishes normally once the recovery is over" do
     transport
     session.start_recovering
