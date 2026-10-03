@@ -79,10 +79,12 @@ While the version is `0.x` the public API may change in any release.
   threads parked in `ConsumerWorkPool#run_loop`. A standing load with `concurrency: 4`
   reached ~54 threads by its 12th forced recovery.
 
-  With a tag of our own the recorded count holds at 1, one pool stays live, and 20
-  forced recoveries leave the thread count where it started — publishing and consuming
-  throughout. A plain bunny consumer never grew this way, which is what showed the tag
-  was ours to fix rather than bunny's.
+  With a tag of our own the recorded count holds at 1 and one pool stays live. Over 60
+  forced recoveries the thread count ends where it started, 88,712 published and 88,718
+  consumed across them, and resident memory grows 0.13MB per recovery — which is bunny's
+  own floor, measured at 0.12MB for a client built on bunny alone. So this library now
+  adds nothing to either number. A plain bunny consumer never grew this way, which is
+  what showed the tag was ours to fix rather than bunny's.
 
   The tag is `acemq-{queue}-{random}`, generated once per subscription so it survives
   every recovery of that subscription, and a caller-supplied `tag:` is still used
