@@ -230,6 +230,98 @@ RSpec.describe AceMQ::AMQP::Transport, "while the connection is recovering" do
   end
 end
 
+# A publish whose confirm was still owed when the connection died.
+#
+# bunny never answers that wait: on recovery it swaps the continuation the waiting
+# thread is parked on for a new one, so no confirm can reach it, and the thread sits
+# out bunny's whole continuation timeout -- fifteen seconds by default -- holding the
+# publish lock, so every other publisher on the connection waits with it. Measured on
+# bunny 2.24 and 3.4 alike, with and without this library: the wait ended 15.06s after
+# the publish, five seconds after the connection was already back.
+RSpec.describe AceMQ::AMQP::Transport, "a confirm still owed when the connection is lost" do
+  subject(:transport) { described_class.new(session) }
+
+  # A confirm that never comes until the test says so, like bunny's for a message
+  # written into a connection that has just died.
+  let(:channel) do
+    Class.new(StubChannel) do
+      def initialize
+        super
+        @answers = Thread::Queue.new
+        @waiting = false
+      end
+
+      def waiting? = @waiting
+      def answer(acked) = @answers << acked
+      def basic_publish(*, **) = nil
+
+      def wait_for_confirms
+        @waiting = true
+        @answers.pop
+      ensure
+        @waiting = false
+      end
+    end.new
+  end
+
+  let(:session) do
+    Class.new do
+      def initialize(channel) = @channel = channel
+      def open? = true
+      def create_channel(*) = @channel
+      def close = nil
+      def before_recovery_attempt_starts(&block) = @on_start = block
+      def after_recovery_completed(&block) = @on_recovered = block
+      def start_recovering = @on_start&.call
+      def finish_recovering = @on_recovered&.call
+    end.new(channel)
+  end
+
+  def publish_in_background
+    Thread.new do
+      transport.publish(exchange: "x", routing_key: "k", body: "b", message_id: "m-1")
+    rescue StandardError => e
+      e
+    end
+  end
+
+  def wait_until_waiting
+    deadline = Time.now + 2
+    sleep 0.005 until channel.waiting? || Time.now > deadline
+    expect(channel).to be_waiting
+  end
+
+  it "gives up when the recovery starts, as a possibly lost message, and frees the lock" do
+    transport
+    publishing = publish_in_background
+    wait_until_waiting
+
+    session.start_recovering
+
+    expect(publishing.join(1)).not_to be_nil, "the publish was still waiting for a confirm"
+    failure = publishing.value
+    expect(failure).to be_a(AceMQ::AMQP::PublishError)
+    # Written and never answered for: that is "failed", not "refused".
+    expect(failure).not_to be_a(AceMQ::AMQP::PublishingPausedError)
+    expect(failure.message).to match(/connection was lost.*whether it arrived is unknown/m)
+  end
+
+  it "keeps the broker's answer when it came first, and leaves the next publish alone" do
+    transport
+    publishing = publish_in_background
+    wait_until_waiting
+    channel.answer(true)
+    expect(publishing.value).to eq("m-1")
+
+    session.start_recovering
+    session.finish_recovering
+    publishing = publish_in_background
+    wait_until_waiting
+    channel.answer(true)
+    expect(publishing.value).to eq("m-1")
+  end
+end
+
 # The threads a replaced channel holds.
 #
 # A bunny channel carries a consumer work pool -- one thread by default -- and both the

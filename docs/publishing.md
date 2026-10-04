@@ -143,10 +143,25 @@ channel the broker has not opened yet. The broker's answer to that is not to
 refuse the message; it closes the whole connection, which would undo the recovery
 in progress and start another one.
 
-So publishing is refused for the length of the window, typically well under a
-second, and the message is not sent. Retry it: by the time a retry lands the
-channels are back. `publish` raises `PublishError` as it does for any other
-failure, so code that already retries needs no change.
+So publishing is refused for the length of the window and the message is not
+sent. The window is longer than it sounds: bunny with a single broker address
+sleeps `network_recovery_interval` (5s by default) before the attempt, finds its
+address list used up, and sleeps it again before reconnecting, so a forced close
+measured on the drill cluster refused publishes for about 5s and had the
+connection back about 10s after the loss. Retry with a back-off: by the time a
+retry lands the channels are back. `publish` raises `PublishError` as it does for
+any other failure, so code that already retries needs no change.
+
+A publish that was *waiting for its confirm* when the connection dropped is a
+different case: the message was written and nothing answered for it, so it may
+or may not have arrived, and it fails as an ordinary `PublishError` — not as a
+refusal. bunny itself never ends that wait: its recovery replaces the queue the
+waiting thread is parked on, so the wait runs to bunny's whole
+`continuation_timeout` (15s), and on bunny 2.24 and 3.4 alike every other
+publisher on the connection stalled behind it, five seconds past the recovery.
+The transport ends the wait as soon as bunny starts its recovery attempt, one
+`network_recovery_interval` after the loss, which brought that stall from 15.06s
+to 5.06s. A lower `network_recovery_interval` shortens it further.
 
 Consuming is unaffected — deliveries resume on their own once the channels are
 recovered.

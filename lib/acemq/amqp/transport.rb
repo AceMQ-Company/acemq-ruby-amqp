@@ -191,6 +191,84 @@ module AceMQ
       end
     end
 
+    # bunny's +wait_for_confirms+, made to let go when the connection is lost.
+    #
+    # A message written just as the connection dies is never confirmed, and bunny
+    # never tells the thread waiting for it so. Its recovery does try --
+    # +release_all_continuations+ wakes the waiting thread -- but the wait loops on
+    # an empty continuation queue and goes straight back to sleep, and the same
+    # recovery then replaces that queue with a new one, so no confirm can ever
+    # reach it. The thread sits out bunny's whole continuation timeout, fifteen
+    # seconds by default. Measured on bunny 2.24 and 3.4 alike, with bunny alone
+    # and through this library: a forced close at 86.45s, the connection back at
+    # 96.46s, the wait ended by +Timeout::Error+ at 101.46s.
+    #
+    # It costs more than the one message, because the wait holds the publish lock:
+    # every other publisher on the connection stalled behind it for those fifteen
+    # seconds, five of them after the connection was healthy again.
+    #
+    # So {Transport} calls {#abandon} when a recovery attempt starts, and the
+    # waiting thread is told the connection was lost. The message stays a
+    # possible loss -- it was written and nothing answered for it -- so the
+    # publish fails as unconfirmed, not as declined.
+    #
+    # The interruption is +Thread#raise+, which is only safe because it is fenced
+    # in: it can land only while the thread is inside +wait_for_confirms+, parked
+    # on a condition variable, and one that arrives as the wait is finishing is
+    # taken here and dropped rather than escaping later from somewhere else. The
+    # earliest bunny offers is +before_recovery_attempt_starts+, which comes one
+    # +network_recovery_interval+ (5s) after the loss.
+    #
+    # @api private
+    class ConfirmWait
+      # Raised inside the waiting thread. Never escapes {#wait} except as itself,
+      # and is a StandardError so a publish answers it the way it answers any
+      # other failed wait.
+      class Abandoned < StandardError; end
+
+      def initialize
+        @lock = Mutex.new
+        @waiter = nil
+      end
+
+      # bunny's answer to "were they all acked", unless {#abandon} came first.
+      #
+      # @raise [Abandoned] when the connection was lost during the wait
+      def wait(channel)
+        Thread.handle_interrupt(Abandoned => :never) do
+          @lock.synchronize { @waiter = Thread.current }
+          begin
+            Thread.handle_interrupt(Abandoned => :immediate) { channel.wait_for_confirms }
+          ensure
+            @lock.synchronize { @waiter = nil }
+            discard_late_abandon
+          end
+        end
+      end
+
+      # Ends the wait in progress, if there is one.
+      def abandon
+        @lock.synchronize do
+          @waiter&.raise(Abandoned,
+                         "the connection was lost while waiting for the broker to confirm " \
+                         "this message, so whether it arrived is unknown")
+        end
+        nil
+      end
+
+      private
+
+      # An abandon that arrived after the wait had already returned is pending
+      # rather than raised. The wait's own answer stands, so it is taken here.
+      def discard_late_abandon
+        return unless Thread.pending_interrupt?(Abandoned)
+
+        Thread.handle_interrupt(Abandoned => :immediate) { Thread.pass }
+      rescue Abandoned
+        nil
+      end
+    end
+
     # Keeps bunny's topology recovery off channels this library has closed.
     #
     # bunny 3.x records every declaration for replay when a connection comes back, and
@@ -475,9 +553,12 @@ module AceMQ
       #   one hash per message
       # @param returns [ReturnedMessages] the channel's returns, the same object
       #   a single mandatory publish reads
-      def initialize(messages, returns)
+      # @param confirms [ConfirmWait] how to wait, so a lost connection ends the
+      #   wait as it does for a single publish
+      def initialize(messages, returns, confirms = ConfirmWait.new)
         @messages = messages
         @returns = returns
+        @confirms = confirms
         @results = Array.new(messages.size)
         # Delivery tag to payload position, for the messages that are on the
         # wire right now with no answer back yet. Emptied by every wave.
@@ -649,7 +730,7 @@ module AceMQ
       # by one, and an exception here would lose every one of those answers,
       # including the ones the broker had already acknowledged.
       def wait_for_batch(channel)
-        channel.wait_for_confirms
+        @confirms.wait(channel)
         nil
       rescue StandardError => e
         e
@@ -808,6 +889,7 @@ module AceMQ
         @pull_lock = Mutex.new
         @subscriptions = []
         @returns = ReturnedMessages.new
+        @confirms = ConfirmWait.new
         # A lock of its own again, and the smallest one in the class: the
         # broker's blocked callback runs on bunny's reader thread, and a health
         # probe reads it from a web server's. Sharing the publish lock would
@@ -956,7 +1038,7 @@ module AceMQ
           end
         end
 
-        batch = BatchPublish.new(messages, @returns)
+        batch = BatchPublish.new(messages, @returns, @confirms)
         publish_channel { |channel| batch.run(channel, @permits) }
       rescue PublishingPausedError => e
         # Refused before anything was written -- a recovery in progress -- so
@@ -1243,6 +1325,10 @@ module AceMQ
         if @session.respond_to?(:before_recovery_attempt_starts)
           @session.before_recovery_attempt_starts do
             @recovery_lock.synchronize { @recovering = true }
+            # A confirm still owed now is owed by a connection that is gone; see
+            # {ConfirmWait} for why bunny would otherwise hold the wait, and the
+            # publish lock with it, for its whole continuation timeout.
+            @confirms.abandon
           end
         end
 
@@ -1381,7 +1467,7 @@ module AceMQ
         begin
           channel.basic_publish(body, exchange, routing_key, **properties)
           outstanding = true
-          confirmed = channel.wait_for_confirms
+          confirmed = @confirms.wait(channel)
           outstanding = false
           confirmed
         ensure

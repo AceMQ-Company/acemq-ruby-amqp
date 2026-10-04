@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A publish waiting for its confirm when the connection dropped no longer holds
+  every publisher on the connection for bunny's whole `continuation_timeout`.
+  bunny never answers that wait -- its recovery replaces the continuation the
+  waiting thread is parked on -- so it ran the full 15s and, because it holds the
+  publish lock, stalled all publishing until 5s after the connection was already
+  back. Reproduced with bunny alone on 2.24 and 3.4. The wait is now ended
+  when bunny starts its recovery attempt, one `network_recovery_interval` after
+  the loss: measured stall 15.06s before, 5.06s after. The message fails as an
+  unconfirmed `PublishError`, since it was written and may have arrived.
+
 ## [0.7.6] - 2026-10-03
 
 ### Fixed
