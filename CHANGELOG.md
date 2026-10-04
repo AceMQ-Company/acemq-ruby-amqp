@@ -21,6 +21,14 @@ While the version is `0.x` the public API may change in any release.
   `publish_all`. The same errors from the confirm wait, after the message was
   written, stay `failed`. Measured with forced closes on bunny 2.24 and 3.4: 86
   `failed` per recovery before, 0 after, publishing and consuming both moving.
+- A connection to a single broker address recovers in one
+  `network_recovery_interval` instead of two. bunny rewinds its address list
+  only after an attempt finds it used up, and with one address it always was, so
+  every recovery slept, failed to pick an address, and slept again. The
+  transport rewinds a single-address list as each attempt starts; a forced close
+  is back in about 5.7s instead of 10.7s on bunny 2.24 and 3.4. Several
+  addresses keep bunny's rotation. `Transport.new` takes `single_host:` for a
+  session built by the caller.
 
 ## [0.7.7] - 2026-10-04
 

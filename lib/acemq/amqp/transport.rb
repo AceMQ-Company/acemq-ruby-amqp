@@ -881,11 +881,21 @@ module AceMQ
                                  **options, **security.to_transport_options)
         security.configure(session)
         session.start
-        new(session, max_outstanding_publishes: permits.limit)
+        new(session, max_outstanding_publishes: permits.limit,
+                     single_host: single_host?(options))
       rescue DependencyMissing, ConfigurationError
         raise
       rescue StandardError => e
         raise TransportError, "cannot reach the broker at #{redact(url)}: #{e.message}"
+      end
+
+      # Whether bunny will have one address to connect to, read the way bunny's
+      # own +addresses_from+ reads it: the first of these it finds, or the URL.
+      #
+      # @api private
+      def self.single_host?(options)
+        hosts = options[:host] || options[:hostname] || options[:addresses] || options[:hosts]
+        Array(hosts).size <= 1
       end
 
       # A URL with its password taken out, for an error message that will be
@@ -899,8 +909,13 @@ module AceMQ
 
       # @param session [Bunny::Session] an already started connection
       # @param max_outstanding_publishes [Integer] see {PublishPermits}
-      def initialize(session, max_outstanding_publishes: PublishPermits::DEFAULT)
+      # @param single_host [Boolean] whether the session has one broker address,
+      #   so a recovery can go straight back to it; see {#watch_recovery}.
+      #   {.open} works it out; a caller handing in a session of its own says so
+      def initialize(session, max_outstanding_publishes: PublishPermits::DEFAULT,
+                     single_host: false)
         @session = session
+        @single_host = single_host
         @permits = PublishPermits.new(max_outstanding_publishes)
         @lock = Mutex.new
         # A lock of its own, because a pull holds messages unacknowledged across
@@ -1346,6 +1361,7 @@ module AceMQ
         if @session.respond_to?(:before_recovery_attempt_starts)
           @session.before_recovery_attempt_starts do
             @recovery_lock.synchronize { @recovering = true }
+            rewind_single_host
             # A confirm still owed now is owed by a connection that is gone; see
             # {ConfirmWait} for why bunny would otherwise hold the wait, and the
             # publish lock with it, for its whole continuation timeout.
@@ -1363,6 +1379,24 @@ module AceMQ
           @permits.reopened
           @returns.reopened
         end
+      end
+
+      # Sends a single-address session's attempt straight back to its one broker.
+      #
+      # bunny advances its address index on every connect and rewinds it only when
+      # an attempt finds it past the end -- and that rewind costs a whole retry,
+      # +network_recovery_interval+ again. With one address the first connect leaves
+      # the index past the end, so every recovery slept twice: 5s, a depleted list,
+      # 5s more, then the connect -- about 10s for a broker that was back at once,
+      # measured on bunny 2.24 and 3.4 alike. This runs after the first sleep and
+      # before bunny picks the address, so the first attempt connects. With several
+      # addresses it does nothing: rewinding there would send every attempt back to
+      # the first host, the one that may just have died, and bunny's rotation is
+      # the point of having several.
+      def rewind_single_host
+        return unless @single_host && @session.respond_to?(:reset_address_index)
+
+        @session.reset_address_index
       end
 
       # Refuses to write anything between a connection being lost and its channels

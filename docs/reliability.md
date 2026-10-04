@@ -465,6 +465,23 @@ on `Connection.open`, which forwards what it does not recognise to the
 transport. Nothing here redeclares a topology after a recovery or re-runs
 `RetryLadder#declare`.
 
+One thing is adjusted. bunny steps through its address list once per connect and
+rewinds it only when an attempt finds it used up, which costs a whole retry. With
+a single address the first connect already leaves it used up, so up to 0.7.7 every
+recovery slept `network_recovery_interval`, found no address, slept again and then
+connected: about 10.7s from a forced close to publishing again, measured on bunny
+2.24 and 3.4. `Transport.open` now rewinds a single-address list as each attempt
+starts, and the same close is back in about 5.7s. With several addresses (`hosts:`
+or `addresses:`) bunny's rotation is left alone, so an attempt goes to the next
+host rather than back to the one that may have just died, and a recovery that
+reaches the end of the list still waits one extra interval there. A session built
+yourself and handed to `Transport.new` gets the rewind with `single_host: true`.
+
+The knob is `network_recovery_interval`, the seconds bunny waits before each
+attempt: the time to recover from a lost connection is about that plus the
+reconnect, and the time a publisher refuses (see
+[publishing](publishing.md#while-the-connection-is-being-recovered)) is the same.
+
 So do not assume a broker restart is invisible. `mq.health` is what says whether
 this process is still doing its job — see
 [metrics and health](observability.md) — and a readiness probe on it is what

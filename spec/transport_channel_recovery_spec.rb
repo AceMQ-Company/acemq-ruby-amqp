@@ -625,3 +625,74 @@ RSpec.describe AceMQ::AMQP::Transport, "between the loss and the recovery attemp
     }
   end
 end
+
+# A single broker address took a recovery two +network_recovery_interval+ sleeps.
+#
+# bunny walks its address list one step per connection attempt and only rewinds it
+# when an attempt finds it used up. With one address the first connect leaves the
+# index past the end, so every recovery sleeps (5s), starts an attempt, finds the
+# list depleted, rewinds, sleeps again and only then connects: ~10s for a broker that
+# was back in under one. Measured on bunny 2.24 and 3.4 alike. With one address there
+# is nowhere else to go, so the transport rewinds the list as each attempt starts --
+# +before_recovery_attempt_starts+ runs after the sleep and before bunny picks the
+# address. With several it is left alone: rewinding would send every attempt back to
+# the first host, the one that may have just died.
+RSpec.describe AceMQ::AMQP::Transport, "recovering a single-address connection" do
+  let(:session) do
+    Class.new do
+      attr_reader :rewound
+
+      def initialize = @rewound = 0
+      def open? = true
+      def close = nil
+      def start = nil
+      def reset_address_index = @rewound += 1
+      def before_recovery_attempt_starts(&block) = @on_start = block
+      def after_recovery_completed(&block) = @on_recovered = block
+      def start_recovering = @on_start&.call
+    end.new
+  end
+
+  it "rewinds bunny's address list as each attempt starts when there is one address" do
+    described_class.new(session, single_host: true)
+
+    2.times { session.start_recovering }
+
+    expect(session.rewound).to eq(2)
+  end
+
+  it "leaves the list alone when it was not told there is only one address" do
+    described_class.new(session)
+
+    session.start_recovering
+
+    expect(session.rewound).to eq(0)
+  end
+
+  describe ".open" do
+    before { allow(Bunny).to receive(:new).and_return(session) }
+
+    it "treats a URL alone as one address" do
+      described_class.open("amqp://localhost:5672")
+      session.start_recovering
+
+      expect(session.rewound).to eq(1)
+    end
+
+    it "treats one host in hosts: as one address" do
+      described_class.open("amqp://localhost:5672", hosts: ["rmq1"])
+      session.start_recovering
+
+      expect(session.rewound).to eq(1)
+    end
+
+    %i[hosts addresses].each do |key|
+      it "leaves bunny's rotation alone for several #{key}" do
+        described_class.open("amqp://localhost:5672", key => %w[rmq1:5672 rmq2:5672])
+        session.start_recovering
+
+        expect(session.rewound).to eq(0)
+      end
+    end
+  end
+end

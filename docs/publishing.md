@@ -155,11 +155,13 @@ not sent, and a retry once the recovery completes will go down the recovered
 connection.
 ```
 
-The window is longer than it sounds: bunny with a single broker address sleeps
-`network_recovery_interval` before the attempt, finds its address list used up,
-and sleeps it again before reconnecting, so a forced close measured on the drill
-cluster had the connection back about 10s after the loss. Retry with a back-off:
-by the time a retry lands the channels are back. Both refusals are a
+With a single broker address the whole window is one `network_recovery_interval`
+and the reconnect: a forced close on the drill cluster, on bunny 2.24 and 3.4
+alike, stopped publishing about 0.65s after the close (when bunny noticed) and
+had it going again about 5.05s later. Lowering `network_recovery_interval` (a
+keyword on `Connection.open`) shortens it one for one. Retry with a back-off: by
+the time a retry lands the channels are back. See
+[recovery](reliability.md#what-is-not-here) for why it was twice that up to 0.7.7. Both refusals are a
 `PublishingPausedError` -- a `PublishError`, so code that already retries needs no
 change -- and both count as `refused`, never `failed`. So does a publish bunny
 itself would not write because the connection closed between the check and the
