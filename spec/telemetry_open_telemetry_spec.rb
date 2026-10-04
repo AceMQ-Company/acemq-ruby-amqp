@@ -335,6 +335,27 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
         .to eq(OpenTelemetry::Trace::Status::ERROR)
     end
 
+    # Declined before anything was written, so not a possible loss: the span
+    # says `refused`, the word the counter uses. Still an error -- the publish
+    # did not happen and the caller got an exception -- coloured by that
+    # exception rather than by the word, as Python's adapter does.
+    it "calls a publish the library declined to send refused, and does call that an error" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      paused = AceMQ::AMQP::Connection.new(transport: transport, origin: "rspec@otel",
+                                           telemetry: metrics)
+      tracing.install(paused)
+      allow(transport).to receive(:publish)
+        .and_raise(AceMQ::AMQP::PublishingPausedError, "the broker has blocked this connection")
+
+      expect { paused.publish({ "a" => 1 }, to: "orders.new") }
+        .to raise_error(AceMQ::AMQP::PublishingPausedError)
+      span = span_named("orders.new publish")
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("refused")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::ERROR)
+      expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: "refused"]).to eq(1)
+    end
+
     # A message the broker took and could not route is not the same problem as
     # one it would not take, and the span has to say which: `failed` sends
     # whoever reads it to the broker, and the answer is a binding nobody made.

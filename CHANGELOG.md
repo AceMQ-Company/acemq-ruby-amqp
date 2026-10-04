@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `acemq.publish.total` has a new `outcome`, `refused`, for a publish the library
+  declined before writing anything: a `PublishingPausedError`, raised while the
+  broker has blocked the connection or while the connection is being recovered.
+  Nothing was sent, so nothing can have been lost. `failed` keeps meaning
+  possibly lost (a nack, no confirm, an I/O failure). The OpenTelemetry publish
+  span writes the same word to `messaging.acemq.outcome` and is still an error,
+  coloured by the exception. `Telemetry::Outcome::REFUSED` names it. Additive,
+  and the same word in all five libraries; a dashboard that watched `failed` for
+  loss stops counting back pressure as loss.
+
 ### Fixed
 
 - A publish waiting for its confirm when the connection dropped no longer holds

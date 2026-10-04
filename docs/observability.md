@@ -19,7 +19,7 @@ written for one reads the same against another:
 
 | | |
 |---|---|
-| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, `unroutable` or `failed` |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, `unroutable`, `failed` or `refused` |
 | `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
 | `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
 | `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way **in** |
@@ -46,6 +46,16 @@ the publish succeeds, the consumer waits, and nothing anywhere says why. Only a
 ever told, so this series stays at zero until something asks for one. Keeping it
 apart from `failed` is the point: `failed` is a broker or a network, `unroutable`
 is a binding nobody made, and they are fixed in different places.
+
+`outcome=refused` is a publish this library declined before writing anything to
+the wire: a [`PublishingPausedError`](publishing.md#while-the-broker-has-blocked-the-connection),
+raised while the broker has blocked the connection or while the connection is
+[being recovered](publishing.md#while-the-connection-is-being-recovered). Nothing
+was sent, so nothing was lost and a retry cannot duplicate it. `failed` keeps
+meaning *possibly lost* — a nack, a confirm that never came, an I/O failure
+partway — which is what makes it the series to alert on, and a broker alarm no
+longer reads as message loss. The same word in all five AceMQ libraries, and the
+publish span's `messaging.acemq.outcome` says the same word as the counter.
 
 `acemq.consume.attempts` is two numbers in one. Its **sample count** is how many
 deliveries this consumer was given, taken on the way in — so a handler that never

@@ -522,7 +522,7 @@ alert written for one service reads the same against the next:
 
 | | |
 |---|---|
-| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`; `unroutable` for a [mandatory](docs/publishing.md#when-reaching-no-queue-should-be-an-error) message the broker had nowhere to route; `failed` for anything that did not reach the broker, an interceptor's refusal included |
+| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`; `unroutable` for a [mandatory](docs/publishing.md#when-reaching-no-queue-should-be-an-error) message the broker had nowhere to route; `failed` for anything that did not reach the broker, an interceptor's refusal included; `refused` for a publish the library declined before writing anything (`PublishingPausedError`: a blocked broker, or a connection being recovered), which cannot have been lost |
 | `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
 | `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
 | `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way in |

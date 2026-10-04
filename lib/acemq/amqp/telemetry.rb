@@ -225,8 +225,18 @@ module AceMQ
         CONFIRMED = "confirmed"
         # A publish the broker accepted and could route nowhere.
         UNROUTABLE = "unroutable"
-        # A publish that did not happen.
+        # A publish that may have been lost: the broker nacked it, the confirm
+        # never came, it could not be written, or the connection failed partway.
+        # The message may or may not be on the broker, which is what makes this
+        # the outcome worth alerting on.
         FAILED = "failed"
+        # A publish this library declined before writing anything: a
+        # {PublishingPausedError}, raised while the broker has blocked the
+        # connection or while the connection is being recovered. Nothing was
+        # sent, so nothing was lost and a retry cannot duplicate it. Kept apart
+        # from {FAILED} so a broker alarm does not read as message loss; the same
+        # word in all five libraries.
+        REFUSED = "refused"
 
         # The handler was happy.
         ACKED = "acked"
@@ -252,7 +262,7 @@ module AceMQ
         ENDED_EARLY = "ended_early"
 
         # Every word above, for a test that wants to check a tag is one of them.
-        ALL = [CONFIRMED, UNROUTABLE, FAILED, ACKED, RETRIED, DEAD_LETTERED,
+        ALL = [CONFIRMED, UNROUTABLE, FAILED, REFUSED, ACKED, RETRIED, DEAD_LETTERED,
                REJECTED, PARKED, ANSWERED, TIMED_OUT, PUBLISHED, COMPLETED,
                ENDED_EARLY].freeze
 
@@ -267,8 +277,10 @@ module AceMQ
         # can go through it, not only a {PublishError}.
         #
         # @param failure [Exception]
-        # @return [String] +unroutable+ or +failed+
+        # @return [String] +refused+, +unroutable+ or +failed+
         def self.of_publish_failure(failure)
+          return REFUSED if failure.is_a?(PublishingPausedError)
+
           failure.respond_to?(:unroutable?) && failure.unroutable? ? UNROUTABLE : FAILED
         end
       end

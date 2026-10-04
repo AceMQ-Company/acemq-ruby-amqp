@@ -117,6 +117,11 @@ module AceMQ
         # not a failure. Go and Python leave it out too, so a parked span reads
         # the same in all three. The parking queue still has to be looked at --
         # that is what +acemq.consume.total+ tagged +outcome=parked+ is for.
+        #
+        # +refused+ is absent for a different reason: it is not the word that
+        # makes a refused publish's span red, the exception is, recorded by
+        # {Scope#failed} with the cause in the description. Python's adapter
+        # does the same, and the set stays the same as Java's.
         FAILING_OUTCOMES = %w[unroutable failed dead_lettered].freeze
 
         # Runs before every other interceptor on the way in and after every

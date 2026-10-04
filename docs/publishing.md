@@ -120,7 +120,8 @@ separate thing an unbound exchange will do silently, and which the next section
 is about.
 
 Whatever the failure, `acemq.publish.total{outcome="failed"}` is counted before the
-interceptors are told, so a publish an interceptor refused is counted too. It
+interceptors are told — except a publish the library declined before writing
+anything, below, which is `outcome="refused"` because it cannot have been lost — so a publish an interceptor refused is counted too. It
 did not reach the broker, which is what the metric is about. See
 [metrics and health](observability.md).
 
@@ -190,7 +191,11 @@ end
 ```
 
 `PublishingPausedError` is a subclass of `PublishError`, so code that rescues
-`PublishError` keeps working and simply treats back pressure as before. The message
+`PublishError` keeps working and simply treats back pressure as before. It is
+counted as `acemq.publish.total{outcome="refused"}`, and the publish span says
+`refused`, so a broker alarm does not show up in the `failed` series that means a
+message may have been lost. A publish declined during a recovery is the same error
+and the same word. The message
 carries the broker's reason (`low on memory`, `low on disk space`). It is the
 counterpart of Go's `isPaused`, .NET's `ConnectionBlockedException` and Java's
 `PublishingPausedException`.

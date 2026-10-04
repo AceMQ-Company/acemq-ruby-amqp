@@ -70,6 +70,35 @@ RSpec.describe AceMQ::AMQP::Telemetry do
                      exchange: "", outcome: Telemetry::Outcome::CONFIRMED]).to eq(0)
     end
 
+    # Declined before anything was written -- a blocked broker, or a connection
+    # being recovered -- so nothing can have been lost, and counting it as
+    # `failed` makes a broker alarm read as message loss. The same word in all
+    # five libraries.
+    it "counts a publish the library declined to send as refused, not failed" do
+      allow(transport).to receive(:publish)
+        .and_raise(AceMQ::AMQP::PublishingPausedError, "the broker has blocked this connection")
+      expect { mq.publish({ "order_id" => "A-1" }, to: "orders.new") }
+        .to raise_error(AceMQ::AMQP::PublishingPausedError)
+
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::REFUSED]).to eq(1)
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::FAILED]).to eq(0)
+    end
+
+    it "counts every declined message of a batch as refused" do
+      allow(transport).to receive(:publish_all) do |messages|
+        messages.map { AceMQ::AMQP::PublishingPausedError.new("being recovered") }
+      end
+      expect { mq.publish_all([{ "a" => 1 }, { "a" => 2 }], to: "orders.new") }
+        .to raise_error(AceMQ::AMQP::PublishError)
+
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::REFUSED]).to eq(2)
+      expect(metrics[Telemetry::PUBLISH_TOTAL,
+                     exchange: "", outcome: Telemetry::Outcome::FAILED]).to eq(0)
+    end
+
     # The quietest failure AMQP has: the publish is confirmed, the consumer
     # waits, and nothing anywhere says why. Only a mandatory publish is told,
     # which is why the outcome is a different word from `failed` — an operator
