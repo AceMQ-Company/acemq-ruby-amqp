@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require "acemq/amqp"
+require "bunny"
 
 # What a reconnect does to the publishing ceiling.
 #
@@ -481,5 +482,146 @@ RSpec.describe AceMQ::AMQP::Transport, "the threads a replaced channel holds" do
     plain.channels.first.die!
 
     expect { transport.send(:publish_channel) { |c| c } }.not_to raise_error
+  end
+end
+
+# The seconds between the connection dying and bunny's recovery attempt starting.
+#
+# bunny marks the session disconnected the moment it notices the loss and then
+# sleeps +network_recovery_interval+ before it calls +before_recovery_attempt_starts+,
+# so for those five seconds the recovery guard above had not been told anything. A
+# publish in that window went to the channel, which still reads open, and bunny
+# refused it without writing a byte -- +ConnectionClosedError+ from +send_frameset+,
+# or +ChannelAlreadyClosed+ from +basic_publish+ -- and that came back as a plain
+# PublishError, counted +failed+: about 85 per recovery on the drill cluster, every
+# one of them a message that was certainly not sent.
+RSpec.describe AceMQ::AMQP::Transport, "between the loss and the recovery attempt" do
+  subject(:transport) { described_class.new(session) }
+
+  # A channel that writes nothing and says what was asked of it.
+  let(:channel) do
+    Class.new(StubChannel) do
+      attr_reader :published
+      attr_accessor :publish_error, :wait_error
+
+      def initialize
+        super
+        @published = 0
+      end
+
+      def basic_publish(*, **)
+        raise publish_error if publish_error
+
+        @published += 1
+      end
+
+      def next_publish_seq_no = @published + 1
+      def nacked_set = Set.new
+      # Every message written, when the wait broke: none of them was answered for.
+      def unconfirmed_set = wait_error ? Set.new(1..@published) : Set.new
+
+      def wait_for_confirms # rubocop:disable Naming/PredicateMethod -- bunny's name
+        raise wait_error if wait_error
+
+        true
+      end
+    end.new
+  end
+
+  # bunny's three states that matter here: open, lost and not yet recovering
+  # (+:disconnected+), and closed by the application.
+  let(:session) do
+    Class.new do
+      attr_accessor :state
+
+      def initialize(channel)
+        @channel = channel
+        @state = :open
+      end
+
+      def open? = state == :open
+      def closed? = state == :closed
+      def create_channel(*) = @channel
+      def close = nil
+      def before_recovery_attempt_starts(&block) = @on_start = block
+      def after_recovery_completed(&block) = @on_recovered = block
+    end.new(channel)
+  end
+
+  let(:batch) do
+    [{ exchange: "x", routing_key: "a", body: "1", message_id: "m-1" },
+     { exchange: "x", routing_key: "b", body: "2", message_id: "m-2" }]
+  end
+
+  def publish = transport.publish(exchange: "x", routing_key: "k", body: "b", message_id: "m-1")
+
+  it "declines a publish on a lost connection before writing anything" do
+    transport
+    session.state = :disconnected
+
+    expect { publish }.to raise_error(AceMQ::AMQP::PublishingPausedError, /m-1.*was not sent/m)
+    expect(channel.published).to eq(0)
+  end
+
+  it "answers every message of a batch as declined on a lost connection" do
+    transport
+    session.state = :disconnected
+
+    expect(transport.publish_all(batch)).to all(be_a(AceMQ::AMQP::PublishingPausedError))
+    expect(channel.published).to eq(0)
+  end
+
+  # A connection the application closed is not coming back, so it is not
+  # "waiting to be recovered": the guard leaves it to the channel, and whatever
+  # bunny does with a closed connection is what the caller hears, as before.
+  it "does not refuse up front on a connection closed on purpose" do
+    transport
+    session.state = :closed
+
+    expect(publish).to eq("m-1")
+    expect(channel.published).to eq(1)
+  end
+
+  # The check above is made before the channel is touched, and the connection can
+  # die after it. bunny's two refusals are both raised before the frame reaches
+  # the socket, so they mean the same thing the check does.
+  [Bunny::ConnectionClosedError.new("frame"),
+   Bunny::ChannelAlreadyClosed.new("cannot use a closed channel!", nil)].each do |error|
+    name = error.class.name.split("::").last
+
+    it "counts bunny's #{name} from basic_publish as declined" do
+      channel.publish_error = error
+
+      expect { publish }.to raise_error(AceMQ::AMQP::PublishingPausedError, /m-1.*closed/m)
+    end
+
+    it "answers a batch message bunny's #{name} refused as declined" do
+      channel.publish_error = error
+
+      results = transport.publish_all(batch)
+      expect(results).to all(be_a(AceMQ::AMQP::PublishingPausedError))
+      expect(results.map(&:message)).to all(match(/closed/))
+    end
+
+    # The same exception from the wait comes after the message was written, so
+    # whether it arrived is unknown: that is a failure, never a refusal.
+    it "keeps a #{name} after the write a failure" do
+      channel.wait_error = error
+
+      expect { publish }.to raise_error(AceMQ::AMQP::PublishError) { |e|
+        expect(e).not_to be_a(AceMQ::AMQP::PublishingPausedError)
+      }
+      expect(transport.publish_all(batch)).to all(satisfy { |r|
+        r.is_a?(AceMQ::AMQP::PublishError) && !r.is_a?(AceMQ::AMQP::PublishingPausedError)
+      })
+    end
+  end
+
+  it "keeps any other publish failure a failure" do
+    channel.publish_error = IOError.new("broken pipe")
+
+    expect { publish }.to raise_error(AceMQ::AMQP::PublishError) { |e|
+      expect(e).not_to be_a(AceMQ::AMQP::PublishingPausedError)
+    }
   end
 end

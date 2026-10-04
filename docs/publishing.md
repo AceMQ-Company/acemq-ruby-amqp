@@ -145,13 +145,28 @@ refuse the message; it closes the whole connection, which would undo the recover
 in progress and start another one.
 
 So publishing is refused for the length of the window and the message is not
-sent. The window is longer than it sounds: bunny with a single broker address
-sleeps `network_recovery_interval` (5s by default) before the attempt, finds its
-address list used up, and sleeps it again before reconnecting, so a forced close
-measured on the drill cluster refused publishes for about 5s and had the
-connection back about 10s after the loss. Retry with a back-off: by the time a
-retry lands the channels are back. `publish` raises `PublishError` as it does for
-any other failure, so code that already retries needs no change.
+sent. The window opens when bunny notices the loss, not when its recovery attempt
+starts: bunny first sleeps `network_recovery_interval` (5s by default), and a
+publish in those seconds is refused as well, with
+
+```
+the connection has been lost and is waiting to be recovered; this message was
+not sent, and a retry once the recovery completes will go down the recovered
+connection.
+```
+
+The window is longer than it sounds: bunny with a single broker address sleeps
+`network_recovery_interval` before the attempt, finds its address list used up,
+and sleeps it again before reconnecting, so a forced close measured on the drill
+cluster had the connection back about 10s after the loss. Retry with a back-off:
+by the time a retry lands the channels are back. Both refusals are a
+`PublishingPausedError` -- a `PublishError`, so code that already retries needs no
+change -- and both count as `refused`, never `failed`. So does a publish bunny
+itself would not write because the connection closed between the check and the
+write (`Bunny::ConnectionClosedError` or `Bunny::ChannelAlreadyClosed` from
+`basic_publish`): nothing reached the socket. Up to 0.7.7 the seconds before the
+attempt went to bunny that way and came back as a plain `PublishError`, counted
+`failed` -- about 85 per recovery on the drill cluster, every one unsent.
 
 A publish that was *waiting for its confirm* when the connection dropped is a
 different case: the message was written and nothing answered for it, so it may

@@ -100,6 +100,24 @@ module AceMQ
                       "was not sent. This is broker capacity, not this message: send it " \
                       "again once the block clears.")
       end
+
+      # bunny's refusals that are raised before a frame reaches the socket:
+      # +ConnectionClosedError+ from +send_frame+/+send_frameset+, which check
+      # +open?+ and raise instead of writing, and +ChannelAlreadyClosed+ from
+      # the first line of +basic_publish+. The same in bunny 2.24 and 3.x. By
+      # name, because bunny is loaded lazily and this file must load without it.
+      # Only ever asked of +basic_publish+: the same classes out of
+      # +wait_for_confirms+ come after the write.
+      UNSENT = %w[Bunny::ConnectionClosedError Bunny::ChannelAlreadyClosed].freeze
+
+      def unsent?(error) = UNSENT.include?(error.class.name)
+
+      def unsent(message_id, exchange, routing_key, error)
+        not_published(message_id, exchange, routing_key,
+                      "bunny would not write it because the connection or channel is " \
+                      "closed (#{error.class.name}), so the message was not sent. Send it " \
+                      "again once the connection is recovered.")
+      end
     end
 
     # How many messages may be on the wire with no confirm back yet.
@@ -643,10 +661,13 @@ module AceMQ
         # goes straight back — the same place Java releases it when
         # basicPublish throws.
         permits.release(1)
-        @results[index] = PublishError.new(
-          PublishFailure.not_published(message[:message_id], message[:exchange],
-                                       message[:routing_key], e.message)
-        )
+        where = message.values_at(:message_id, :exchange, :routing_key)
+        @results[index] =
+          if PublishFailure.unsent?(e)
+            PublishingPausedError.new(PublishFailure.unsent(*where, e))
+          else
+            PublishError.new(PublishFailure.not_published(*where, e.message))
+          end
       end
 
       # Every message from +from+ onwards, answered with the reason there was no
@@ -1387,15 +1408,39 @@ module AceMQ
       # Raised as PublishingPausedError because that is what it is: declined
       # before anything was written, and safe to retry. It was a bare
       # TransportError, which a load counted as a failed publish.
+      #
+      # The callback is not the start of the window, though. bunny marks the
+      # session lost the moment it notices, then sleeps +network_recovery_interval+
+      # before it calls +before_recovery_attempt_starts+. A publish in those
+      # seconds found the channel still reading open, and bunny refused the write
+      # itself -- unsent, but a plain PublishError, about 85 of them per recovery.
+      # So a session that is not open, and was not closed on purpose, is refused
+      # here too. A closed one is left to fail as it always has: it is not coming
+      # back, and "retry once it recovers" would be a lie.
       def refuse_while_recovering!(context = nil)
-        return unless @recovery_lock.synchronize { @recovering }
+        reason =
+          if @recovery_lock.synchronize { @recovering }
+            "the connection is being recovered and its channels are not open yet. " \
+              "Publishing now would be refused by the broker and would close the " \
+              "connection again; this message was not sent, and a retry once the " \
+              "recovery completes will go down the recovered connection."
+          elsif connection_lost?
+            "the connection has been lost and is waiting to be recovered; this message " \
+              "was not sent, and a retry once the recovery completes will go down the " \
+              "recovered connection."
+          end
+        return if reason.nil?
 
-        reason = "the connection is being recovered and its channels are not open yet. " \
-                 "Publishing now would be refused by the broker and would close the " \
-                 "connection again; this message was not sent, and a retry once the " \
-                 "recovery completes will go down the recovered connection."
         reason = PublishFailure.not_published(*context, reason) if context
         raise PublishingPausedError, reason
+      end
+
+      # Lost and not given up on: bunny's +:disconnected+ before its recovery
+      # attempt, or a socket that died before bunny noticed. Asked only of a
+      # session that can also say it was closed, so a double that cannot is
+      # never refused on a guess.
+      def connection_lost?
+        @session.respond_to?(:closed?) && !@session.open? && !@session.closed?
       end
 
       # Declines a publish on a connection the broker has blocked, before
@@ -1465,7 +1510,15 @@ module AceMQ
 
         outstanding = false
         begin
-          channel.basic_publish(body, exchange, routing_key, **properties)
+          begin
+            channel.basic_publish(body, exchange, routing_key, **properties)
+          rescue StandardError => e
+            raise unless PublishFailure.unsent?(e)
+
+            # Refused by bunny before the write: declined, not lost.
+            raise PublishingPausedError,
+                  PublishFailure.unsent(properties[:message_id], exchange, routing_key, e)
+          end
           outstanding = true
           confirmed = @confirms.wait(channel)
           outstanding = false

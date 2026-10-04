@@ -8,6 +8,20 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A publish in the seconds between a connection dying and bunny starting its
+  recovery attempt (one `network_recovery_interval`, 5s by default) is declined
+  with `PublishingPausedError` and counted `refused`. It used to reach bunny,
+  which refused to write it (`ConnectionClosedError` / `ChannelAlreadyClosed`),
+  and came back as a plain `PublishError` counted `failed` -- about 85 per
+  recovery on the drill cluster, none of them sent. The transport now refuses up
+  front when the session is lost and not closed on purpose, and treats those two
+  bunny errors from `basic_publish` as unsent, for `publish` and per message in
+  `publish_all`. The same errors from the confirm wait, after the message was
+  written, stay `failed`. Measured with forced closes on bunny 2.24 and 3.4: 86
+  `failed` per recovery before, 0 after, publishing and consuming both moving.
+
 ## [0.7.7] - 2026-10-04
 
 ### Added
