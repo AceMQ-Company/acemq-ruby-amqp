@@ -8,6 +8,27 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `Connection#close(timeout:)`, `Consumer#cancel(timeout:)` and
+  `Patterns::ConsumerGroup#close(timeout:)` keep their deadline against a real
+  broker. Cancelling the last consumer on a bunny channel waited for the busy
+  handler, up to bunny's sixty-second work-pool timeout, before the deadline was
+  consulted: `close(timeout: 0.5)` on a 3s handler took 3s and raised nothing,
+  `close(timeout: 0)` waited too, and a 63s handler gave 60.5s followed by a
+  `DrainTimeout` saying "within 0.5s". Subscription channels are now created with
+  no pool shutdown timeout, every consumer is stopped before any is waited for, and
+  one deadline covers all of them. Measured on the drill cluster: 0.50s for one
+  busy consumer and 0.51s for three, each raising `DrainTimeout` with the
+  messages back on the queue, on bunny 2.24 and 3.4.
+- A handler still running when the deadline expires runs to the end and its
+  outcome is discarded: no ack, retry, dead letter or park, because the broker
+  has already requeued the message. Before, a handler that outlived a
+  `Consumer#cancel` could dead-letter or retry a message the broker was also
+  redelivering.
+- Deliveries bunny had received but no handler had started are no longer started
+  once a drain begins; they go back to the broker with the channel.
+
 ## [0.7.5] - 2026-10-03
 
 ### Added

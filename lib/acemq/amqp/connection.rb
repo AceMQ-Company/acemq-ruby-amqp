@@ -90,11 +90,10 @@ module AceMQ
     module Drain
       # Stops every consumer, and says what was left when time ran out.
       #
-      # Each consumer is given whatever is left of the deadline, in the order
-      # they were started; one reached with nothing left is stopped without
-      # being waited for rather than starting a fresh wait of its own. That is
-      # the whole difference between a drain a process can be held to and one
-      # that is however many consumers there happen to be times thirty seconds.
+      # All of them share one deadline: nothing starts a fresh wait of its own.
+      # That is the whole difference between a drain a process can be held to
+      # and one that is however many consumers there happen to be times thirty
+      # seconds.
       #
       # Every consumer is stopped even when one of them refuses, and the caller
       # closes the connection either way. Stopping at the first failure would
@@ -105,35 +104,47 @@ module AceMQ
       # worth reporting about it, and a second one raised while asking would
       # bury the first.
       #
-      # Sequential rather than a thread per consumer. The deadline is what a
-      # shutdown is short of, and threads would shorten it only when several
-      # consumers are busy at once — at the price of that many +basic_cancel+
-      # calls down one bunny session while handlers on it are still publishing
-      # dead letters. One deadline is the fix for the bug; threads would be a
-      # second answer to the same question.
+      # Three passes rather than one cancel per consumer: every subscription is
+      # stopped first, then the handlers of all of them are waited for against
+      # the one deadline, then every subscription is released. Cancelling one
+      # consumer at a time left the later ones subscribed — and still being
+      # handed work that the deadline would then strand — while the earlier
+      # ones were being waited for.
       #
       # @param consumers [Array<Consumer>]
       # @param timeout [Numeric] seconds for all of them together
       # @return [Array(StandardError, nil, Hash{String => Integer})] the first
       #   failure, and what each queue still had in flight when time ran out
       def self.of(consumers, timeout)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-        failure = nil
+        deadline = now + timeout
+        failures = []
+        stopped = consumers.select { |consumer| attempt(failures) { consumer.stop } }
+        # Polled rather than signalled. A condition variable would be tidier and
+        # would mean holding a lock across a handler that may be waiting on a
+        # database, which is how a shutdown turns into a deadlock.
+        sleep(0.01) while stopped.any? { |c| c.in_flight.positive? } && now < deadline
         stranded = Hash.new(0)
-        consumers.each do |consumer|
-          left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          consumer.cancel(timeout: left.positive? ? left : 0)
-          # Asked after the cancel rather than before: what is in flight now is
-          # what the deadline did not wait for, which is the number an operator
-          # needs — those deliveries are unacknowledged and will come round
-          # again.
-          in_flight = consumer.in_flight
-          stranded[consumer.queue] += in_flight if in_flight.positive?
-        rescue StandardError => e
-          failure ||= e
+        stopped.each do |consumer|
+          # What was still running when the subscription was let go is what the
+          # deadline did not wait for, and the number an operator needs: those
+          # deliveries are unacknowledged and will come round again.
+          attempt(failures) { stranded[consumer.queue] += consumer.release }
         end
-        [failure, stranded]
+        [failures.first, stranded.reject { |_, count| count.zero? }]
       end
+
+      # Runs one step for one consumer, keeping its failure rather than letting
+      # it stop the steps for the others. True when it went through.
+      def self.attempt(failures)
+        yield
+        true
+      rescue StandardError => e
+        failures << e
+        false
+      end
+
+      def self.now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      private_class_method :attempt, :now
     end
 
     # A connection to a broker.
@@ -530,17 +541,18 @@ module AceMQ
       # consumers each given thirty seconds is four minutes, and four minutes
       # into a shutdown Kubernetes has long since sent SIGKILL — killing every
       # handler mid-flight and leaving everything it was holding unsettled,
-      # which is the exact outcome draining exists to avoid. One deadline,
-      # spent in the order the consumers were started: each gets whatever is
-      # left of it, and a consumer reached with nothing left is stopped without
-      # being waited for.
+      # which is the exact outcome draining exists to avoid. Every consumer is
+      # stopped at once, and then all of their handlers are waited for against
+      # the one deadline.
       #
-      # When the deadline expires with handlers still running, this stops the
-      # subscription anyway and raises {DrainTimeout} once the socket is shut.
+      # When the deadline expires with handlers still running, this closes
+      # their channels anyway and raises {DrainTimeout} once the socket is shut.
       # Nothing is lost — an unacknowledged delivery goes back to the broker and
       # is redelivered — but the drain did not do what it was asked, and saying
       # so is the honest answer. Reporting success would mean an operator whose
-      # grace period is too short never finds out.
+      # grace period is too short never finds out. The handlers themselves run
+      # on to the end and their outcome is discarded; {Consumer#cancel} says
+      # why.
       #
       # @param timeout [Numeric] seconds for the whole drain; see
       #   {DRAIN_TIMEOUT} for why twenty. Zero stops every consumer without
@@ -783,7 +795,7 @@ module AceMQ
         @ladder.declare(@transport)
         @subscription = @transport.subscribe(
           @queue, prefetch: prefetch, concurrency: concurrency, tag: tag, arguments: arguments
-        ) { |delivery| handle(delivery) }
+        ) { |delivery| handle(delivery) unless @stopped }
         self
       end
 
@@ -818,7 +830,10 @@ module AceMQ
         # written with — otherwise a header stamped on the way in would be there
         # for the handler and gone from the queue somebody has to look at.
         @interceptors.after_handle(context, ack)
-        settle(delivery, context.envelope, context.settlement)
+        # Not settled when the drain gave up on this handler: the channel is
+        # gone, the broker has the message back, and an ack would fail while a
+        # retry or a dead letter would publish a second copy. See {#cancel}.
+        settle(delivery, context.envelope, context.settlement) unless @released
       rescue DecodeError => e
         # A body that will not decode decodes no better next time, so it is
         # parked rather than retried. Parked and not dead-lettered: a message
@@ -846,18 +861,50 @@ module AceMQ
       # the broker redelivers it. {#in_flight} afterwards is how many that was,
       # and it is what {Connection#close} reports in its {DrainTimeout}.
       #
+      # **A handler still running at the deadline is left to finish, and its
+      # outcome is thrown away.** Ruby cannot stop a thread safely — +Thread#kill+
+      # in the middle of a database transaction is worse than anything it would
+      # save — so the thread runs on, as Java's +drain+ leaves it ("the consumer
+      # is still stopped, but something is still running"). Whatever it returns
+      # is not settled: no ack, no retry, no dead letter. The channel it came
+      # down is already closed, so the broker has requeued the message and will
+      # redeliver it; settling it as well would be the same message twice.
+      #
+      # Deliveries bunny had already received but no handler had started are not
+      # started at all once this is called. They go back with the channel.
+      #
       # @param timeout [Numeric] seconds to wait for in-flight handlers. Zero
       #   stops the consumer without waiting at all
       # @return [nil]
       def cancel(timeout: Connection::DRAIN_TIMEOUT)
-        @subscription&.stop
-        wait_for_handlers(timeout)
-        @subscription&.close
-        nil
+        failure, = Drain.of([self], timeout)
+        raise failure if failure
       end
 
       # How many messages this consumer is working on right now.
       def in_flight = @lock.synchronize { @in_flight }
+
+      # The first step of {#cancel}: no more deliveries, and none of those
+      # bunny has already received is started — they go back with the channel.
+      # Returns at once; bunny is not allowed to wait for a busy handler here,
+      # see {Transport#subscribe}.
+      #
+      # @api private
+      def stop
+        @stopped = true
+        @subscription&.stop
+      end
+
+      # The last step of {#cancel}: closes the channel, which hands every
+      # unsettled delivery back to the broker, and stops any handler still
+      # running from settling.
+      #
+      # @api private
+      # @return [Integer] how many handlers were still running
+      def release
+        @released = true
+        in_flight.tap { @subscription&.close }
+      end
 
       private
 
@@ -1181,15 +1228,6 @@ module AceMQ
       def leave
         @telemetry.gauge(Telemetry::CONSUME_IN_FLIGHT, @lock.synchronize { @in_flight -= 1 },
                          queue: @queue)
-      end
-
-      # Polled rather than signalled. A condition variable would be tidier and
-      # would also mean holding a lock across a handler that may be waiting on
-      # a database, which is how a shutdown turns into a deadlock.
-      def wait_for_handlers(timeout)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-        sleep(0.01) while in_flight.positive? &&
-                          Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
       end
     end
   end

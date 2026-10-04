@@ -140,7 +140,7 @@ story.
 ## Stopping
 
 ```ruby
-consumer.cancel                # stop delivery, wait up to 30s for handlers
+consumer.cancel                # stop delivery, wait up to 20s for handlers
 consumer.cancel(timeout: 5)
 consumer.running?              # is the subscription still open
 consumer.in_flight             # messages being worked on right now
@@ -164,7 +164,9 @@ by default, which fits inside Kubernetes' thirty-second grace period. A deadline
 spent per consumer would be multiplied by however many there are, which is no
 bound at all. When it expires with handlers still running, those consumers are
 stopped anyway and `DrainTimeout` is raised saying what was left unsettled for
-the broker to redeliver. See [shutdown](reliability.md#shutdown).
+the broker to redeliver. Those handlers are not killed: they run to the end and
+their outcome is discarded, so the message is redelivered rather than settled
+twice. See [shutdown](reliability.md#shutdown).
 
 A message being handled when a process is killed without any of this is not
 lost — it was never acknowledged, so the broker offers it again. It is just

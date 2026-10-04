@@ -979,7 +979,19 @@ module AceMQ
       # @yieldparam delivery [Delivery]
       # @return [Subscription]
       def subscribe(queue, prefetch: 20, concurrency: 1, tag: nil, arguments: {}, &handler)
-        channel = @session.create_channel(nil, concurrency)
+        # No shutdown timeout on the channel's work pool, and that +nil+ is what
+        # keeps a drain inside its deadline.
+        #
+        # Cancelling the last consumer on a bunny channel shuts its work pool down
+        # and, given a timeout, waits that long for a busy worker -- sixty seconds
+        # by default -- inside +basic_cancel+, before {Connection#close} has looked
+        # at its own deadline at all. Measured on 0.7.5: close(timeout: 0.5) on a
+        # 1.5s handler took 1.5s and raised nothing; on a 63s handler it took 60.5s
+        # and then said "within 0.5s". With +nil+ the pool is told to stop and the
+        # cancel returns, so the only wait left is the library's own, against one
+        # deadline. The fourth positional argument has meant this since bunny 2.x
+        # and still does in 3.4.
+        channel = @session.create_channel(nil, concurrency, false, nil)
         channel.prefetch(prefetch) if prefetch.positive?
         # A consumer tag of our own when the caller gives none, rather than leaving it
         # to the broker.

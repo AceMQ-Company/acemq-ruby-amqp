@@ -144,7 +144,7 @@ RSpec.describe "a drain" do
       # process that will not exit.
       first = mq.consume("orders.new") { AceMQ::AMQP::Ack.accept }
       second = mq.consume("orders.shipped") { AceMQ::AMQP::Ack.accept }
-      allow(first).to receive(:cancel).and_raise(AceMQ::AMQP::TransportError, "channel gone")
+      allow(first).to receive(:stop).and_raise(AceMQ::AMQP::TransportError, "channel gone")
 
       expect { mq.close(timeout: 0.1) }
         .to raise_error(AceMQ::AMQP::TransportError, /channel gone/)

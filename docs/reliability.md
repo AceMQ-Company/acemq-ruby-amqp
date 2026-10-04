@@ -412,12 +412,13 @@ same way, by the same code — a group is the one place several consumers are
 started at once, so a per-member wait would be multiplied by exactly the size
 configured.
 
-The deadline is spent in the order the consumers were started, each getting
-whatever is left of it. A consumer reached with nothing left is stopped without
-being waited for.
+Every consumer is stopped at once, and then all of their handlers are waited
+for against the one deadline. A delivery bunny had already received but no
+handler had started is not started once the drain begins; it goes back to the
+broker with the channel. `close(timeout: 0)` does not wait at all.
 
-**When the deadline expires with handlers still running**, `close` stops those
-consumers anyway, closes the socket, and then raises `DrainTimeout`:
+**When the deadline expires with handlers still running**, `close` closes those
+consumers' channels anyway, closes the socket, and then raises `DrainTimeout`:
 
 ```
 the drain did not finish within 20s: 3 deliveries were left unsettled
@@ -431,6 +432,22 @@ is the ordinary at-least-once case handlers should already be
 the drain did not finish, and it is raised rather than logged because an
 operator whose grace period is too short has no other way to find out. The error
 carries `stranded`, a count per queue, and the `timeout` that expired.
+
+**A handler still running at the deadline is not killed.** Ruby has no safe way
+to stop a thread — `Thread#kill` in the middle of a database transaction does
+more harm than the drain saves — so the handler runs on to the end, as Java's
+`drain` leaves it. Its outcome is thrown away: the message is not acknowledged,
+retried, dead-lettered or parked, because the broker already has it back and
+settling it as well would be the same message twice. A handler that never
+returns keeps its thread for as long as the process lives, which is one more
+reason to bound handler work by itself.
+
+Up to 0.7.5 none of this held against a real broker. Cancelling the last
+consumer on a bunny channel waited for the busy handler — up to bunny's
+sixty-second pool timeout — before the deadline was consulted, so
+`close(timeout: 0.5)` on a three-second handler took three seconds and raised
+nothing, and a handler longer than sixty seconds produced a `DrainTimeout` that
+named a deadline it had not kept.
 
 A message being handled when a process is killed outright is not lost. It was
 never acknowledged, so the broker offers it again — to this consumer or another

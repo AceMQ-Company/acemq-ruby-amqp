@@ -99,7 +99,7 @@ RSpec.describe AceMQ::AMQP::Patterns::ConsumerGroup do
     # Leaving the rest running after a failed shutdown is worse than the
     # failure, so the refusal is raised only once the others are down.
     group = described_class.new(mq, "orders.new", size: 3) { AceMQ::AMQP::Ack.accept }
-    allow(group.consumers[0]).to receive(:cancel).and_raise("the connection went away")
+    allow(group.consumers[0]).to receive(:stop).and_raise("the connection went away")
 
     expect { group.close }.to raise_error(/the connection went away/)
     expect(transport.instance_variable_get(:@subscribers)["orders.new"].size).to eq(1)
