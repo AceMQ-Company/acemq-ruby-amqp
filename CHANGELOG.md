@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-04
+
 ### Added
 
 - `acemq.publish.total` has a new `outcome`, `refused`, for a publish the library
