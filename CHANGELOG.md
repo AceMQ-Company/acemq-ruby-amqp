@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-04
+
 ### Fixed
 
 - A publish in the seconds between a connection dying and bunny starting its
