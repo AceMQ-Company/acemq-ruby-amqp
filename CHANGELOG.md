@@ -35,6 +35,8 @@ While the version is `0.x` the public API may change in any release.
   `Ack#in_progress?`, `Settlement::IN_PROGRESS`, `Telemetry::Outcome::IN_PROGRESS`
   and `Patterns.idempotent(..., in_progress_delay:)`. `Patterns.read_stream`
   dead-letters an `Ack.in_progress` rather than appending a copy to the stream.
+- `Codecs.build("text")`: the string codec answers to `text`, the name Java and
+  Python use, as well as `string`, so one `ACEMQ_CODEC` value works everywhere.
 
 ## [0.7.9] - 2026-10-04
 

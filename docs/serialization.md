@@ -333,7 +333,7 @@ at three in the morning.
 For choosing a codec by name from configuration:
 
 ```ruby
-Codecs.names                  # => ["bytes", "json", "string", "toml", "xml", "yaml"]
+Codecs.names                  # => ["bytes", "json", "string", "text", "toml", "xml", "yaml"]
 Codecs.build("json")          # => a new JSONCodec
 
 Codecs.register("msgpack") { MessagePackCodec.new }
@@ -341,7 +341,8 @@ Connection.open(url, codec: Codecs.build(ENV.fetch("MQ_CODEC", "json")))
 ```
 
 Those six names mean the same six things in Java and Go, so a deployment that
-sets `ACEMQ_CODEC` does not have to be rewritten per language.
+sets `ACEMQ_CODEC` does not have to be rewritten per language. `text` is the same
+codec as `string` — it is what Java and Python call it — so either name works.
 
 **`protobuf` and `avro` are deliberately not names.** Both codecs are built
 around a message type or a schema, a string in configuration cannot carry one,

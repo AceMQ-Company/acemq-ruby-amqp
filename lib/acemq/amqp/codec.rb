@@ -307,7 +307,8 @@ module AceMQ
     # The names are shared with the other libraries — +json+, +bytes+, +string+,
     # +yaml+, +toml+ and +xml+ mean the same six things in Go and Java — so a
     # deployment that sets ACEMQ_CODEC does not have to be rewritten per
-    # language.
+    # language. +text+ is the same codec as +string+: it is the name Java and
+    # Python give it, and one ACEMQ_CODEC value has to work in all of them.
     #
     # {ProtobufCodec} and {AvroCodec} are deliberately not here. Both are built
     # around a message type or a schema, a name in configuration cannot carry
@@ -359,6 +360,7 @@ module AceMQ
       register("json") { JSONCodec.new }
       register("bytes") { BytesCodec.new }
       register("string") { StringCodec.new }
+      register("text") { StringCodec.new }
       register("yaml") { YAMLCodec.new }
       register("toml") { TOMLCodec.new }
       register("xml") { XMLCodec.new }

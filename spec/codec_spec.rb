@@ -136,12 +136,12 @@ RSpec.describe AceMQ::AMQP::CompositeCodec do
 end
 
 RSpec.describe AceMQ::AMQP::Codecs do
-  it "knows the six names the other libraries know" do
+  it "knows the names the other libraries know" do
     # A deployment that names a format in configuration should not have to be
     # rewritten per language. Protobuf and Avro are not among them in any
     # library: both are built around a message type or a schema, and a name in
     # configuration cannot carry one.
-    expect(Codecs.names).to eq(%w[bytes json string toml xml yaml])
+    expect(Codecs.names).to eq(%w[bytes json string text toml xml yaml])
   end
 
   it "builds by name" do
@@ -150,10 +150,16 @@ RSpec.describe AceMQ::AMQP::Codecs do
     expect(Codecs.build("string")).to be_a(StringCodec)
   end
 
+  it "answers to text as well as string, the name Java and Python give the same codec" do
+    # One ACEMQ_CODEC value has to mean the same format in every library.
+    expect(Codecs.build("text")).to be_a(StringCodec)
+    expect(Codecs.build("text").content_type).to eq(Codecs.build("string").content_type)
+  end
+
   it "says what it does know when asked for something it does not" do
     expect do
       Codecs.build("msgpack")
-    end.to raise_error(ArgumentError, /known: bytes, json, string, toml, xml, yaml/)
+    end.to raise_error(ArgumentError, /known: bytes, json, string, text, toml, xml, yaml/)
   end
 
   it "lets a name be taken over, which is what makes a default overridable" do

@@ -111,7 +111,7 @@ ship, because a Java or Go service publishing one of those was until now a
 message this library could not decode:
 
 ```ruby
-Codecs.names   # => ["bytes", "json", "string", "toml", "xml", "yaml"]
+Codecs.names   # => ["bytes", "json", "string", "text", "toml", "xml", "yaml"]
 
 mq = Connection.open(url, codec: YAMLCodec.new)
 mq = Connection.open(url, codec: CompositeCodec.new(JSONCodec.new, YAMLCodec.new))
