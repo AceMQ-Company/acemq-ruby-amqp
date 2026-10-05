@@ -33,9 +33,15 @@ module AceMQ
       #   first_time?(key)  # records the key, true when it had not been seen
       #   forget(key)       # removes it, so a message that failed can be redone
       #
-      # and, optionally, a third:
+      # and, optionally, two more:
       #
       #   confirm(key)      # the work is done; start remembering it properly
+      #   claim(key)        # first_time? with a three-way answer, see {Claim}
+      #
+      # A store with +claim+ can tell work in progress from work done, and
+      # {Patterns.idempotent} puts the first back rather than accepting it. A
+      # store with only +first_time?+ cannot, and is treated as before: a repeat
+      # is a duplicate.
       #
       # +first_time?+ has to be atomic. Two consumers handed the same message at
       # the same moment must not both be told they are first, or the guard has
@@ -57,6 +63,17 @@ module AceMQ
       module IdempotencyStore
       end
 
+      # What a store found when it was asked to claim a message.
+      module Claim
+        # Nobody had it, or the last holder's lease had run out: ours to run.
+        CLAIMED = :claimed
+        # It was handled and confirmed. Accept it without running anything.
+        DUPLICATE = :duplicate
+        # Somebody holds a live claim and has not confirmed. Neither run it nor
+        # accept it: put it back and look again later.
+        IN_PROGRESS = :in_progress
+      end
+
       # An idempotency store that remembers keys in this process.
       #
       # Right behind one worker, and wrong the moment there are two: each has its
@@ -72,6 +89,9 @@ module AceMQ
         # How long a key is remembered when no window is given.
         DEFAULT_WINDOW = 3600.0
 
+        # The window is also the claim's lease: a key claimed and never
+        # confirmed is in progress until it ages out, and then it is free again.
+        #
         # @param window [Numeric] seconds to remember a key for. There has to be
         #   one: without it the map grows for as long as the process lives. Make
         #   it comfortably longer than the longest a message can take to stop
@@ -83,19 +103,34 @@ module AceMQ
           @lock = Mutex.new
         end
 
+        # Claims a key, or says why not: done already, or still being done.
+        #
+        # @param key [String]
+        # @return [Symbol] one of the {Claim} values
+        def claim(key)
+          key = key.to_s
+          @lock.synchronize do
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            sweep(now)
+            held = @seen[key]
+            next held[1] ? Claim::DUPLICATE : Claim::IN_PROGRESS if held
+
+            @seen[key] = [now, false]
+            Claim::CLAIMED
+          end
+        end
+
         # Records a key, and says whether it is new.
         #
         # @param key [String]
         # @return [Boolean] true the first time, false for every repeat
-        def first_time?(key)
-          key = key.to_s
-          @lock.synchronize do
-            sweep(Process.clock_gettime(Process::CLOCK_MONOTONIC))
-            next false if @seen.key?(key)
+        def first_time?(key) = claim(key) == Claim::CLAIMED
 
-            @seen[key] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            true
-          end
+        # Records that the claimed message really was handled, so a repeat is a
+        # duplicate rather than work in progress.
+        def confirm(key)
+          @lock.synchronize { @seen[key.to_s]&.[]=(1, true) }
+          nil
         end
 
         # Removes a key, so the message it belongs to can be handled again.
@@ -113,7 +148,7 @@ module AceMQ
         # Swept on the way past rather than on a timer, so the store owns no
         # thread and there is nothing to close.
         def sweep(now)
-          @seen.delete_if { |_, at| now - at > @window }
+          @seen.delete_if { |_, (at, _)| now - at > @window }
         end
       end
 
@@ -131,6 +166,15 @@ module AceMQ
       # message has been handled; dead-lettering it would raise an alarm about
       # something that went right.
       #
+      # A redelivery that finds the message **in progress** -- claimed by a
+      # handler that is still running, or by one that failed and could not
+      # release its claim -- is neither run nor accepted: it is answered with
+      # {Ack.in_progress}, which puts it back after +in_progress_delay+ without
+      # spending a retry attempt. Accepting it would lose the message if that
+      # claim never became a fact. A store with a +claim+ method (both shipped
+      # stores) is asked for this three-way answer; one with only +first_time?+
+      # cannot tell in progress from done and is treated as before.
+      #
       # When the handler does not accept, the key is forgotten so that the retry
       # can actually run. That ordering is the honest one — remembering a message
       # that then failed would mean its retry silently does nothing — and it is
@@ -145,8 +189,12 @@ module AceMQ
       #   Use it when the natural key is in the payload: an order identifier that
       #   two different messages both carry, where handling either one twice is
       #   the thing to prevent.
+      # @param in_progress_delay [Numeric] seconds a message found in progress
+      #   waits before it is looked at again. Keep it well under the store's
+      #   claim timeout
       # @return [Proc] a handler to pass to {Connection#consume}
-      def self.idempotent(store, key: nil, &handler)
+      def self.idempotent(store, key: nil, in_progress_delay: Ack::DEFAULT_IN_PROGRESS_DELAY,
+                          &handler)
         raise ArgumentError, "Patterns.idempotent needs a block to wrap" unless handler
 
         lambda do |message|
@@ -160,22 +208,36 @@ module AceMQ
                             ))
           end
 
-          run_once(store, seen_as, message, handler)
+          run_once(store, seen_as, message, in_progress_delay, handler)
         end
       end
 
       # @api private
-      def self.run_once(store, key, message, handler)
+      def self.run_once(store, key, message, in_progress_delay, handler)
         begin
-          first = store.first_time?(key)
+          claimed = claim(store, key)
         rescue StandardError => e
           # The store is what is broken, not the message. Retrying is right;
           # carrying on and risking a duplicate is what the store was for.
           return Ack.retry(e)
         end
-        return Ack.accept unless first
+        return Ack.accept if claimed == Claim::DUPLICATE
+        return Ack.in_progress(in_progress_delay) if claimed == Claim::IN_PROGRESS
 
         forgetting_on_failure(store, key) { handler.call(message) }
+      end
+
+      # Asks for the three-way answer, from a store that can give it.
+      #
+      # Asked rather than required for the same reason +confirm+ is: a store
+      # written against the two-method contract keeps working, and can only say
+      # claimed or duplicate.
+      #
+      # @api private
+      def self.claim(store, key)
+        return store.claim(key) if store.respond_to?(:claim)
+
+        store.first_time?(key) ? Claim::CLAIMED : Claim::DUPLICATE
       end
 
       # @api private
@@ -198,7 +260,7 @@ module AceMQ
         raise
       end
 
-      private_class_method :run_once, :forgetting_on_failure
+      private_class_method :run_once, :claim, :forgetting_on_failure
     end
   end
 end

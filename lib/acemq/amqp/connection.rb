@@ -1016,6 +1016,10 @@ module AceMQ
           return Settlement.rejected("rejected by the handler: #{describe(ack.error)}")
         end
         return Settlement.parked("parked by the handler: #{describe(ack.error)}") if ack.park?
+        # Somebody else holds the message. Not a failure of this one, so the
+        # retry policy is not asked: it can neither spend an attempt nor run out
+        # and dead-letter a message nobody has failed to handle.
+        return Settlement.in_progress(ack.delay) if ack.in_progress?
 
         if ack.error.is_a?(FatalError)
           # The handler asked for a retry but marked the reason as one that
@@ -1040,6 +1044,8 @@ module AceMQ
           park(delivery, envelope, settlement.reason)
         elsif settlement.dead_letters?
           dead_letter(delivery, envelope, settlement.reason)
+        elsif settlement.in_progress?
+          put_back(settlement.delay, delivery, envelope)
         else
           retry_after(settlement.delay, delivery, envelope)
         end
@@ -1103,6 +1109,29 @@ module AceMQ
         sleep(@retry_policy.jittered(delay)) if delay.positive?
         republish(@queue, delivery, envelope)
         delivery.ack
+      end
+
+      # Returns a message somebody else is working on, attempt unchanged.
+      #
+      # {#wait_here} without the increment: the attempt counts this message's
+      # failures, and a claim held elsewhere is not one of them. Mandatory, so a
+      # queue that has gone is an answer: the message is then handed back to the
+      # broker rather than acknowledged into nothing.
+      #
+      # Not put back when the drain gave up on this handler during the wait: the
+      # channel is gone and the broker already has the message back, so a copy
+      # would be the same message twice. See {#cancel}.
+      def put_back(delay, delivery, envelope)
+        sleep(delay) if delay.to_f.positive?
+        return if @released
+
+        begin
+          republish(@queue, delivery, envelope, mandatory: true)
+        rescue StandardError
+          delivery.nack(requeue: true)
+        else
+          delivery.ack
+        end
       end
 
       # A long delay, waited by the broker.

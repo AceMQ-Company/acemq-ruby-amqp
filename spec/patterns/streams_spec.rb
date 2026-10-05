@@ -137,6 +137,15 @@ RSpec.describe "streams" do
       expect(consumer.retry_policy.max_attempts).to eq(1)
     end
 
+    it "refuses to put a message back, which would append a second copy" do
+      AceMQ::AMQP::Patterns.read_stream(mq, "events") { AceMQ::AMQP::Ack.in_progress(0) }
+      mq.publish({ "n" => 1 }, to: "events")
+
+      expect(transport.published_to("events").size).to eq(1)
+      expect(transport.published_to("events.dlq").first.headers[AceMQ::AMQP::Headers::ERROR])
+        .to match(/stream events answered in_progress/)
+    end
+
     it "hands messages to the handler like any other consumer" do
       seen = []
       AceMQ::AMQP::Patterns.read_stream(mq, "events") do |message|

@@ -8,6 +8,34 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A redelivery that finds its idempotency claim still held is put back, not
+  acknowledged.** `Patterns.idempotent` used to treat a live but unconfirmed
+  claim as a duplicate and accept the message; if the first handler had failed
+  and its `forget` failed too, the message was lost. Now a confirmed claim is
+  still a duplicate (accepted, handler not run), an expired claim is still taken
+  over and run, and a **live unconfirmed** claim is *in progress*: the handler is
+  not run and the message goes back on its own queue after `in_progress_delay:`
+  (default five seconds) **with its attempt unchanged** — the retry policy is not
+  asked, so it spends no retry and is never dead-lettered for it. A put-back that
+  cannot be routed is requeued to the broker. Counted as
+  `acemq.consume.total{outcome="in_progress"}`; the span outcome is the same and
+  is not an error. The same contract in all five libraries.
+
+### Added
+
+- `Patterns::Claim` (`CLAIMED`, `DUPLICATE`, `IN_PROGRESS`) and `claim(key)` on
+  `SQLIdempotencyStore` and `InMemoryIdempotencyStore`; `first_time?` keeps its
+  signature and is `claim(key) == Claim::CLAIMED`. A custom store with only
+  `first_time?` still works, without the in-progress answer.
+  `InMemoryIdempotencyStore` gains `confirm`; its `window:` is also the claim's
+  lease.
+- `Ack.in_progress(delay = 5.0)`, `Ack::IN_PROGRESS`, `Ack#delay`,
+  `Ack#in_progress?`, `Settlement::IN_PROGRESS`, `Telemetry::Outcome::IN_PROGRESS`
+  and `Patterns.idempotent(..., in_progress_delay:)`. `Patterns.read_stream`
+  dead-letters an `Ack.in_progress` rather than appending a copy to the stream.
+
 ## [0.7.9] - 2026-10-04
 
 ### Fixed

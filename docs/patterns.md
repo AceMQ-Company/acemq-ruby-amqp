@@ -53,6 +53,32 @@ A handler that does not accept has its key **forgotten**, so its retry can
 actually run. Without that, the first failure would poison the key and every
 retry would be waved through as a duplicate.
 
+A redelivery that finds the message **in progress** — claimed, not yet
+confirmed, and the claim still live — is neither run nor accepted. Accepting it
+was how a message could be lost: if the first handler failed and its claim could
+not be released, the retry looked like a duplicate. Instead the wrapper answers
+`Ack.in_progress(delay)` and the consumer puts the message back on its own queue
+after `in_progress_delay:` (five seconds by default) **with its attempt
+unchanged**: it does not spend a retry, the retry policy is not asked, and it can
+never be dead-lettered for it. If the put-back cannot be routed the delivery is
+requeued to the broker instead. Once the claim is confirmed the next look is a
+duplicate; once its lease runs out the message is taken over and run. It shows as
+`outcome="in_progress"` on `acemq.consume.total` and on the span.
+
+| the store says | the wrapper |
+|---|---|
+| `Claim::CLAIMED` — no claim, or its lease ran out | runs the handler |
+| `Claim::DUPLICATE` — confirmed | `Ack.accept`, handler not run |
+| `Claim::IN_PROGRESS` — live, unconfirmed | `Ack.in_progress(in_progress_delay)`, handler not run |
+
+```ruby
+Patterns.idempotent(store, in_progress_delay: 2) { … }
+```
+
+A stream reader (`Patterns.read_stream`) cannot put a message back — that would
+append a second copy to the log — so it dead-letters an `Ack.in_progress` with
+the reason instead.
+
 `key:` takes the key from the payload instead of the message id, for when two
 different messages carry the same order and doing the order twice is the thing
 to prevent:
@@ -66,6 +92,13 @@ A store is anything answering `first_time?(key)` and `forget(key)`, and
 answers `confirm(key)` has it called after a handler accepts, which is what a
 store whose rows outlive the process needs; see
 [the idempotency store](#the-idempotency-store-a-hold-is-a-lease).
+
+Give your store `claim(key)` — returning `Claim::CLAIMED`, `Claim::DUPLICATE` or
+`Claim::IN_PROGRESS` — (and `confirm`) to get the three-way answer; both shipped
+stores have them, and their `first_time?` stays as `claim(key) == Claim::CLAIMED`.
+A store with only `first_time?` cannot tell work in progress from work done, and
+is treated as before. In `InMemoryIdempotencyStore` the `window:` is also the
+claim's lease.
 
 `InMemoryIdempotencyStore` is right behind one worker and wrong the moment there
 are two: each has its own memory, so both are told they are first. Its `window:`
@@ -971,7 +1004,7 @@ end
 | | |
 |---|---|
 | `Patterns::SQLOutboxStore` | `add`, `pending`, `mark_published`, `mark_failed`, `pending_count`, `purge_published` |
-| `Patterns::SQLIdempotencyStore` | `first_time?`, `confirm`, `forget`, `confirmed?`, `purge_expired` |
+| `Patterns::SQLIdempotencyStore` | `claim`, `first_time?`, `confirm`, `forget`, `confirmed?`, `purge_expired` |
 | `Patterns::SQLSchemaRegistry` | `register`, `by_id`, `latest`, `versions` |
 
 ### The connection is yours
@@ -1116,12 +1149,14 @@ That is why the store answers a third method. `Patterns.idempotent` calls
 
 ```
 first_time?(key)  # take it, under a lease
+claim(key)        # the same, answering CLAIMED, DUPLICATE or IN_PROGRESS
 confirm(key)      # the work is done: hold it for retention, not for the lease
 forget(key)       # the work failed: give the hold up so a retry can run
 ```
 
-A store with no `confirm` — the in-memory one — is simply never asked, because a
-crash wipes it and a key it holds is a key somebody is working on now.
+A store with no `confirm` is simply never asked. The in-memory one has one now,
+so that a repeat of finished work is a duplicate and a repeat of unfinished work
+is in progress.
 Confirmations are kept for `retention:` and then forgotten; a duplicate arriving
 later than that is handled again. Schedule `purge_expired` — hourly is ample.
 Nothing on the message path deletes anything, because a store that tidies up on

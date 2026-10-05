@@ -39,14 +39,22 @@ and `redelivered?` for "might I have half-done this already".
 
 ## What a handler returns
 
-An `Ack`, and it has to be one of four:
+An `Ack`, and it has to be one of these:
 
 ```ruby
 Ack.accept                         # done
 Ack.retry("the warehouse said no") # try again, if the policy allows
 Ack.reject("no such SKU")          # never going to work; dead-letter it
 Ack.park("schema version 9")       # nothing here can read it; park it
+Ack.in_progress(5)                 # somebody else holds it; look again in 5 s
 ```
+
+`Ack.in_progress` is what `Patterns.idempotent` answers when another consumer
+holds a live claim on the message. The consumer waits the delay, puts the message
+back on its own queue **with the attempt unchanged** and acknowledges the
+original (or requeues it, when the put-back cannot be routed). The retry policy
+is not asked, so it is never dead-lettered for it. Counted as
+`acemq.consume.total{outcome="in_progress"}`.
 
 `Ack.park` puts the message in `{queue}.parked` rather than `{queue}.dlq`. Use it
 where the handler already knows the message is unreadable — a version this

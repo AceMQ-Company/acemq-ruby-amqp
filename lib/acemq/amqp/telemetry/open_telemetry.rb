@@ -426,6 +426,7 @@ module AceMQ
           return "acked" if ack.accept?
           return "rejected" if ack.reject?
           return "parked" if ack.park?
+          return "in_progress" if ack.in_progress?
           return "dead_lettered" if ack.error.is_a?(FatalError)
 
           "retried"

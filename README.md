@@ -824,6 +824,12 @@ been handled, and dead-lettering it would raise an alarm about something that
 went right. A handler that does not accept has its key forgotten, so its retry
 can actually run.
 
+A redelivery that finds the claim live but **unconfirmed** — somebody is still on
+it, or died without releasing it — is neither run nor accepted: it goes back on
+its own queue after `in_progress_delay:` (five seconds) with its attempt
+unchanged, and is never dead-lettered for it (`outcome="in_progress"`). A store
+answering `claim(key)` gives that three-way answer; both shipped stores do.
+
 `key:` takes the key from the payload instead of the message id, for when two
 different messages carry the same order and doing the order twice is the thing
 to prevent.

@@ -103,10 +103,15 @@ module AceMQ
       # Set aside in +{queue}.parked+ for somebody to look at: the body would
       # not decode, or the handler said the message cannot be read.
       PARKED = "parked"
+      # Put back on its own queue after {#delay} seconds, attempt unchanged,
+      # because another consumer holds a live idempotency claim on it. Not a
+      # retry and never a dead letter: nobody has failed to handle it yet.
+      IN_PROGRESS = "in_progress"
 
       # @return [String] one of the words above
       attr_reader :outcome
       # @return [Float, nil] seconds this message will wait, when it is a retry
+      #   or in progress
       attr_reader :delay
       # @return [String, nil] why, when it is not going round again
       attr_reader :reason
@@ -123,10 +128,12 @@ module AceMQ
       def self.retried(delay) = new(outcome: RETRIED, delay: delay)
       def self.dead_lettered(reason) = new(outcome: DEAD_LETTERED, reason: reason)
       def self.parked(reason) = new(outcome: PARKED, reason: reason)
+      def self.in_progress(delay) = new(outcome: IN_PROGRESS, delay: delay)
 
       def acked? = @outcome == ACKED
       def retried? = @outcome == RETRIED
       def parked? = @outcome == PARKED
+      def in_progress? = @outcome == IN_PROGRESS
 
       # Whether the message is going to the dead-letter queue, which a rejection
       # and a give-up both do. Parking is not one of them: it goes to a queue of

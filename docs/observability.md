@@ -72,7 +72,7 @@ which succeeded with the work which failed is a number about neither.
 
 ### The outcome tag is what the consumer decided
 
-`acked`, `retried`, `rejected`, `dead_lettered` and `parked` are the
+`acked`, `retried`, `rejected`, `dead_lettered`, `parked` and `in_progress` are the
 [`Settlement`](interceptors.md#the-settlement) outcomes, and **exactly one
 `acemq.consume.total` series goes up per delivery**. The tag is read off the same
 decision the span's `messaging.acemq.outcome` attribute is read off, so a delivery
@@ -90,6 +90,11 @@ retry rate included messages that were never retried.
 a handler answered with `Ack.park`. Both go to `{queue}.parked`, and both are kept
 apart from `dead_lettered` on purpose — a message that failed five times and a
 message nothing can read are two different problems with two different fixes.
+
+`in_progress` is a message put back on its own queue because another consumer
+holds a live, unconfirmed idempotency claim on it (`Ack.in_progress`, answered by
+`Patterns.idempotent`). Its attempt is unchanged, so it is counted under neither
+`retried.total` nor `dead.lettered.total`, and its span is not an error.
 
 `acemq.messages.retried.total` and `acemq.messages.dead.lettered.total` count the
 same deliveries as those two tag values, under a name of their own. They are

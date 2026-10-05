@@ -172,9 +172,28 @@ module AceMQ
           stream, prefetch: prefetch, tag: name,
                   retry_policy: options.delete(:retry_policy) || RetryPolicy.none,
                   arguments: { "x-stream-offset" => offset.to_argument },
-                  **options, &handler
+                  **options, &refusing_put_back(stream, handler)
         )
       end
+
+      # A stream cannot put a message back: republishing appends a second copy
+      # to the log for every reader. So {Ack.in_progress} -- what
+      # {Patterns.idempotent} answers for a claim held elsewhere -- is refused
+      # here and dead-lettered with the reason, rather than duplicated.
+      #
+      # @api private
+      def self.refusing_put_back(stream, handler)
+        lambda do |message|
+          ack = handler.call(message)
+          next ack unless ack.is_a?(Ack) && ack.in_progress?
+
+          Ack.reject(FatalError.new(
+                       "a handler reading the stream #{stream} answered in_progress for " \
+                       "#{message.id}, and a stream cannot put a message back"
+                     ))
+        end
+      end
+      private_class_method :refusing_put_back
 
       # A duration as RabbitMQ wants it: a number with a unit suffix rather than
       # a bare number of anything.

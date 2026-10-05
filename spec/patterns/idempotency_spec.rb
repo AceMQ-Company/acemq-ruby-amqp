@@ -54,6 +54,24 @@ RSpec.describe AceMQ::AMQP::Patterns do
       expect(store.first_time?("k")).to be(true)
       expect(store.size).to eq(1)
     end
+
+    it "tells a claim still being worked on from one that was confirmed" do
+      store = Patterns::InMemoryIdempotencyStore.new
+
+      expect(store.claim("k")).to eq(Patterns::Claim::CLAIMED)
+      expect(store.claim("k")).to eq(Patterns::Claim::IN_PROGRESS)
+      store.confirm("k")
+      expect(store.claim("k")).to eq(Patterns::Claim::DUPLICATE)
+      expect(store.first_time?("k")).to be(false)
+    end
+
+    it "frees an unconfirmed claim once the window, its lease, has passed" do
+      store = Patterns::InMemoryIdempotencyStore.new(window: 0.05)
+      store.claim("k")
+      sleep(0.08)
+
+      expect(store.claim("k")).to eq(Patterns::Claim::CLAIMED)
+    end
   end
 
   describe "idempotent" do
@@ -146,6 +164,58 @@ RSpec.describe AceMQ::AMQP::Patterns do
 
       expect(ack).to be_reject
       expect(ack.error).to be_a(AceMQ::AMQP::FatalError)
+    end
+
+    describe "a redelivery that finds the claim live and unconfirmed" do
+      # The first handler died and could not release its claim. Accepting the
+      # redelivery as a duplicate lost the message; it is in progress instead.
+      let(:sticky) do
+        Class.new(Patterns::InMemoryIdempotencyStore) do
+          def forget(_key) = raise("the store is not answering")
+        end.new
+      end
+
+      it "neither runs the handler nor accepts it, but puts it back" do
+        runs = 0
+        handler = Patterns.idempotent(sticky) do
+          runs += 1
+          raise "died mid-work" if runs == 1
+
+          AceMQ::AMQP::Ack.accept
+        end
+
+        expect { handler.call(message) }.to raise_error(/not answering/)
+        ack = handler.call(message)
+
+        expect(ack).to be_in_progress
+        expect(ack.delay).to eq(AceMQ::AMQP::Ack::DEFAULT_IN_PROGRESS_DELAY)
+        expect(runs).to eq(1)
+      end
+
+      it "waits as long as it is told to" do
+        store.claim("msg-1")
+        ack = Patterns.idempotent(store, in_progress_delay: 0.2) { AceMQ::AMQP::Ack.accept }
+                      .call(message)
+
+        expect(ack).to be_in_progress
+        expect(ack.delay).to eq(0.2)
+      end
+
+      it "still accepts a confirmed one as a duplicate" do
+        store.claim("msg-1")
+        store.confirm("msg-1")
+
+        expect(Patterns.idempotent(store) { raise "must not run" }.call(message)).to be_accept
+      end
+
+      it "answers a store that only knows first_time? as before" do
+        old = Class.new do
+          def first_time?(_key) = false
+          def forget(_key) = nil
+        end.new
+
+        expect(Patterns.idempotent(old) { raise "must not run" }.call(message)).to be_accept
+      end
     end
 
     it "is still an ordinary handler, so the consumer around it is unchanged" do

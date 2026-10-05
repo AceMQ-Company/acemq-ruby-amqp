@@ -28,12 +28,21 @@ module AceMQ
       RETRY = :retry
       REJECT = :reject
       PARK = :park
+      IN_PROGRESS = :in_progress
+
+      # Seconds a message found in progress waits before it is looked at again.
+      DEFAULT_IN_PROGRESS_DELAY = 5.0
 
       attr_reader :action, :error
 
-      def initialize(action, error = nil)
+      # @return [Float, nil] seconds to wait before the message is looked at
+      #   again; read for {IN_PROGRESS} only, a retry's wait is the policy's
+      attr_reader :delay
+
+      def initialize(action, error = nil, delay: nil)
         @action = action
         @error = error
+        @delay = delay
         freeze
       end
 
@@ -82,10 +91,31 @@ module AceMQ
         new(PARK, reason)
       end
 
+      # Puts the message back because somebody else is still working on it.
+      #
+      # What {Patterns.idempotent} answers when a redelivery finds a claim that
+      # is live but not yet confirmed. Accepting it would lose the message if
+      # that other handler then died; running it would do the work twice. So it
+      # goes back on its own queue after +delay+ seconds with its attempt
+      # **unchanged**: a claim held elsewhere says nothing about whether this
+      # message can be handled, so it neither spends a retry nor can exhaust the
+      # policy and be dead-lettered. When the claim is confirmed the next look
+      # is a duplicate and is accepted; when its lease runs out, it is taken
+      # over.
+      #
+      # The wait is spent in the consumer, holding the delivery, as a short
+      # retry's is; keep it short beside the store's claim timeout.
+      #
+      # @param delay [Numeric] seconds until the message is looked at again
+      def self.in_progress(delay = DEFAULT_IN_PROGRESS_DELAY)
+        new(IN_PROGRESS, delay: delay.to_f)
+      end
+
       def accept? = action == ACCEPT
       def retry? = action == RETRY
       def reject? = action == REJECT
       def park? = action == PARK
+      def in_progress? = action == IN_PROGRESS
 
       def to_s = action.to_s
 

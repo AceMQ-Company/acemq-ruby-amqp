@@ -48,6 +48,12 @@ Metrics/ModuleLength:
 Metrics/ClassLength:
   Max: 200
   Exclude:
+    # Consumer is the whole settle path -- accept, retry here or in a rung,
+    # dead-letter, park, and put back a message another consumer holds -- and
+    # each is a handful of lines that has to see the same delivery, envelope
+    # and telemetry. Splitting it to score under 200 would put half of one
+    # decision in each half.
+    - lib/acemq/amqp/connection.rb
     # The TOML reader is a grammar, not a class that grew. It is long because
     # TOML has four kinds of date, three kinds of string and four bases for an
     # integer, and every method in it is a production of that grammar. Splitting

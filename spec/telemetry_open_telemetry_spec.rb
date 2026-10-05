@@ -237,6 +237,15 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
       expect(span.status.code).to eq(OpenTelemetry::Trace::Status::UNSET)
     end
 
+    # Another consumer holds its idempotency claim. Nothing has failed.
+    it "calls a message put back for a claim held elsewhere in_progress, not an error" do
+      span = handled { |_m| AceMQ::AMQP::Ack.in_progress(0) }
+
+      expect(span.attributes["messaging.acemq.outcome"]).to eq("in_progress")
+      expect(span.status.code).to eq(OpenTelemetry::Trace::Status::UNSET)
+      expect(described_class.outcome_of(AceMQ::AMQP::Ack.in_progress)).to eq("in_progress")
+    end
+
     # A message that will be tried again has not failed yet. Marking it as an
     # error is how a trace view fills with red and stops meaning anything.
     it "calls a retry retried, and does not call it an error either" do

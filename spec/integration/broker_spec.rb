@@ -764,6 +764,35 @@ RSpec.describe "against a real broker", :integration do
       expect(db.execute("SELECT typeof(message_id) FROM acemq_idempotency").flatten)
         .to eq(["text"])
     end
+
+    # The handler dies mid-work and its claim cannot be released. The retry
+    # finds the claim live and unconfirmed: it used to be acknowledged as a
+    # duplicate, losing the message. Now it is put back, without spending an
+    # attempt, until the lease runs out -- and then it is handled, once.
+    it "handles a message whose first handler died holding the claim, exactly once, later" do
+      sticky = Class.new(AceMQ::AMQP::Patterns::SQLIdempotencyStore) do
+        def forget(_key) = raise("the store is not answering")
+      end.new(connection: db, claim_timeout: 2)
+      store.create_schema
+      attempts = []
+      # Two attempts in all: anything that spent one on the in-progress wait
+      # would dead-letter the message instead of handling it.
+      mq.consume(queue, retry_policy: AceMQ::AMQP::RetryPolicy.fixed(2, 0),
+                 &AceMQ::AMQP::Patterns.idempotent(sticky, in_progress_delay: 0.2) do |m|
+                   attempts << m.attempt
+                   raise "died mid-work" if attempts.size == 1
+
+                   AceMQ::AMQP::Ack.accept
+                 end)
+
+      sent = mq.publish({ "order_id" => "A-7" }, to: queue, type: "order.placed.v2")
+
+      expect(wait_for(seconds: 20) { sticky.confirmed?(sent.id) }).to be(true)
+      sleep 1
+      expect(attempts).to eq([1, 2])
+      expect(mq.message_count(AceMQ::AMQP::Naming.dead_letter_queue(queue))).to eq(0)
+      expect(wait_for { mq.message_count(queue).zero? }).to be(true)
+    end
   end
 
   describe "a request and its reply" do

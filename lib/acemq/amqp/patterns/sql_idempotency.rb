@@ -165,7 +165,20 @@ module AceMQ
         #
         # @param key [String]
         # @return [Boolean] true for the caller that may do the work
-        def first_time?(key)
+        def first_time?(key) = claim(key) == Claim::CLAIMED
+
+        # Claims a message, or says why not.
+        #
+        # {Claim::CLAIMED} when there was no row or its lease had run out;
+        # {Claim::DUPLICATE} when the row is confirmed; {Claim::IN_PROGRESS}
+        # when somebody holds a live, unconfirmed claim -- still working, or
+        # failed without releasing it. The difference between the last two is
+        # the difference between done and maybe-never-done, which is why
+        # {Patterns.idempotent} accepts one and puts the other back.
+        #
+        # @param key [String]
+        # @return [Symbol] one of the {Claim} values
+        def claim(key)
           # Every key that reaches a statement goes through SQL.key, and it is
           # not tidiness: a message id off the wire is ASCII-8BIT, sqlite3 binds
           # that as a blob, and SQLite never matches a blob against a text
@@ -175,14 +188,20 @@ module AceMQ
           # exists to prevent.
           key = SQL.key(key)
           now = Time.now.utc
-          return true if take(key, now)
+          return Claim::CLAIMED if take(key, now)
 
           # Somebody already has a row. Taking it over is allowed only if their
           # hold has run out, and the guard lives in the WHERE clause so that
           # the check and the take-over are one statement — a select followed by
           # an update would let two consumers both pass the check and both
           # conclude they had won.
-          taken_over?(key, now)
+          return Claim::CLAIMED if taken_over?(key, now)
+
+          # Only asked once the take-over lost, so it decides nothing about who
+          # runs. No row means it was released or purged between the two
+          # statements: in progress is the answer that cannot lose the message.
+          state = run("SELECT state FROM #{@table} WHERE message_id = ?", [key]).rows.dig(0, 0)
+          state == CONFIRMED ? Claim::DUPLICATE : Claim::IN_PROGRESS
         end
 
         # Records that the work is done, and starts the retention clock.

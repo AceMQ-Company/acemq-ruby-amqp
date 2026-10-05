@@ -350,6 +350,30 @@ RSpec.describe "the database-backed stores" do
       end
     end
 
+    describe "claim, the three-way answer" do
+      it "is claimed for the first, in progress while it is held, a duplicate once confirmed" do
+        other = described_class.new(connection: db)
+
+        expect(store.claim("m-40")).to eq(AceMQ::AMQP::Patterns::Claim::CLAIMED)
+        expect(other.claim("m-40")).to eq(AceMQ::AMQP::Patterns::Claim::IN_PROGRESS)
+        store.confirm("m-40")
+        expect(other.claim("m-40")).to eq(AceMQ::AMQP::Patterns::Claim::DUPLICATE)
+      end
+
+      it "is claimed again once the holder's lease has run out" do
+        died = described_class.new(connection: db, claim_timeout: 0.05)
+        died.claim("m-41")
+        sleep 0.1
+
+        expect(store.claim("m-41")).to eq(AceMQ::AMQP::Patterns::Claim::CLAIMED)
+      end
+
+      it "keeps first_time? a boolean" do
+        expect(store.first_time?("m-42")).to be(true)
+        expect(store.first_time?("m-42")).to be(false)
+      end
+    end
+
     describe "retention" do
       it "forgets a confirmation once its retention has run out" do
         brief = described_class.new(connection: db, retention: 0.05)

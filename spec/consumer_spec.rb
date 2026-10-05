@@ -450,6 +450,91 @@ RSpec.describe AceMQ::AMQP::Consumer do
     end
   end
 
+  # Somebody else holds a live idempotency claim on the message. That is not a
+  # failure of this message, so it must neither spend an attempt nor be
+  # dead-lettered for it: it goes back on its own queue, unchanged, after a wait.
+  describe "a message somebody else is still working on" do
+    it "puts it back on its own queue with the attempt unchanged, and acks the original" do
+      delivery, recorder = FakeDelivery.build(body: '{"id":"A-1"}',
+                                              headers: headers_for(attempt: 2))
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(5, 0)) { Ack.in_progress(0) }
+        .handle(delivery)
+
+      back = transport.published_to("orders.new")
+      expect(back.size).to eq(1)
+      expect(back.first.headers[Headers::ATTEMPT]).to eq(2)
+      expect(back.first.headers[Headers::ID]).to eq("msg-1")
+      expect(back.first.body).to eq('{"id":"A-1"}')
+      expect(recorder.acked?).to be(true)
+    end
+
+    it "is never dead-lettered for it, even on the last attempt" do
+      # RetryPolicy.none has no attempt to spend: a retry here is a dead letter.
+      delivery, recorder = FakeDelivery.build(headers: headers_for(attempt: 1))
+      consumer { Ack.in_progress(0) }.handle(delivery)
+
+      expect(transport.published_to("orders.new.dlq")).to be_empty
+      expect(transport.published_to("orders.new").size).to eq(1)
+      expect(recorder.acked?).to be(true)
+    end
+
+    it "waits the delay before putting it back" do
+      delivery, = FakeDelivery.build(headers: headers_for)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      consumer { Ack.in_progress(0.05) }.handle(delivery)
+
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be >= 0.05
+    end
+
+    it "hands it back to the broker when it cannot be put back" do
+      transport.unroutable!("orders.new")
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+      consumer { Ack.in_progress(0) }.handle(delivery)
+
+      expect(recorder.requeued?).to be(true)
+      expect(recorder.acked?).to be(false)
+    end
+
+    it "counts it as in_progress, and as neither a retry nor a dead letter" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(telemetry: metrics) { Ack.in_progress(0) }.handle(delivery)
+
+      queue = { queue: "orders.new" }
+      total = AceMQ::AMQP::Telemetry::CONSUME_TOTAL
+      expect(metrics[total, **queue, outcome: "in_progress"]).to eq(1)
+      expect(metrics[total, **queue, outcome: "retried"]).to eq(0)
+      expect(metrics[total, **queue, outcome: "dead_lettered"]).to eq(0)
+      expect(metrics[AceMQ::AMQP::Telemetry::RETRIED_TOTAL, **queue, outcome: "in_progress"])
+        .to eq(0)
+      expect(metrics[AceMQ::AMQP::Telemetry::DEAD_LETTERED_TOTAL, **queue,
+                     outcome: "in_progress"]).to eq(0)
+      expect(AceMQ::AMQP::Telemetry::Outcome::ALL).to include("in_progress")
+    end
+
+    it "tells the interceptors in_progress, with the delay" do
+      seen = []
+      watcher = Object.new
+      watcher.define_singleton_method(:after_handle) do |context, _ack|
+        seen << context.settlement
+      end
+      delivery, = FakeDelivery.build(headers: headers_for)
+      consumer(interceptors: AceMQ::AMQP::Interceptors.new.add_consume(watcher)) do
+        Ack.in_progress(0)
+      end.handle(delivery)
+
+      expect(seen.last.outcome).to eq(AceMQ::AMQP::Settlement::IN_PROGRESS)
+      expect(seen.last).to be_in_progress
+      expect(seen.last).not_to be_dead_letters
+      expect(seen.last.delay).to eq(0)
+    end
+
+    it "defaults the wait to five seconds" do
+      expect(Ack.in_progress.delay).to eq(5.0)
+      expect(Ack.in_progress).to be_in_progress
+    end
+  end
+
   # Republishing to the dead-letter or parking queue can itself fail — a queue
   # that was never declared is the usual reason. The message is rejected to the
   # broker rather than left unsettled: an unsettled delivery is redelivered for
