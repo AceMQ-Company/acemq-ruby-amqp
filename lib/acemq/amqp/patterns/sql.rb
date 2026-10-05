@@ -35,7 +35,7 @@ module AceMQ
       #
       #   run(sql, params)              # => Result
       #   placeholder(index)            # "?" or "$1", by driver
-      #   constraint_violation?(error)  # whether a raise means "somebody else won"
+      #   constraint_violation?(error)  # true for a duplicate key and nothing else
       #
       # {SQLite3Connection} and {PGConnection} are here because those are the two
       # this library is tested against. Wrapping a pool, a Sequel database or an
@@ -244,9 +244,16 @@ module AceMQ
           # SQLite numbers its parameters for you.
           def placeholder(_index) = "?"
 
+          # A duplicate key only. SQLite raises the same ConstraintException
+          # for NOT NULL, CHECK and a trigger's RAISE(ABORT), and reading those
+          # as "somebody else won" turns a write that never landed into a
+          # message acked unhandled. The extended code is not exposed by the
+          # gem, so the message is what tells them apart; a primary key and a
+          # unique index both read this way.
           def constraint_violation?(error)
             defined?(SQLite3::ConstraintException) &&
-              error.is_a?(SQLite3::ConstraintException)
+              error.is_a?(SQLite3::ConstraintException) &&
+              error.message.start_with?("UNIQUE constraint failed")
           end
 
           # Runs a block inside a transaction, rolling back if it raises.
@@ -277,12 +284,13 @@ module AceMQ
           def placeholder(index) = "$#{index}"
 
           def constraint_violation?(error)
-            # By SQLSTATE class rather than by class name: 23 is the integrity
-            # constraint violations, and the only constraints on these tables
-            # are their keys.
+            # By SQLSTATE rather than by class name, and 23505 exactly rather
+            # than the 23 class: NOT NULL, foreign key, CHECK and a trigger's
+            # RAISE all share the class, and none of them means the key is
+            # already taken.
             return false unless error.respond_to?(:result) && error.result
 
-            error.result.error_field(PG::PG_DIAG_SQLSTATE).to_s.start_with?("23")
+            error.result.error_field(PG::PG_DIAG_SQLSTATE) == "23505"
           end
 
           # pg yields the connection to the block and this seam does not, so the

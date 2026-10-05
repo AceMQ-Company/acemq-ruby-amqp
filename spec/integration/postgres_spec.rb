@@ -141,6 +141,23 @@ RSpec.describe "the database-backed stores against PostgreSQL", :postgres do
       expect(keys.first_time?("m-3")).to be(true)
     end
 
+    it "raises when the claim fails for any reason but a duplicate key" do
+      # 23502 shares SQLSTATE class 23 with a duplicate key, and reading the
+      # class rather than the code answered "already claimed" for a row that
+      # was never written.
+      db.exec(<<~SQL)
+        CREATE OR REPLACE FUNCTION #{PG_PREFIX}refuse() RETURNS trigger AS $$
+        BEGIN RAISE EXCEPTION 'refused' USING ERRCODE = 'not_null_violation'; END
+        $$ LANGUAGE plpgsql
+      SQL
+      db.exec("CREATE TRIGGER #{PG_PREFIX}refuse BEFORE INSERT ON #{PG_PREFIX}idempotency " \
+              "FOR EACH ROW EXECUTE FUNCTION #{PG_PREFIX}refuse()")
+
+      expect { keys.first_time?("m-6") }.to raise_error(PG::NotNullViolation)
+    ensure
+      db.exec("DROP FUNCTION IF EXISTS #{PG_PREFIX}refuse() CASCADE")
+    end
+
     it "holds a confirmation past the lease and a claim only until it expires" do
       brief = AceMQ::AMQP::Patterns::SQLIdempotencyStore.new(
         connection: db, claim_timeout: 0.05, table: "#{PG_PREFIX}idempotency"

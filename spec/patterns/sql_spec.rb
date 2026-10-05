@@ -63,6 +63,14 @@ RSpec.describe "the database-backed stores" do
       expect(store.pending_count).to eq(1)
     end
 
+    it "raises when the insert fails for any reason but a duplicate id" do
+      # Swallowed, this is a message the caller believes is queued and is not.
+      db.execute("CREATE TRIGGER refuse BEFORE INSERT ON acemq_outbox " \
+                 "BEGIN SELECT RAISE(ABORT, 'database is locked'); END")
+
+      expect { store.add(recorded) }.to raise_error(SQLite3::Exception, /locked/)
+    end
+
     describe "the guarantee the pattern exists for" do
       it "writes the message inside the caller's transaction" do
         # Visible to the connection that wrote it, before any commit. If it were
@@ -392,6 +400,34 @@ RSpec.describe "the database-backed stores" do
         handler.call(message(id: "m-13"))
 
         expect(store.first_time?("m-13")).to be(true)
+      end
+    end
+
+    # SQLite reports a trigger's RAISE(ABORT), a NOT NULL and a CHECK failure
+    # as the same SQLite3::ConstraintException a duplicate key raises. Reading
+    # every one of them as "somebody else has it" made a claim that never
+    # landed answer "already handled", and the consumer acked a message
+    # nothing had touched.
+    describe "a claim the database refused for some other reason" do
+      before do
+        db.execute("CREATE TRIGGER refuse BEFORE INSERT ON acemq_idempotency " \
+                   "BEGIN SELECT RAISE(ABORT, 'database is locked'); END")
+      end
+
+      it "raises instead of answering duplicate" do
+        expect { store.first_time?("m-30") }.to raise_error(SQLite3::Exception, /locked/)
+        expect(store.size).to eq(0)
+      end
+
+      it "is retried by the handler wrapper, not accepted" do
+        done = 0
+        handler = AceMQ::AMQP::Patterns.idempotent(store) do
+          done += 1
+          AceMQ::AMQP::Ack.accept
+        end
+
+        expect(handler.call(message(id: "m-31")).retry?).to be(true)
+        expect(done).to eq(0)
       end
     end
 

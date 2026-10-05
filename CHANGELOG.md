@@ -8,6 +8,19 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `SQLIdempotencyStore`, `SQLOutboxStore` and `SQLSchemaRegistry` read only a
+  duplicate key as "already there". Every other failed insert now raises.
+  Previously, on SQLite any `SQLite3::ConstraintException` (NOT NULL, CHECK, a
+  trigger's `RAISE(ABORT)`) and on PostgreSQL any SQLSTATE `23xxx` counted as a
+  duplicate. A claim that never landed then answered "already handled", so
+  `Patterns.idempotent` acked a message nothing had handled. An outbox `add`
+  that never landed returned as if the record were queued. Now SQLite matches
+  `UNIQUE constraint failed` and PostgreSQL matches `23505`. Anything else
+  propagates, and the handler wrapper returns `Ack.retry`. A custom connection's
+  `constraint_violation?` should be just as narrow.
+
 ## [0.7.8] - 2026-10-04
 
 ### Fixed
