@@ -10,6 +10,32 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **Every other place the library publishes for you and then treats the work as
+  done is mandatory too.** Each one published without `mandatory`, so a copy the
+  broker had nowhere to route was confirmed, dropped, and the original then
+  acknowledged or accepted: the message gone, with nothing reporting it. Now:
+  - **A retry** — onto the queue itself or into a rung. A rung deleted after the
+    consumer had seen it is forgotten, counted as `acemq.retry.rung.missing`, and
+    the wait happens in the consumer; a short retry the broker hands back is
+    handed back to the broker, attempt unchanged, rather than acknowledged.
+  - **A routing slip's hop to its next stop and `then_publish`'s next message.**
+    The step retries rather than accepting. `RoutingSlip#start` is the caller's
+    own publish and keeps its default.
+  - **The scheduler's hops between rungs and its final delivery.** A rung that
+    has gone hands the control message back to the broker rather than
+    acknowledging it; a due message whose target nothing is bound to goes back
+    into the one-second rung and is tried again, rather than being requeued to
+    the head of the control queue in a tight loop. `delivered` now counts a
+    delivery once it has gone, not before. `in` and `at` keep their default.
+  - **`replay`.** The original is left on the queue it was being recovered from
+    and the replay stops with `ReplayFailed`, rather than acknowledging the last
+    copy of a message the broker dropped.
+
+  A responder's reply stays non-mandatory on purpose: a reply queue that has gone
+  means the caller has gone, and the loss shows up as the requester's timeout.
+  The default `mandatory` for `Connection#publish` is unchanged. Verified
+  against RabbitMQ, where each of these fails without the change.
+
 - **The outbox relay no longer loses a record nothing is bound to.** It published
   without `mandatory`, so a record whose exchange had no matching binding was
   confirmed, dropped by the broker and then marked published: gone, with nothing

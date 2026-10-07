@@ -146,7 +146,9 @@ module AceMQ
           next Ack.accept if outgoing.nil?
 
           begin
-            connection.publish(outgoing, to: to, exchange: exchange,
+            # Mandatory, because accepting is what makes this hop final: a next
+            # message nothing is bound to is confirmed and dropped by the broker.
+            connection.publish(outgoing, to: to, exchange: exchange, mandatory: true,
                                          correlation_id: message.envelope.correlation_id,
                                          causation_id: message.envelope.id)
           rescue StandardError => e

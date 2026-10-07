@@ -268,11 +268,19 @@ error outcome — with the broker's own reply text as `messaging.acemq.reason`. 
 word is kept apart from `failed` because they are fixed in different places:
 `failed` is a broker or a network, `unroutable` is a binding nobody made.
 
-The consumer uses this on its own account. A message being set aside into
-`{queue}.dlq` or `{queue}.parked` is republished mandatory, so a dead-letter queue
-that is not on the broker is heard rather than silently swallowed by the default
-exchange — see
+The library uses this on its own account, everywhere it publishes for you and
+then treats the work as done: a retry, a message set aside into `{queue}.dlq` or
+`{queue}.parked`, the outbox relay, a routing slip's or `then_publish`'s hop to
+the next step, the scheduler's hops and final delivery, and `replay`. Each of
+those keeps the original — retried, handed back or left in place — when the
+broker had nowhere to put the copy, rather than acknowledging it into nothing. See
 [when a message cannot be set aside](reliability.md#when-a-message-cannot-be-set-aside-at-all).
+Your own `publish` keeps its default.
+
+The one exception is a responder's reply. It is not mandatory: a reply queue
+that has gone means the caller has gone, and retrying the request would only
+repeat the work for nobody. A reply lost that way shows up on the requester's
+side as a timeout.
 
 ## Publishing a batch
 

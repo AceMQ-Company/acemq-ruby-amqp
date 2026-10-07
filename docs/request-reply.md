@@ -219,6 +219,7 @@ it could:
 | returns a value | that value | accepted |
 | raises | `ResponderFailed` | rejected, and dead-lettered |
 | returns, but the reply will not publish | nothing — it times out | retried |
+| returns, but nothing is listening at `reply_to` | nothing — it times out | accepted |
 
 Raising sends the failure back before settling, because somebody blocked on a
 reply should learn that it failed rather than wait out their timeout. Then the
@@ -231,6 +232,13 @@ message is retried — and the work runs again. That is the concrete reason a
 responder that changes anything should be idempotent, and it is not hypothetical:
 a broker that drops a connection between the handler returning and the reply
 being confirmed produces exactly this.
+
+The fourth row is deliberate. The reply is not published `mandatory`, so a reply
+queue that has gone — a requester that timed out and closed, or restarted — is
+confirmed and dropped by the broker and the request is accepted. The only one
+who could use that reply is the caller who is no longer there, and retrying the
+request would repeat the work for nobody. It surfaces as a timeout on the
+requester's side, which is where it belongs.
 
 A request that names **no reply address at all** is rejected with a `FatalError`
 and dead-lettered rather than retried, because retrying cannot make a reply queue

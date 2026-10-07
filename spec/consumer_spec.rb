@@ -590,16 +590,53 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(recorder.rejected?).to be(true)
       expect(recorder.acked?).to be(false)
     end
+  end
 
-    it "leaves a retry alone: a rung is asked for by name, not by publishing at it" do
-      # Only the set-aside republish is mandatory. A retry has its own
-      # rung-missing path, and asking the broker the same question twice would
-      # buy nothing.
+  # A retry is a republish followed by an ack of the original, so a copy the
+  # broker dropped is a message gone. {#declared?} asks about a rung once and
+  # remembers the answer, and a rung deleted after that was published into
+  # without +mandatory+, confirmed, dropped and acknowledged.
+  describe "a retry whose queue is not there" do
+    it "publishes every retry mandatory" do
       delivery, = FakeDelivery.build(headers: headers_for)
       consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 0)) { Ack.retry }.handle(delivery)
+      rung, = FakeDelivery.build(headers: headers_for)
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 1), threshold: 0.5) { Ack.retry }
+        .handle(rung)
 
+      expect(transport.published.map(&:routing_key)).to eq(["orders.new",
+                                                            "orders.new.retry.1s"])
+      expect(transport.published.map(&:mandatory)).to all(be(true))
+    end
+
+    it "waits here instead when the rung has gone, and asks about it again next time" do
+      metrics = AceMQ::AMQP::Telemetry::Registry.new
+      transport.unroutable!("orders.new.retry.1s")
+      subject = consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 1), threshold: 0.5,
+                         telemetry: metrics) { Ack.retry }
+      allow(subject).to receive(:sleep)
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+      subject.handle(delivery)
+
+      expect(transport.published_to("orders.new.retry.1s")).to be_empty
       expect(transport.published_to("orders.new").size).to eq(1)
-      expect(transport.published.map(&:mandatory)).to all(be_falsey)
+      expect(transport.published_to("orders.new").first.headers[Headers::ATTEMPT]).to eq(2)
+      expect(recorder.acked?).to be(true)
+      expect(metrics[AceMQ::AMQP::Telemetry::RUNG_MISSING, queue: "orders.new"]).to eq(1)
+
+      # Forgotten, so a rung put back is used again rather than remembered gone
+      # or, worse, remembered there.
+      expect(transport).to receive(:queue_exists?).and_call_original
+      subject.handle(FakeDelivery.build(headers: headers_for).first)
+    end
+
+    it "hands it back to the broker rather than acking when its own queue has gone" do
+      transport.unroutable!("orders.new")
+      delivery, recorder = FakeDelivery.build(headers: headers_for)
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 0)) { Ack.retry }.handle(delivery)
+
+      expect(recorder.acked?).to be(false)
+      expect(recorder.requeued?).to be(true)
     end
   end
 

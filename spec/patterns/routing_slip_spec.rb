@@ -203,6 +203,19 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
       expect(ack.error).to match(/validate is done for message .* but the next step did not go/)
     end
 
+    # Accepting is what makes the hop final, so a next stop the broker
+    # confirmed and dropped would be a message that is now nowhere.
+    it "retries the step when nothing is bound at the next stop" do
+      handler = AceMQ::AMQP::Patterns.follow_slip(mq, &:payload)
+      slip = described_class.new.step("", "validate", name: "validate")
+                            .step("billing", "charge", name: "charge")
+      ack = handler.call(carrying(slip, "validate"))
+
+      expect(transport.published.last.mandatory).to be(true)
+      expect(ack).to be_retry
+      expect(ack.error).to match(/nowhere to route/)
+    end
+
     it "lets a step's own failure reach the retry engine" do
       handler = AceMQ::AMQP::Patterns.follow_slip(mq) { raise "the card was declined" }
       message = AceMQ::AMQP::Message.new(
@@ -233,6 +246,9 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
   # a Java service declared.
   describe "a route Java wrote" do
     let(:pipeline) { AceMQ::AMQP::Patterns::Pipeline.new("orders", %w[validate charge ship]) }
+
+    # A hop to the next step is mandatory, so the steps have to be somewhere.
+    before { pipeline.topology.apply(mq) }
 
     # Exactly what a Java Pipeline puts on the wire, built from headers rather
     # than from this library's own writer — a test that produced the message
@@ -367,7 +383,8 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
 
     it "writes a JSON slip as the step-name form when asked to" do
       # The other direction: a route assembled here, handed to a pipeline the
-      # rest of which is declared elsewhere.
+      # rest of which is declared elsewhere. Applied, because the hop is mandatory.
+      pipeline.topology.apply(mq)
       handler = AceMQ::AMQP::Patterns.follow_slip(
         mq, pipeline: pipeline, write: described_class::ROUTE, &:payload
       )

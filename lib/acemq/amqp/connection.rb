@@ -1061,7 +1061,7 @@ module AceMQ
       def retry_after(delay, delivery, envelope)
         next_attempt = envelope.with(attempt: envelope.attempt + 1)
         rung = rung_for(delay)
-        return wait_in_broker(rung, delivery, next_attempt) if rung
+        return wait_in_broker(rung, delay, delivery, next_attempt) if rung
 
         wait_here(delay, delivery, next_attempt)
       end
@@ -1105,10 +1105,20 @@ module AceMQ
       # losing the process loses the wait — the broker redelivers at once. Both
       # are the honest cost of not spending a queue on a delay measured in
       # seconds.
+      #
+      # Mandatory, like every republish here, because the original is
+      # acknowledged as soon as the copy is confirmed: a copy the broker
+      # confirmed and dropped would be the message gone. One that will not go
+      # out is handed back to the broker instead, attempt unchanged.
       def wait_here(delay, delivery, envelope)
         sleep(@retry_policy.jittered(delay)) if delay.positive?
-        republish(@queue, delivery, envelope)
-        delivery.ack
+        begin
+          republish(@queue, delivery, envelope)
+        rescue StandardError
+          delivery.nack(requeue: true)
+        else
+          delivery.ack
+        end
       end
 
       # Returns a message somebody else is working on, attempt unchanged.
@@ -1126,7 +1136,7 @@ module AceMQ
         return if @released
 
         begin
-          republish(@queue, delivery, envelope, mandatory: true)
+          republish(@queue, delivery, envelope)
         rescue StandardError
           delivery.nack(requeue: true)
         else
@@ -1146,8 +1156,20 @@ module AceMQ
       # No jitter either, and none is wanted: each message's time-to-live starts
       # when it enters the rung, so a fleet that failed over ten seconds is
       # released over ten seconds without anybody arranging it.
-      def wait_in_broker(rung, delivery, envelope)
+      #
+      # Mandatory, because {#declared?} remembers a rung it has seen once and a
+      # rung deleted after that would otherwise take the message, confirm it,
+      # drop it and see the original acknowledged. Returned instead, the rung is
+      # forgotten, counted missing, and the wait happens here.
+      def wait_in_broker(rung, delay, delivery, envelope)
         republish(rung, delivery, envelope)
+      rescue PublishError => e
+        raise unless e.unroutable?
+
+        @lock.synchronize { @rungs_seen.delete(rung) }
+        @telemetry.count(Telemetry::RUNG_MISSING, 1, queue: @queue)
+        wait_here(delay, delivery, envelope)
+      else
         delivery.ack
       end
 
@@ -1210,7 +1232,7 @@ module AceMQ
       # in all three languages, so an alert written once reads the same against
       # them, and it is still the only sign this path leaves.
       def set_aside(target, delivery, envelope, reason)
-        republish(target, delivery, envelope.with(error: reason), mandatory: true)
+        republish(target, delivery, envelope.with(error: reason))
       rescue StandardError
         @telemetry.count(Telemetry::SET_ASIDE_FAILED, 1, queue: @queue, target: target)
         delivery.nack(requeue: false)
@@ -1226,14 +1248,14 @@ module AceMQ
       # or parked keeps the property saying where its answer was meant to go, so
       # a replay off the dead-letter queue can still answer whoever asked.
       #
-      # +mandatory+ only where the caller has somewhere to go when the queue is
-      # missing. A retry has {#declared?} and its own rung-missing path, and
-      # asking the broker the same question twice would buy nothing.
-      def republish(queue, delivery, envelope, mandatory: false)
+      # Always mandatory: every caller acknowledges the original once this
+      # returns, so a copy the broker confirmed and dropped would be a message
+      # gone with nothing saying so.
+      def republish(queue, delivery, envelope)
         @transport.publish(exchange: "", routing_key: queue, body: delivery.body,
                            content_type: delivery.content_type, message_id: envelope.id,
                            headers: envelope.to_headers(delivery.routing_key),
-                           persistent: true, reply_to: delivery.reply_to, mandatory: mandatory)
+                           persistent: true, reply_to: delivery.reply_to, mandatory: true)
       end
 
       def describe(error)

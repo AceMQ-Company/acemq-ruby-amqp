@@ -453,7 +453,10 @@ Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
 and `acemq-replay-count`, so a consumer that needs to treat them differently can
 and one that does not is unaffected. A message is acknowledged only after the
 broker has confirmed the new copy: a crash in that gap replays it twice, which
-is the right way round for a dead-letter queue.
+is the right way round for a dead-letter queue. The copy is published
+**mandatory**, so a destination nothing is bound to leaves the message where it
+was and stops the replay with `ReplayFailed`, rather than deleting the last copy
+of a message the broker had nowhere to put.
 
 `limit:` and `deadline:` both default to zero, meaning no limit — which, against
 a queue somebody is still writing to, may mean never stopping. Set one.
@@ -584,7 +587,10 @@ a message that changed under a handler is one nothing can reason about.
 
 The message is accepted only once the next one is out, so a failure to publish
 retries the step — which is why a step that changes anything should be
-[idempotent](#idempotency). A slip that will not parse is fatal rather than
+[idempotent](#idempotency). The hop to the next stop is published **mandatory**,
+so a next stop nothing is bound to is a failed publish and a retry, not a message
+the broker confirmed, dropped and this step then accepted. `start` is your own
+publish and keeps `publish`'s default. A slip that will not parse is fatal rather than
 retried: it will not parse next time either.
 
 Returning `nil` from the block ends the run there: nothing is published and the
@@ -805,6 +811,15 @@ ninety-second delay is one minute and then three tens. A one-day message costs
 twenty-four hops and a one-minute message costs one, which is the right way
 round — short delays are common and want to be cheap.
 
+Every hop the scheduler makes out of `acemq.schedule.due`, and the final
+delivery, is published **mandatory**, because the message that came out of the
+rung is acknowledged as soon as it has gone. A rung that has been deleted hands
+the message back to the control queue rather than acknowledging it into nothing.
+A due message whose target nothing is bound to yet goes back into the one-second
+rung and is tried again a second later, until something is bound — rather than
+requeued to the head of the control queue and handed straight back as fast as
+the broker can. `in` and `at` are your own publish and keep `publish`'s default.
+
 The cost is honest and worth stating: a long delay is several broker round trips
 rather than one, and delivery is accurate to about the smallest rung rather than
 to the second. A scheduler that must fire at 09:00:00.000 exactly is a
@@ -907,7 +922,9 @@ end)
 Returning `nil` publishes nothing and accepts the message, which is how a step
 says "this one does not continue" without inventing an empty message for the
 next service to work out how to ignore. The correlation goes forward and the
-causation records what produced what.
+causation records what produced what. The next message is published
+**mandatory** and the input is accepted only once it is out, so one nothing is
+bound to receive retries the input rather than being dropped by the broker.
 
 ## Schemas
 

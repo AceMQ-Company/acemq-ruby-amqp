@@ -374,7 +374,7 @@ module AceMQ
           headers = schedule_headers(delivery.headers)
           return drop(delivery) if headers.nil?
 
-          route(delivery.body, headers)
+          route(delivery.body, headers, mandatory: true)
           delivery.ack
         rescue StandardError
           # The broker would not take the next hop. Requeued rather than
@@ -404,28 +404,47 @@ module AceMQ
 
         # Delivers if it is due, and otherwise puts it in the largest rung that
         # does not overshoot.
-        def route(body, headers)
+        #
+        # +mandatory+ when a control message is acknowledged once this returns:
+        # a rung that has been deleted, or a target nothing is bound to, is
+        # confirmed and dropped by the broker, and the scheduled message would
+        # be gone with nothing saying so. {#in} and {#at} are the caller's own
+        # publish and keep the ordinary default.
+        def route(body, headers, mandatory: false)
           remaining = (headers[DUE_AT] / 1000.0) - Time.now.to_f
           # Due, or so nearly due that another hop would cost more than the
           # accuracy it buys.
-          return deliver(body, headers) if remaining < RUNGS.last
+          return deliver(body, headers, mandatory) if remaining < RUNGS.last
 
-          rung = RUNGS.find { |candidate| candidate <= remaining } || RUNGS.last
-          count(:hops)
+          hop(body, headers, RUNGS.find { |candidate| candidate <= remaining } || RUNGS.last,
+              mandatory)
+        end
+
+        def hop(body, headers, rung, mandatory)
           @connection.publish(body, to: self.class.rung_name(rung), exchange: EXCHANGE,
-                                    codec: @bytes, type: MESSAGE_TYPE, headers: headers)
+                                    codec: @bytes, type: MESSAGE_TYPE, headers: headers,
+                                    mandatory: mandatory)
+          count(:hops)
         end
 
         # The scheduler's own headers are not passed on: they are bookkeeping,
         # and a consumer that started depending on them would be depending on
         # how a message got to it.
-        def deliver(body, headers)
+        def deliver(body, headers, mandatory)
           content_type = headers[CONTENT_TYPE].to_s
           content_type = JSONCodec::CONTENT_TYPE if content_type.empty?
-          count(:delivered)
           @connection.publish(body, to: headers[TARGET_ROUTING_KEY].to_s,
                                     exchange: headers[TARGET_EXCHANGE].to_s,
-                                    codec: Verbatim.new(content_type), type: MESSAGE_TYPE)
+                                    codec: Verbatim.new(content_type), type: MESSAGE_TYPE,
+                                    mandatory: mandatory)
+          count(:delivered)
+        rescue PublishError => e
+          raise unless mandatory && e.unroutable?
+
+          # Nothing is bound at the target yet. Back into the smallest rung to be
+          # tried again in a second, rather than requeued to the head of the
+          # control queue and handed straight back as fast as the broker can.
+          hop(body, headers, RUNGS.last, mandatory)
         end
 
         # A message in the control queue that no scheduler put there.

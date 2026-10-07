@@ -189,6 +189,10 @@ module AceMQ
             body: delivery.body, content_type: delivery.content_type,
             message_id: envelope.id, headers: stamped(envelope, delivery.routing_key),
             persistent: true,
+            # Mandatory, because the original is acknowledged as soon as this
+            # returns: a destination nothing is bound to is confirmed and dropped
+            # by the broker, and the replay would delete the last copy there was.
+            mandatory: true,
             # A replayed request keeps the property saying where its answer was
             # meant to go, the same way the consumer's own republish does.
             reply_to: delivery.reply_to

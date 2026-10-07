@@ -179,9 +179,15 @@ turns a five-minute backoff into none. It is counted as
 that was never applied looks exactly like one that was until this happens.
 
 The check is one round trip per rung for the life of a consumer. A rung that
-exists does not stop existing, so the answer is remembered; a missing one is
-asked about again, so a topology applied while the consumer is running starts
-being used.
+exists is remembered; a missing one is asked about again, so a topology applied
+while the consumer is running starts being used.
+
+Every retry is also published **mandatory**, because the original is
+acknowledged as soon as the copy is confirmed. A rung deleted after it was
+remembered hands the message back rather than taking it and dropping it: the rung
+is forgotten, counted as `acemq.retry.rung.missing`, and the wait happens in the
+consumer. A short retry onto the queue itself that the broker cannot route is
+handed back to the broker, attempt unchanged, rather than acknowledged.
 
 ## The names
 

@@ -211,6 +211,59 @@ RSpec.describe "the scheduler" do
         "x-schedule-due-at" => due_at, "x-schedule-content-type" => "application/json" }
     end
 
+    # Somewhere for a due message to land: the scheduler's own hops are
+    # mandatory, and a target nothing is bound to is a different test.
+    before do
+      transport.declare_exchange("billing")
+      transport.bind(queue: "invoices", exchange: "billing", routing_key: "invoice.due")
+    end
+
+    def control_delivery(due_at, routing_key: "invoice.due")
+      FakeDelivery.build(body: '{"id":"A-9"}',
+                         headers: headers.merge("x-schedule-due-at" => due_at,
+                                                "x-schedule-routing-key" => routing_key))
+    end
+
+    # The control message is acknowledged once the next hop is out, so a hop
+    # the broker confirmed and dropped would be a scheduled message gone.
+    it "hops and delivers mandatory" do
+      scheduler
+      [due_at, Scheduler.millis(Time.now - 1)].each do |moment|
+        delivery, = control_delivery(moment)
+        scheduler.send(:receive, delivery)
+      end
+
+      expect(transport.published.last(2).map(&:mandatory)).to eq([true, true])
+    end
+
+    it "tries again from the smallest rung when nothing is bound at the target" do
+      scheduler
+      delivery, recorder = control_delivery(Scheduler.millis(Time.now - 1),
+                                            routing_key: "nobody.home")
+      scheduler.send(:receive, delivery)
+
+      expect(last_published.routing_key).to eq("acemq.schedule.1s")
+      expect(last_published.headers).to include("x-schedule-routing-key" => "nobody.home")
+      expect(scheduler.delivered).to eq(0)
+      expect(recorder.acked?).to be(true)
+    end
+
+    it "hands the control message back rather than acking it when a rung has gone" do
+      scheduler
+      allow(transport).to receive(:publish).and_wrap_original do |original, **message|
+        if message[:routing_key].start_with?("acemq.schedule.") && message[:mandatory]
+          raise AceMQ::AMQP::PublishError.new("312 NO_ROUTE", unroutable: true)
+        end
+
+        original.call(**message)
+      end
+      delivery, recorder = control_delivery(due_at)
+      scheduler.send(:receive, delivery)
+
+      expect(recorder.acked?).to be(false)
+      expect(recorder.requeued?).to be(true)
+    end
+
     it "puts a message that is not due yet into the next rung down" do
       scheduler
       publish_into_control(headers)

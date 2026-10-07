@@ -137,6 +137,28 @@ RSpec.describe "the scheduler against a real broker", :integration do
       end
     end
 
+    # Final delivery is mandatory, so a target nothing is bound to yet is
+    # handed back by the broker rather than confirmed and dropped while the
+    # control message is acknowledged. It goes round the smallest rung until
+    # something is bound, and then arrives.
+    it "keeps a due message nothing is bound to receive, and delivers it once something is" do
+      scheduler = SCHEDULER.on(mq)
+      begin
+        scheduler.in(1.5, { "invoice" => "A-9" }, to: "invoice.later", exchange: target)
+
+        expect(wait_for(seconds: 10) { scheduler.hops >= 3 }).to be(true)
+        expect(scheduler.delivered).to eq(0)
+
+        mq.bind(queue: arrivals, exchange: target, routing_key: "invoice.later")
+        delivery = wait_for { mq.pull(arrivals) }
+        expect(delivery&.body).to eq('{"invoice":"A-9"}')
+        delivery.ack
+        expect(scheduler.delivered).to eq(1)
+      ensure
+        scheduler.close
+      end
+    end
+
     it "does not leak a dead-letter queue for its control queue" do
       scheduler = SCHEDULER.on(mq)
       begin

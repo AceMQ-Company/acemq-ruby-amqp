@@ -473,9 +473,13 @@ module AceMQ
         end
 
         begin
+          # Mandatory, because accepting below is what makes this hop final: a
+          # next stop nothing is bound to is confirmed and dropped by the broker,
+          # and this step would accept a message that is now nowhere. Only here:
+          # {RoutingSlip#start} is the caller's own publish and keeps its default.
           send_to(connection, advanced.next_step, advanced, payload,
                   { correlation_id: message.envelope.correlation_id,
-                    causation_id: message.envelope.id })
+                    causation_id: message.envelope.id, mandatory: true })
         rescue StandardError => e
           return Ack.retry("#{at} is done for message #{message.id} but the next step " \
                            "did not go out: #{e.message}")

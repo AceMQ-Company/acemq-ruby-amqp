@@ -462,6 +462,10 @@ module AceMQ
         # that would drift.
         counters&.answered!
         begin
+          # Not mandatory, unlike every other publish the library makes for you.
+          # A reply queue that has gone means the caller has gone, and turning
+          # that into a retry would repeat the work for nobody. It surfaces as a
+          # timeout on the requester's side. See docs/request-reply.md.
           connection.publish(response, to: reply_to,
                                        correlation_id: request.envelope.correlation_id,
                                        causation_id: request.envelope.id, headers: headers)

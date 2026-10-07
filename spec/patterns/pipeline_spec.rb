@@ -200,6 +200,18 @@ RSpec.describe "chaining handlers" do
       expect(ack.error).to match(/is done but the next message did not go out/)
     end
 
+    # Accepting is what makes the hop final, so a next message the broker
+    # confirmed and dropped would be work done and then lost.
+    it "retries the input when nothing is bound to receive the next message" do
+      handler = AceMQ::AMQP::Patterns.then_publish(mq, to: "shipment.requested",
+                                                       exchange: "shipping-events", &:payload)
+      ack = handler.call(message)
+
+      expect(transport.published.last.mandatory).to be(true)
+      expect(ack).to be_retry
+      expect(ack.error).to match(/nowhere to route/)
+    end
+
     it "lets the step's own failure reach the retry engine" do
       handler = AceMQ::AMQP::Patterns.then_publish(mq, to: "x") { raise "the warehouse is down" }
 

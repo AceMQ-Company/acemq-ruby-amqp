@@ -103,6 +103,7 @@ RSpec.describe "replaying a dead-letter queue" do
   it "keeps the message's own routing key when none is given" do
     # So a message goes back where it came from rather than everywhere.
     dead_letter(1)
+    transport.bind(queue: "orders.audit", exchange: "orders-events", routing_key: dlq)
     AceMQ::AMQP::Patterns.replay(mq, from: dlq, exchange: "orders-events")
 
     expect(transport.published.last.exchange).to eq("orders-events")
@@ -197,6 +198,20 @@ RSpec.describe "replaying a dead-letter queue" do
 
     expect { AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "orders.new") }
       .to raise_error(AceMQ::AMQP::Patterns::ReplayFailed) { |e| expect(e.result.moved).to eq(0) }
+    expect(transport.message_count(dlq)).to eq(2)
+  end
+
+  # The original is acknowledged as soon as the copy is confirmed, so a copy
+  # the broker confirmed and dropped would delete the last one there was.
+  it "leaves the message where it was when nothing is bound at the destination" do
+    dead_letter(2)
+
+    expect do
+      AceMQ::AMQP::Patterns.replay(mq, from: dlq, exchange: "orders", routing_key: "orders.new")
+    end.to raise_error(AceMQ::AMQP::Patterns::ReplayFailed, /nowhere to route/) { |e|
+      expect(e.result.moved).to eq(0)
+    }
+    expect(transport.published.last.mandatory).to be(true)
     expect(transport.message_count(dlq)).to eq(2)
   end
 

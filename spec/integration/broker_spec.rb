@@ -1318,4 +1318,98 @@ RSpec.describe "against a real broker", :integration do
       consumer.cancel
     end
   end
+
+  # Everywhere this library publishes on the caller's behalf and then treats
+  # the work as done. Each one is mandatory, and the fakes say so; this is the
+  # broker saying so -- basic.return arriving ahead of the confirm, on a channel
+  # whose ReturnedMessages watcher has to be registered for that exchange.
+  describe "what the library publishes for you" do
+    let(:metrics) { AceMQ::AMQP::Telemetry::Registry.new }
+    let(:mq) do
+      AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit", telemetry: metrics)
+    end
+    let(:nowhere) { "#{PREFIX}nobody-bound-here" }
+
+    before { mq.declare_exchange(nowhere, kind: "direct") }
+    after { mq.transport.delete_exchange(nowhere) }
+
+    def arriving(envelope = AceMQ::AMQP::Envelope.new)
+      AceMQ::AMQP::Message.new(payload: { "order_id" => "A-1" }, routing_key: "in",
+                               content_type: "application/json", redelivered: false,
+                               body: '{"order_id":"A-1"}', envelope: envelope)
+    end
+
+    it "retries a pipeline step whose next message reached no queue" do
+      ack = AceMQ::AMQP::Patterns.then_publish(mq, to: "shipped", exchange: nowhere, &:payload)
+                                 .call(arriving)
+
+      expect(ack).to be_retry
+      expect(ack.error).to match(/312 NO_ROUTE/)
+    end
+
+    it "retries a routing-slip step whose next stop reached no queue" do
+      slip = AceMQ::AMQP::Patterns::RoutingSlip.new.step("", "validate", name: "validate")
+                                               .step(nowhere, "charge", name: "charge")
+      envelope = AceMQ::AMQP::Envelope.new(
+        headers: { AceMQ::AMQP::Patterns::SLIP_HEADER => slip.to_header }
+      )
+      ack = AceMQ::AMQP::Patterns.follow_slip(mq, &:payload).call(arriving(envelope))
+
+      expect(ack).to be_retry
+      expect(ack.error).to match(/312 NO_ROUTE/)
+    end
+
+    describe "a replay" do
+      let(:dlq) { queue_named("replay-unroutable.dlq") }
+
+      before do
+        scrub(dlq)
+        mq.declare_queue(dlq, queue_type: :classic)
+      end
+
+      after { scrub(dlq) }
+
+      it "leaves the message on the dead-letter queue when the copy reached no queue" do
+        mq.publish({ "order_id" => "A-2" }, to: dlq)
+        expect(wait_for { mq.message_count(dlq) == 1 }).to be(true)
+
+        expect do
+          AceMQ::AMQP::Patterns.replay(mq, from: dlq, exchange: nowhere, routing_key: "x")
+        end.to raise_error(AceMQ::AMQP::Patterns::ReplayFailed, /312 NO_ROUTE/)
+        expect(wait_for { mq.message_count(dlq) == 1 }).to be(true)
+      end
+    end
+
+    describe "a retry whose rung was deleted after it was seen" do
+      let(:queue) { queue_named("rung-gone") }
+      let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
+      let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
+
+      before do
+        scrub(queue, rung)
+        AceMQ::AMQP::Topology.new.queue(queue, retry_policy: policy, retry_threshold: 1)
+                             .dead_letter_queue(queue).apply(mq)
+      end
+
+      after { scrub(queue, rung) }
+
+      it "waits here instead of acknowledging a copy the broker dropped" do
+        attempts = Hash.new { |all, id| all[id] = [] }
+        consumer = mq.consume(queue, retry_policy: policy, retry_threshold: 1) do |message|
+          attempts[message.payload["order_id"]] << message.attempt
+          message.attempt >= 2 ? AceMQ::AMQP::Ack.accept : AceMQ::AMQP::Ack.retry("not yet")
+        end
+
+        # The first failure is what makes the consumer remember the rung.
+        mq.publish({ "order_id" => "seen" }, to: queue)
+        expect(wait_for { mq.message_count(rung) == 1 }).to be(true)
+        mq.delete_queue(rung)
+
+        mq.publish({ "order_id" => "kept" }, to: queue)
+        expect(wait_for(seconds: 15) { attempts["kept"] == [1, 2] }).to be_truthy
+        expect(metrics[AceMQ::AMQP::Telemetry::RUNG_MISSING, queue: queue]).to eq(1)
+        consumer.cancel
+      end
+    end
+  end
 end
