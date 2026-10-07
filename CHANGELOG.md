@@ -21,6 +21,17 @@ While the version is `0.x` the public API may change in any release.
   publishes are mandatory by default. Found porting the policy-administration
   sample app.
 
+- **A stream reader carries on where it was after a lost connection.** bunny
+  re-subscribes a recovered consumer with its original arguments, so a stream
+  subscription asked for its original `x-stream-offset` again: a reader that began
+  at `first` was handed the whole stream a second time (500 entries became 900
+  deliveries), and one that began at `next` skipped everything appended while it
+  was away (50 of 200 lost). Measured on bunny 2.24 and 3.4 alike. The transport
+  now records the offset of each stream delivery as it is settled and, as a
+  recovery starts, moves the subscription's starting point to the oldest offset
+  still unsettled or one past the newest settled. Queue consumers, and the consumer
+  tag a subscription recovers under, are unchanged. The same fix as Go's.
+
 ## [0.7.10] - 2026-10-05
 
 ### Fixed

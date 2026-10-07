@@ -797,6 +797,91 @@ module AceMQ
       end
     end
 
+    # How far a stream subscription has got, so a recovery carries on from there.
+    #
+    # A queue forgets what it delivered, so re-subscribing after a lost connection
+    # takes whatever is left. A stream forgets nothing, and re-subscribing starts
+    # wherever +x-stream-offset+ says -- and bunny re-subscribes with the arguments
+    # the subscription was first made with. A reader that began at +first+ was
+    # handed the whole stream again (500 entries became 900 deliveries in the
+    # reproducer, on bunny 2.24 and 3.4 alike), and one that began at +next+ skipped
+    # everything appended while it was away (50 of 200 never arrived).
+    #
+    # So a re-subscribe starts at the oldest offset delivered and not yet settled,
+    # or one past the newest settled: what a queue would redeliver, and nothing it
+    # would not. Go's transport does the same.
+    #
+    # Deliveries from before a recovery are counted no further once it has been
+    # worked out where to resume: the new subscription delivers them again, and a
+    # handler still finishing an old copy must not move the position past entries
+    # the new one has not reached.
+    #
+    # @api private
+    class StreamPosition
+      ARGUMENT = "x-stream-offset"
+
+      # One for a subscription that names a place in a stream, nil for any other.
+      def self.for(arguments) = (new if arguments.key?(ARGUMENT))
+
+      def initialize
+        @lock = Mutex.new
+        @pending = Hash.new(0) # offset => deliveries not yet settled
+        @settled = nil         # the newest offset settled
+        @generation = 0
+      end
+
+      # The delivery, recorded as pending and settling itself on ack or nack.
+      # Recorded before the handler sees it and settled before the broker is told,
+      # so a recovery at any moment finds it either pending or done.
+      def track(delivery)
+        offset = delivery.headers[ARGUMENT]
+        return delivery unless offset.is_a?(Integer)
+
+        generation = @lock.synchronize do
+          @pending[offset] += 1
+          @generation
+        end
+        ack = delivery.on_ack
+        nack = delivery.on_nack
+        delivery.on_ack = lambda do
+          settle(offset, generation)
+          ack&.call
+        end
+        delivery.on_nack = lambda do |requeue|
+          settle(offset, generation)
+          nack&.call(requeue)
+        end
+        delivery
+      end
+
+      # Where a re-subscribe starts, or nil when nothing was delivered and the
+      # subscription's own starting point still stands. Asking twice without a
+      # delivery in between gives the same answer, as a recovery that takes more
+      # than one attempt does.
+      def resume
+        @lock.synchronize do
+          offset = @pending.empty? ? @settled&.+(1) : @pending.keys.min
+          next nil if offset.nil?
+
+          @pending.clear
+          @settled = offset - 1
+          @generation += 1
+          offset
+        end
+      end
+
+      private
+
+      def settle(offset, generation)
+        @lock.synchronize do
+          next unless generation == @generation
+
+          @pending.delete(offset) if (@pending[offset] -= 1) <= 0
+          @settled = offset if @settled.nil? || offset > @settled
+        end
+      end
+    end
+
     # The broker, over AMQP 0-9-1.
     #
     # Everything above this class is about envelopes, codecs and retries and
@@ -1127,12 +1212,15 @@ module AceMQ
         # Generated once here, so it survives every recovery of this subscription and
         # the record is replaced rather than added to.
         tag ||= "acemq-#{queue}-#{SecureRandom.hex(8)}"
+        arguments = stringify(arguments)
+        position = StreamPosition.for(arguments)
         consumer = channel.queue(queue, passive: true).subscribe(
-          manual_ack: true, block: false, consumer_tag: tag, arguments: stringify(arguments)
+          manual_ack: true, block: false, consumer_tag: tag, arguments: arguments
         ) do |info, properties, body|
-          handler.call(delivery_from(channel, info, properties, body))
+          delivery = delivery_from(channel, info, properties, body)
+          handler.call(position ? position.track(delivery) : delivery)
         end
-        track(Subscription.new(channel, consumer))
+        track(Subscription.new(channel, consumer, position))
       rescue StandardError => e
         channel.close if channel&.open?
         raise TransportError, "cannot consume from #{queue.inspect}: #{e.message}"
@@ -1264,9 +1352,22 @@ module AceMQ
       # in-flight acknowledgement loses the message the handler just finished.
       # {Consumer#cancel} stops delivery, waits, and only then closes.
       class Subscription
-        def initialize(channel, consumer)
+        def initialize(channel, consumer, position = nil)
           @channel = channel
           @consumer = consumer
+          @position = position
+        end
+
+        # Moves a stream subscription's starting point to where it got to, so the
+        # re-subscribe a recovery is about to make carries on rather than starts
+        # over. bunny 2.24 and 3.x both re-subscribe with the arguments the
+        # +Bunny::Consumer+ carries, read when the re-subscribe is sent, so that
+        # hash is the one place a new offset can go. See {StreamPosition}.
+        #
+        # @api private
+        def rewind_stream
+          offset = @position&.resume
+          @consumer.arguments[StreamPosition::ARGUMENT] = offset unless offset.nil?
         end
 
         # Whether the broker can still deliver down this subscription.
@@ -1366,6 +1467,9 @@ module AceMQ
             # {ConfirmWait} for why bunny would otherwise hold the wait, and the
             # publish lock with it, for its whole continuation timeout.
             @confirms.abandon
+            # After the abandon, because a publisher waiting for a confirm holds the
+            # lock the subscriptions are listed under.
+            @lock.synchronize { @subscriptions.dup }.each(&:rewind_stream)
           end
         end
 

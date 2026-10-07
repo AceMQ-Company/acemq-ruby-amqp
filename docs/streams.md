@@ -168,6 +168,18 @@ at-least-once, which is fine when the handler is
 server-side offset tracking possible at all. Give every stream consumer a stable
 one; a generated tag is a consumer the broker cannot recognise after a restart.
 
+## When the connection is lost
+
+bunny recovers the connection and re-subscribes the reader, and the reader carries
+on from where it was rather than from the offset it was started with: the oldest
+entry it had been handed and not yet acknowledged or rejected, or one past the
+newest it had. An entry that was in a handler when the connection went is
+delivered again — at-least-once, as a queue would — and nothing appended while the
+reader was away is skipped.
+
+That position lives in the process. A *restart* starts from the `offset:` you pass,
+which is what the checkpoint above is for.
+
 ## Prefetch
 
 A stream consumer always has one, because RabbitMQ refuses one without:

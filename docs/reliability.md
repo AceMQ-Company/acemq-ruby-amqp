@@ -477,6 +477,17 @@ host rather than back to the one that may have just died, and a recovery that
 reaches the end of the list still waits one extra interval there. A session built
 yourself and handed to `Transport.new` gets the rewind with `single_host: true`.
 
+A second one is adjusted for streams. bunny re-subscribes a recovered consumer
+with the arguments it was first made with, which for a queue is right — a queue
+redelivers whatever was unacknowledged — and for a stream is not, because a stream
+delivers from wherever `x-stream-offset` says. Up to 0.7.10 a reader that began at
+`first` was handed the whole stream again after every recovery (500 entries became
+900 deliveries, measured on bunny 2.24 and 3.4), and one that began at `next`
+skipped everything appended while it was away (50 of 200 never arrived). A
+recovered stream subscription now starts at the oldest entry it had been given and
+not yet settled, or just after the newest it had: what a queue would redeliver,
+and nothing it would not. See [streams](streams.md#when-the-connection-is-lost).
+
 The knob is `network_recovery_interval`, the seconds bunny waits before each
 attempt: the time to recover from a lost connection is about that plus the
 reconnect, and the time a publisher refuses (see
