@@ -160,6 +160,12 @@ anything sent this way need to be [idempotent](#idempotency), which is why that
 pattern is in the same library. Removing first would lose messages instead, and
 an absence cannot be recognised the way a duplicate can.
 
+The relay always publishes **mandatory**, whatever `publish` defaults to. A
+record whose exchange has no matching binding is a failed publish rather than a
+confirmed one: it stays in the outbox, `SQLOutboxStore` counts the attempt, and
+`on_error:` hears about it. Without that, the broker would confirm it and drop
+it, and the relay would mark it published.
+
 `sweep` is public, so an application can flush its outbox at the end of a
 request rather than up to an interval later, and a test can drive a relay
 without waiting for a tick:

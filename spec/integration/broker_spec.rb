@@ -583,6 +583,20 @@ RSpec.describe "against a real broker", :integration do
       expect(headers[AceMQ::AMQP::Headers::ORIGIN]).to eq("rspec@rbit")
       expect(headers[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
     end
+
+    it "keeps a record the broker had nowhere to route" do
+      # The broker confirms a message that matches no binding and drops it in
+      # the same breath. Only a mandatory publish hears about it, and an outbox
+      # that did not ask would mark the record published and lose it.
+      store.add(AceMQ::AMQP::Patterns.record(mq, { "order_id" => "A-7" },
+                                             to: queue_named("outbox.nobody-declared-this")))
+      relay = AceMQ::AMQP::Patterns::OutboxRelay.new(mq, store)
+
+      expect { relay.sweep }.to raise_error(AceMQ::AMQP::PublishError) do |error|
+        expect(error.unroutable?).to be(true)
+      end
+      expect(store.size).to eq(1)
+    end
   end
 
   describe "a queue carrying more than one format" do

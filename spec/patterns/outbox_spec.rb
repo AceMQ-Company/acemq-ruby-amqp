@@ -112,6 +112,22 @@ RSpec.describe AceMQ::AMQP::Patterns::OutboxRelay do
       expect(store.size).to eq(1)
     end
 
+    it "keeps a record nothing is bound to, rather than marking it published" do
+      # A confirm says the broker has the message, not that it reached a queue.
+      # Published without mandatory, a record whose binding nobody made is
+      # confirmed, dropped by the broker and then marked published here: gone,
+      # with nothing anywhere saying so. Java and .NET relay mandatory by
+      # default and keep the record; this is the same promise.
+      store.add(recorded)
+      transport.unroutable!("order.placed")
+
+      relay = described_class.new(mq, store)
+      expect { relay.sweep }.to raise_error(AceMQ::AMQP::PublishError) do |error|
+        expect(error.unroutable?).to be(true)
+      end
+      expect(store.size).to eq(1)
+    end
+
     it "marks a record published only after the broker has confirmed it" do
       # A crash in this gap republishes the record, which is the at-least-once
       # this pattern promises. Marking first would lose it instead.

@@ -301,11 +301,22 @@ module AceMQ
         # waiting the lease out for nothing. A store with no such notion — the
         # in-memory one — is simply not asked, and the failure travels on
         # exactly as it did before.
+        #
+        # Mandatory, whatever {Connection#publish} defaults to. A confirm says
+        # the broker has the message, not that it reached a queue: a record
+        # whose binding nobody made is confirmed and dropped in the same
+        # breath, and without the broker's return this relay would mark it
+        # published and the message would be gone with nothing anywhere saying
+        # so. An outbox exists so that a decided message is not lost, and the
+        # caller has no way to ask for this per record. Unroutable is therefore
+        # a failed publish like any other: the record stays, the store counts
+        # the attempt, and +on_error+ hears about it -- what Java's and .NET's
+        # relays do, because their publishes are mandatory by default.
         def publish(record)
           @transport.publish(exchange: record.exchange, routing_key: record.routing_key,
                              body: record.body, content_type: record.content_type,
                              message_id: record.id, headers: record.headers,
-                             persistent: true)
+                             persistent: true, mandatory: true)
         rescue StandardError => e
           @store.mark_failed(record.id, e.message) if @store.respond_to?(:mark_failed)
           raise

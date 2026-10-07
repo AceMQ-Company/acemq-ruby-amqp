@@ -8,6 +8,19 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The outbox relay no longer loses a record nothing is bound to.** It published
+  without `mandatory`, so a record whose exchange had no matching binding was
+  confirmed, dropped by the broker and then marked published: gone, with nothing
+  reporting it. The relay now always publishes mandatory, whatever
+  `Connection#publish` defaults to. An unroutable record is a failed publish like
+  any other: it stays in the outbox, `SQLOutboxStore` counts the attempt (so
+  `max_attempts` eventually retires it, still in the table), and `on_error:` is
+  told. This is what Java's and .NET's relays already did, because their
+  publishes are mandatory by default. Found porting the policy-administration
+  sample app.
+
 ## [0.7.10] - 2026-10-05
 
 ### Fixed

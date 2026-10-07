@@ -245,6 +245,18 @@ RSpec.describe "the database-backed stores" do
         # record nothing can publish eventually stops being claimed.
         expect(store.pending.size).to eq(1)
       end
+      it "counts an unroutable record as a failed attempt, so it is kept and retired" do
+        # The retirement above only works if the relay notices. A record
+        # nothing is bound to used to be confirmed, marked published and lost
+        # without ever reaching mark_failed.
+        db.transaction { store.add(recorded, connection: db) }
+        transport.unroutable!("order.placed")
+        relay = AceMQ::AMQP::Patterns::OutboxRelay.new(mq, store)
+
+        expect { relay.sweep }.to raise_error(AceMQ::AMQP::PublishError)
+        expect(store.pending_count).to eq(1)
+        expect(described_class.new(connection: db, max_attempts: 1).pending).to be_empty
+      end
     end
 
     describe "housekeeping" do
