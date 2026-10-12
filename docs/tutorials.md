@@ -29,7 +29,7 @@ gives.
 source "https://rubygems.org"
 
 source "https://acemq.org/gems" do
-  gem "acemq-amqp", "~> 0.7", ">= 0.7.12"
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.13"
 end
 gem "bunny", ">= 2.23", "< 4"
 ```
@@ -42,7 +42,7 @@ Ruby 3.1 or newer. `bunny` is a separate gem because the library requires it
 lazily, at the moment a connection is opened — a process that only builds
 envelopes or checks a retry schedule needs no broker client at all. The gem is
 not on rubygems.org: releases go to AceMQ's own feed at <https://acemq.org/gems>,
-which is what the `source` block names, and the current one is 0.7.12. The
+which is what the `source` block names, and the current one is 0.7.13. The
 [releasing section of the README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing)
 says why.
 
