@@ -879,6 +879,39 @@ RSpec.describe "against a real broker", :integration do
       end
     end
 
+    it "raises the codec's error for a reply it cannot read, rather than timing out" do
+      texts = AceMQ::AMQP::Connection.open(BROKER, origin: "rspec@rbit",
+                                                   codec: AceMQ::AMQP::StringCodec.new)
+      begin
+        AceMQ::AMQP::Patterns.serve(texts, queue) { |_message| "not json {" }
+        requester = AceMQ::AMQP::Patterns::Requester.new(mq, to: queue, timeout: 10)
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        expect { requester.call({ "sku" => "X" }) }
+          .to raise_error(AceMQ::AMQP::DecodeError, /not JSON/)
+        expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 5
+        requester.close
+      ensure
+        texts.close
+        scrub(requester.reply_queue) if requester
+      end
+    end
+
+    it "leaves no queue behind once a requester with a generated reply queue closes" do
+      # A generated reply queue is exclusive and auto-deleting, so it goes when
+      # the requester does. Nothing durable may be hung off it: a .dlq or a
+      # .parked per requester would be a leak per process start.
+      requester = AceMQ::AMQP::Patterns::Requester.new(mq, to: queue, timeout: 1)
+      name = requester.reply_queue
+      requester.close
+
+      left = [name, "#{name}.dlq", "#{name}.parked"].select do |q|
+        wait_for(seconds: 2) { !mq.queue_exists?(q) } ? false : true
+      end
+      scrub(name)
+      expect(left).to be_empty
+    end
+
     # The three that need a real broker. reply-to is an AMQP property and not a
     # header, so it travels in basic.properties rather than in the field table:
     # a fake transport can be made to carry anything, and only the wire says

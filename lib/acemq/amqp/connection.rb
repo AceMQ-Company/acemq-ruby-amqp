@@ -430,9 +430,13 @@ module AceMQ
       # @param retry_threshold [Numeric, nil] seconds, or nil for the
       #   connection's. A retry delayed this long or longer waits in a rung
       #   queue instead of in this process.
+      # @param dead_letters [Boolean] false declares no +{queue}.dlq+ and
+      #   +{queue}.parked+. Only for a handler that accepts everything, as the
+      #   request-reply reply consumer does: a message given up on then has
+      #   nowhere to land and is dropped. @api private
       # @return [Consumer]
       def consume(queue, codec: nil, retry_policy: nil, prefetch: nil, concurrency: 1,
-                  tag: nil, arguments: {}, retry_threshold: nil,
+                  tag: nil, arguments: {}, retry_threshold: nil, dead_letters: true,
                   &handler)
         unless handler
           raise ArgumentError,
@@ -447,7 +451,7 @@ module AceMQ
           interceptors: @interceptors, telemetry: @telemetry
         )
         consumer.start(prefetch: prefetch || @prefetch, concurrency: concurrency, tag: tag,
-                       arguments: arguments)
+                       arguments: arguments, dead_letters: dead_letters)
         @lock.synchronize { @consumers << consumer }
         consumer
       end
@@ -780,7 +784,7 @@ module AceMQ
       def running? = !!@subscription&.open?
 
       # @api private
-      def start(prefetch:, concurrency:, tag:, arguments:)
+      def start(prefetch:, concurrency:, tag:, arguments:, dead_letters: true)
         # Declared before anything is subscribed, and not on the failure path.
         # A rung, a dead-letter queue or a parking queue that does not exist
         # loses the message rather than reporting anything — the default
@@ -792,7 +796,11 @@ module AceMQ
         # +{queue}.parked+ by name whatever its policy says, and a topology
         # nobody remembered to apply must not be the difference between a dead
         # letter somebody can read and one that never existed.
-        @ladder.declare(@transport)
+        #
+        # The one exception is a consumer started with +dead_letters: false+,
+        # which is the request-reply reply consumer: it accepts everything, so
+        # durable queues hung off an exclusive reply queue would only outlive it.
+        @ladder.declare(@transport) if dead_letters
         @subscription = @transport.subscribe(
           @queue, prefetch: prefetch, concurrency: concurrency, tag: tag, arguments: arguments
         ) { |delivery| handle(delivery) unless @stopped }

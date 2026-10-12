@@ -8,6 +8,22 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.13] - 2026-10-12
+
+### Fixed
+
+- **A reply the requester cannot read now fails `call` at once.** A reply whose
+  body the connection's codec could not decode was parked by the reply consumer,
+  and `call` waited out its whole timeout and raised `RequestTimedOut`, as though
+  nothing had come back. Replies are now taken as raw bytes and decoded in
+  `call`, which raises the codec's `DecodeError` as soon as the reply arrives. A
+  responder failure is still reported as `ResponderFailed` even when its body is
+  unreadable. Java, .NET and Python already behave this way.
+- **A requester no longer leaves queues behind.** Every requester with a
+  generated reply queue declared a durable `.dlq` and `.parked` queue for it,
+  and both stayed on the broker after the requester closed, so each process
+  start left two more. The reply consumer now declares neither.
+
 ## [0.7.12] - 2026-10-12
 
 ### Fixed

@@ -221,6 +221,43 @@ RSpec.describe AceMQ::AMQP::Patterns::Requester do
     requester.close
   end
 
+  it "raises the codec's error for a reply it cannot read, rather than timing out" do
+    # The reply arrived. A caller left to wait out its deadline for an answer
+    # that is already here, and then told nothing came back, is being lied to.
+    texts = AceMQ::AMQP::Connection.new(transport: transport, codec: AceMQ::AMQP::StringCodec.new)
+    AceMQ::AMQP::Patterns.serve(texts, "price.requests") { |_message| "not json {" }
+    requester = described_class.new(mq, to: "price.requests", timeout: 5)
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    expect { requester.call({ "sku" => "A" }) }
+      .to raise_error(AceMQ::AMQP::DecodeError, /not JSON/)
+    expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
+    expect(transport.published_to("#{requester.reply_queue}.parked")).to be_empty
+    requester.close
+  end
+
+  it "reports a responder's failure even when the failure's body is unreadable" do
+    texts = AceMQ::AMQP::Connection.new(transport: transport, codec: AceMQ::AMQP::StringCodec.new)
+    AceMQ::AMQP::Patterns.serve(texts, "price.requests") { |_message| raise "the catalogue is down" }
+    requester = described_class.new(mq, to: "price.requests", timeout: 5)
+
+    expect { requester.call({ "sku" => "A" }) }
+      .to raise_error(AceMQ::AMQP::Patterns::ResponderFailed, /the catalogue is down/)
+    requester.close
+  end
+
+  it "declares nothing beside a reply queue: no dead-letter queue, no parking queue" do
+    # Every reply is accepted and decoded by the caller, so nothing is ever
+    # dead-lettered or parked off a reply queue, and a durable queue declared
+    # for that would outlive the requester that named it.
+    requester = described_class.new(mq, to: "price.requests")
+    names = transport.declared_queues.map(&:first)
+
+    expect(names).not_to include("#{requester.reply_queue}.dlq",
+                                 "#{requester.reply_queue}.parked")
+    requester.close
+  end
+
   describe "what a responder counts" do
     it "has both numbers before it has been asked anything" do
       responder = serving { |_message| { "ok" => true } }

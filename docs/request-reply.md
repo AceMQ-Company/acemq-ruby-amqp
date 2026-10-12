@@ -150,19 +150,25 @@ one per request is a queue per request, and a broker with ten thousand
 auto-delete queues on it is a real way to run out of memory with nothing
 obviously wrong.
 
-### The reply consumer has no retry policy
+### The reply consumer has no retry policy and no dead-letter queues
 
 Whatever the connection's `retry_policy` is, the consumer reading the reply queue
-is started with `RetryPolicy.none`:
+takes raw bytes, has no retry policy, and declares no `.dlq` or `.parked` queue:
 
 ```ruby
-@consumer = connection.consume(@reply_queue, retry_policy: RetryPolicy.none) { … }
+@consumer = connection.consume(@reply_queue, codec: BytesCodec.new,
+                               retry_policy: RetryPolicy.none, dead_letters: false) { … }
 ```
 
-That handler cannot meaningfully fail — it hands a message to a waiter and
-accepts — so a policy could only ever add [rung queues](reliability.md) to an
-ephemeral reply queue that is about to be deleted. `acemq-reply-1f8c….retry.40s`
-is not a queue anybody wants to find on their broker.
+That handler cannot meaningfully fail — it hands the bytes to a waiter and
+accepts every reply — so a policy or a dead-letter queue could only ever add
+durable queues to an ephemeral reply queue, and they would outlive it.
+`acemq-reply-1f8c….parked` is not a queue anybody wants to find on their broker.
+Before 0.7.13 a generated reply queue left its `.dlq` and `.parked` behind on
+every requester.
+
+The reply is decoded in `call`, with the connection's codec, as Java, .NET and
+Python do.
 
 ## What `call` can raise
 
@@ -173,8 +179,15 @@ rescue AceMQ::AMQP::Patterns::RequestTimedOut => e
   # "no reply to 376c1d3b-… arrived within 5.0 seconds"
 rescue AceMQ::AMQP::Patterns::ResponderFailed => e
   # "the responder failed: KeyError: key not found: \"nope\""
+rescue AceMQ::AMQP::DecodeError => e
+  # "this message is not JSON: …"
 end
 ```
+
+`DecodeError` means a reply arrived and the connection's codec cannot read it;
+`call` raises it as soon as the reply lands rather than waiting out the timeout.
+A responder failure is checked first, so a failure whose body is unreadable
+still raises `ResponderFailed`.
 
 `ResponderFailed` means the far end answered and the answer was a failure. The
 message is the responder's exception class and message, carried home in

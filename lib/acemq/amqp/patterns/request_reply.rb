@@ -17,6 +17,7 @@
 require "securerandom"
 
 require_relative "../ack"
+require_relative "../codec"
 require_relative "../queue_type"
 require_relative "../retry_policy"
 
@@ -100,11 +101,19 @@ module AceMQ
           @waiting = {}
           @lock = Mutex.new
           declare_reply_queue
-          # No retry policy on the reply consumer, whatever the connection's is.
-          # This handler cannot fail — it hands a message to a waiter and
-          # accepts — so a policy could only add rung queues to an ephemeral
-          # reply queue that is about to be deleted.
-          @consumer = connection.consume(@reply_queue, retry_policy: RetryPolicy.none) do |m|
+          # Replies are taken as raw bytes and decoded by the caller in {#call},
+          # as Java, .NET and Python do. Decoded here, a reply this codec cannot
+          # read was parked by the consumer and the caller waited out its whole
+          # timeout to be told nothing came back; decoded in {#call}, the caller
+          # gets the codec's error at once.
+          #
+          # No retry policy and no dead-letter or parking queue, whatever the
+          # connection's policy is. This handler cannot fail — it hands bytes to
+          # a waiter and accepts — so those could only add durable queues to an
+          # ephemeral reply queue, and they would outlive it.
+          @consumer = connection.consume(@reply_queue, codec: BytesCodec.new,
+                                                       retry_policy: RetryPolicy.none,
+                                                       dead_letters: false) do |m|
             deliver(m)
             Ack.accept
           end
@@ -117,6 +126,8 @@ module AceMQ
         # @return [Object] the reply's payload
         # @raise [RequestTimedOut] when nothing came back in time
         # @raise [ResponderFailed] when the answer was a failure
+        # @raise [DecodeError] when the reply came back in a form the
+        #   connection's codec cannot read
         def call(request, **fields)
           # The correlation identifier is what pairs a reply with its request,
           # so it is generated here rather than taken from the caller: a caller
@@ -220,10 +231,23 @@ module AceMQ
                   "no reply to #{correlation} arrived within #{@timeout} seconds"
           end
 
+          # Before decoding, so a failure whose body is unreadable still reads
+          # as the responder's failure rather than as a codec error.
           failure = message.envelope.headers[ERROR_HEADER]
           raise ResponderFailed, "the responder failed: #{failure}" if failure
 
-          message.payload
+          decode(message)
+        end
+
+        # The connection's codec, asked the way the consumer asks it: a codec
+        # that chooses by content type is told it, a plain one is not.
+        def decode(message)
+          codec = @connection.codec
+          if codec.method(:decode).arity == 1
+            codec.decode(message.body)
+          else
+            codec.decode(message.body, message.content_type)
+          end
         end
 
         # Hands a reply to whoever is waiting for it.
