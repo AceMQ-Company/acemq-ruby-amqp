@@ -1411,5 +1411,69 @@ RSpec.describe "against a real broker", :integration do
         consumer.cancel
       end
     end
+
+    # A hop the broker refused for any reason but "no queue" -- a nack, a
+    # connection that went away mid-publish. The family's answer is that only
+    # this delivery goes back, requeued, and the consumer carries on with the
+    # rest of its prefetch. This library used to let the error escape the
+    # handler, which left the delivery unsettled for as long as the channel
+    # lived: never redelivered, and holding a prefetch slot for good.
+    describe "a retry hop the broker refused" do
+      let(:queue) { queue_named("hop-refused") }
+      let(:rung) { AceMQ::AMQP::Naming.retry_queue(queue, 2) }
+      let(:policy) { AceMQ::AMQP::RetryPolicy.fixed(3, 2) }
+
+      before do
+        scrub(queue, rung)
+        AceMQ::AMQP::Topology.new.queue(queue, retry_policy: policy, retry_threshold: 1)
+                             .dead_letter_queue(queue).apply(mq)
+      end
+
+      after { scrub(queue, rung) }
+
+      it "requeues only that delivery and keeps the consumer running" do
+        refused = false
+        hop = rung
+        transport = mq.transport
+        original = transport.method(:publish)
+        transport.define_singleton_method(:publish) do |**options|
+          if options[:routing_key] == hop && !refused
+            refused = true
+            raise AceMQ::AMQP::PublishError, "the broker did not confirm the message"
+          end
+          original.call(**options)
+        end
+
+        seen = Hash.new { |all, id| all[id] = [] }
+        lock = Mutex.new
+        consumer = mq.consume(queue, retry_policy: policy, retry_threshold: 1,
+                                     prefetch: 5) do |message|
+          id = message.payload["order_id"]
+          first = lock.synchronize { (seen[id] << message.redelivered).size == 1 }
+          next AceMQ::AMQP::Ack.retry("not yet") if id == "bad" && first
+
+          sleep(0.2)
+          AceMQ::AMQP::Ack.accept
+        end
+
+        %w[bad ok-1 ok-2 ok-3 ok-4].each { |id| mq.publish({ "order_id" => id }, to: queue) }
+
+        expect(wait_for { lock.synchronize { seen["bad"].size == 2 } }).to be(true)
+        expect(seen["bad"]).to eq([false, true])
+        expect(wait_for { lock.synchronize { (1..4).all? { |n| seen["ok-#{n}"].size == 1 } } })
+          .to be(true)
+
+        mq.publish({ "order_id" => "after" }, to: queue)
+        expect(wait_for { lock.synchronize { seen["after"].size == 1 } }).to be(true)
+        expect(wait_for { consumer.in_flight.zero? }).to be(true)
+        consumer.cancel
+
+        # Cancelled, so anything left unacknowledged is back on the queue now.
+        expect(mq.message_count(queue)).to eq(0)
+        expect(mq.message_count(rung)).to eq(0)
+        expect(seen.transform_values(&:size))
+          .to eq("bad" => 2, "ok-1" => 1, "ok-2" => 1, "ok-3" => 1, "ok-4" => 1, "after" => 1)
+      end
+    end
   end
 end

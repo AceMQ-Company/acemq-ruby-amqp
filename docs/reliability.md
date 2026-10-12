@@ -189,6 +189,11 @@ is forgotten, counted as `acemq.retry.rung.missing`, and the wait happens in the
 consumer. A short retry onto the queue itself that the broker cannot route is
 handed back to the broker, attempt unchanged, rather than acknowledged.
 
+A retry the broker refuses for any other reason — a nack, a connection lost
+mid-publish — hands back only that message, requeued with its attempt unchanged,
+and the consumer keeps running and keeps working through the rest of its
+prefetch.
+
 ## The names
 
 ```ruby

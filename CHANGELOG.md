@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-10-12
+
+### Fixed
+
+- **A retry the broker refuses no longer strands the message.** When a long
+  retry could not be published into its rung for a reason other than "no queue
+  bound" — the broker nacked it, or the connection dropped mid-publish — the
+  message was left unacknowledged on the consumer: never redelivered while the
+  consumer ran, and holding one of its prefetch slots. Now that one message is
+  handed back to the broker, attempt unchanged, and the consumer carries on with
+  everything else. .NET, Go and Java already behave this way.
+
 ## [0.7.11] - 2026-10-11
 
 ### Fixed

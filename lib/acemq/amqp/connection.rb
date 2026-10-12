@@ -1161,16 +1161,34 @@ module AceMQ
       # rung deleted after that would otherwise take the message, confirm it,
       # drop it and see the original acknowledged. Returned instead, the rung is
       # forgotten, counted missing, and the wait happens here.
+      #
+      # Any other failure of the hop — a nack, a connection gone mid-publish —
+      # hands this one delivery back to the broker, attempt unchanged, and the
+      # consumer carries on. It used to escape the handler instead, which left
+      # the delivery unsettled for as long as the channel lived: never
+      # redelivered, and a prefetch slot gone for good. .NET, Go and Java do
+      # the same.
       def wait_in_broker(rung, delay, delivery, envelope)
         republish(rung, delivery, envelope)
       rescue PublishError => e
-        raise unless e.unroutable?
+        return hand_back(delivery) unless e.unroutable?
 
         @lock.synchronize { @rungs_seen.delete(rung) }
         @telemetry.count(Telemetry::RUNG_MISSING, 1, queue: @queue)
         wait_here(delay, delivery, envelope)
+      rescue StandardError
+        hand_back(delivery)
       else
         delivery.ack
+      end
+
+      # Requeues a delivery whose retry could not be published. A channel too
+      # dead to take the nack has already handed the message back to the
+      # broker, so that failure is only worth a line in the log.
+      def hand_back(delivery)
+        delivery.nack(requeue: true)
+      rescue StandardError => e
+        warn("acemq: could not requeue a delivery from #{@queue}: #{e.message}")
       end
 
       def gave_up(envelope)
