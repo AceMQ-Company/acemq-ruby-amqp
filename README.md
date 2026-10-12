@@ -24,7 +24,9 @@ produces pin that rather than leaving it to be discovered in production.
 > [development certificates that cannot reach
 > production](#development-certificates-and-why-they-cannot-reach-production).
 > So are [encrypted bodies](#encrypted-bodies) and an
-> [OpenTelemetry adapter](#tracing). Nothing is published to RubyGems yet.
+> [OpenTelemetry adapter](#tracing). The current release is **0.7.11**,
+> published to AceMQ's own gem feed at <https://acemq.org/gems> rather than to
+> rubygems.org.
 
 ## What is here today
 
@@ -73,7 +75,9 @@ transport, at the moment a connection is opened, and named in the error if it
 is not there. Add it to your own Gemfile to use the transport:
 
 ```ruby
-gem "acemq-amqp"
+source "https://acemq.org/gems" do
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.11"
+end
 gem "bunny", ">= 2.23", "< 4"
 ```
 
@@ -882,6 +886,13 @@ without waiting for a tick. A store is anything answering `add`, `pending` and
 transaction — a store that opens its own connection has the gap back, in a
 place that looks like it has been dealt with.
 
+The relay always publishes **mandatory**, whatever `Connection#publish` defaults
+to. A record whose exchange has nothing bound to its routing key is a failed
+publish, not a success: it stays in the outbox, `SQLOutboxStore` counts the
+attempt so `max_attempts` eventually retires it (still in the table), and
+`on_error:` is told — rather than the broker confirming it, dropping it, and the
+relay marking it published.
+
 A relay whose sweeps are all failing is an outbox filling up, so pass
 `on_error:`. A one-argument callback is given the exception; one that also
 declares `exchange:` and `routing_key:` is told where the record was going,
@@ -1025,7 +1036,10 @@ Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
 and `acemq-replay-count`, so a consumer that needs to treat them differently
 can and one that does not is unaffected. A message is acknowledged only after
 the broker has confirmed the new copy: a crash in that gap replays it twice,
-which is the right way round for a dead-letter queue.
+which is the right way round for a dead-letter queue. The copy is published
+mandatory, so one that reaches no queue leaves the original where it was and
+stops the replay with `ReplayFailed`, rather than acknowledging the last copy of
+a message the broker dropped.
 
 Replaying a queue through the default exchange with no routing key is refused
 rather than allowed to loop. A dead letter's routing key is the dead-letter
@@ -1124,7 +1138,8 @@ fixed chain of consumers is simpler and easier to follow.
 Completed steps are carried rather than dropped, so a slip that fails half way
 says how far it got, which is exactly what whoever finds it in a dead-letter
 queue is asking. The message is accepted only once the next one is out, so a
-failure to publish retries the step — which is why a step that changes anything
+failure to publish retries the step — and the hop is mandatory, so a next stop
+nothing is bound to is such a failure — which is why a step that changes anything
 should be idempotent. A slip that will not parse is fatal rather than retried:
 it will not parse next time either. Returning `nil` ends the run there and
 publishes nothing.
@@ -1221,6 +1236,11 @@ The control consumer is subscribed on the transport rather than through
 `consume`, so it does not declare `acemq.schedule.due.dlq` and `.parked` — two
 queues in every deployment that nothing writes to and nobody reads.
 
+Its own hops between rungs and its final delivery are mandatory. A rung that has
+gone hands the control message back to the broker rather than acknowledging it,
+and a due message whose target nothing is bound to goes back into the one-second
+rung and is tried again; `delivered` counts a delivery once it has gone.
+
 ### Pipelines and middleware
 
 ```ruby
@@ -1310,6 +1330,13 @@ Positions: `first`, `next` (the default), `last`, `at(offset)`, `since(time)`.
 position. Rejecting does not dead-letter it either, because there is nothing to
 remove it from. Nothing is lost, and nothing is retried for you, which is why
 `read_stream` uses `RetryPolicy.none` whatever the connection carries.
+
+**A reader carries on where it was after a lost connection.** When the
+connection recovers, the subscription restarts from the oldest entry still
+unsettled, or one past the newest settled — not from the position it was first
+given, which would hand a `first` reader the whole stream again and make a `next`
+reader skip what arrived while it was away. The few repeats are entries a block
+held when the connection went, which is at-least-once.
 
 Retention is unbounded by default, which for a stream means until the disk is
 full — a mistake an ordinary queue cannot make. Set at least one limit on

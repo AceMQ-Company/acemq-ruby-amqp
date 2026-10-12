@@ -28,7 +28,9 @@ gives.
 # Gemfile
 source "https://rubygems.org"
 
-gem "acemq-amqp", git: "https://github.com/AceMQ-Company/acemq-ruby-amqp"
+source "https://acemq.org/gems" do
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.11"
+end
 gem "bunny", ">= 2.23", "< 4"
 ```
 
@@ -38,10 +40,11 @@ bundle install
 
 Ruby 3.1 or newer. `bunny` is a separate gem because the library requires it
 lazily, at the moment a connection is opened — a process that only builds
-envelopes or checks a retry schedule needs no broker client at all. Nothing is
-published to rubygems.org yet, which is why that is a git source; the
+envelopes or checks a retry schedule needs no broker client at all. The gem is
+not on rubygems.org: releases go to AceMQ's own feed at <https://acemq.org/gems>,
+which is what the `source` block names, and the current one is 0.7.11. The
 [releasing section of the README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing)
-says what has to happen before it is not.
+says why.
 
 ### You need a broker
 

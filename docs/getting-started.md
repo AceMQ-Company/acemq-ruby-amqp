@@ -14,9 +14,17 @@ docker run --rm -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 Then, in your `Gemfile`:
 
 ```ruby
-gem "acemq-amqp"
+source "https://acemq.org/gems" do
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.11"
+end
 gem "bunny", ">= 2.23", "< 4"
 ```
+
+The gem is not on rubygems.org. It is served from AceMQ's own static feed,
+<https://acemq.org/gems> — no account and no credential, and the `source` block
+is the whole of the setup; `bunny` still comes from rubygems.org. The current
+release is **0.7.11**. Outside Bundler, `gem install acemq-amqp --source
+https://acemq.org/gems` does the same.
 
 The gem itself has **no runtime dependencies**. `bunny` is required lazily by
 the transport, at the moment a connection is opened, and named in the error if

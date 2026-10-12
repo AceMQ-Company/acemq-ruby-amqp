@@ -149,7 +149,9 @@ if you would rather.
 
 ```ruby
 # Gemfile
-gem "acemq-amqp"
+source "https://acemq.org/gems" do
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.11"
+end
 gem "bunny", ">= 2.23", "< 4"   # for the transport
 ```
 
@@ -167,10 +169,10 @@ gem "avro", "~> 1.12"             # AvroCodec
 gem "opentelemetry-api", "~> 1.8" # Telemetry::OpenTelemetry
 ```
 
-Nothing is published to rubygems.org yet, so for now this is a git or path
-source. The [releasing section of the
-README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing) says what
-has to happen before it is.
+The gem is not on rubygems.org. Releases go to AceMQ's own feed at
+<https://acemq.org/gems>, which is what the `source` block above names; the
+current one is 0.7.11. The [releasing section of the
+README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing) says why.
 
 ## Where to go next
 
@@ -205,4 +207,5 @@ Pre-1.0 and in development. The contract layer and the AMQP transport —
 connect, publish, consume, retry, dead-letter — are implemented and tested,
 against the shared fixtures and against a real broker, and so are the patterns
 above them. TLS and credentials are in, including a private certificate
-authority and mutual TLS. The API may change before 1.0.
+authority and mutual TLS. The API may change before 1.0. The current release is
+**0.7.11**, from the gem feed at <https://acemq.org/gems>.
