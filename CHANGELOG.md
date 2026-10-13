@@ -12,7 +12,7 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
-- Runs the AceMQ TCK v0.1.0. The driver is `spec/tck/driver.rb`, run by a `tck`
+- Runs the AceMQ TCK v0.2.0. The driver is `spec/tck/driver.rb`, run by a `tck`
   job in CI.
 - **`acemq.publish.duration`**, `Telemetry::PUBLISH_DURATION`: how long a
   publish took, in seconds, from the call to the broker's answer, for every
