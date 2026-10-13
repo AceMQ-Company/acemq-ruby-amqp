@@ -324,3 +324,24 @@ jobs:
       - name: What the broker said, if anything went wrong
         if: failure()
         run: docker logs acemq-ruby-compat
+
+  # The AceMQ TCK: the cases every AceMQ library has to pass, checked on the
+  # broker by one shared runner rather than by this suite's own reading of the
+  # contract. The action starts its own broker on 5682/15682 and hands the
+  # driver its URL in ACEMQ_TCK_AMQP_URL. The version on the uses: line is the
+  # TCK this library claims to pass, and moving it is a one-line change.
+  tck:
+    name: AceMQ TCK
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.1.0
+        with:
+          driver: bundle exec ruby -Ilib spec/tck/driver.rb

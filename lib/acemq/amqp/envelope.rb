@@ -30,8 +30,12 @@ module AceMQ
     # read, so two libraries reading the same message agree without having to
     # agree on a second set of rules: +correlation_id+ falls back to +id+, an
     # attempt starts at 1, a version starts at 1, and +type+ falls back to the
-    # routing key.
+    # routing key, and to {DEFAULT_TYPE} when that is empty too.
     class Envelope
+      # The type of a message published with neither a type nor a routing key,
+      # as through a fanout exchange. The word the other four libraries write.
+      DEFAULT_TYPE = "message"
+
       attr_reader :id, :type, :version, :correlation_id, :causation_id,
                   :attempt, :first_seen, :origin, :error, :claim, :headers, :route
 
@@ -92,7 +96,7 @@ module AceMQ
 
         new(
           id: id,
-          type: presence(text(raw[Headers::TYPE]), routing_key),
+          type: presence(text(raw[Headers::TYPE]), presence(routing_key, DEFAULT_TYPE)),
           version: number(raw[Headers::VERSION], 1),
           correlation_id: presence(text(raw[Headers::CORRELATION]), id),
           causation_id: text(raw[Headers::CAUSATION]),
@@ -113,7 +117,7 @@ module AceMQ
       def to_headers(routing_key = "")
         written = {
           Headers::ID => id,
-          Headers::TYPE => type.empty? ? routing_key : type,
+          Headers::TYPE => [type, routing_key.to_s].find { |t| !t.empty? } || DEFAULT_TYPE,
           Headers::VERSION => version,
           Headers::CORRELATION => correlation_id.empty? ? id : correlation_id,
           Headers::ATTEMPT => attempt,

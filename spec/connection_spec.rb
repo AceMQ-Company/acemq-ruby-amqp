@@ -186,6 +186,16 @@ RSpec.describe AceMQ::AMQP::Transport do
     expect(described_class.redact("amqps://svc:hunter2@broker:5671/prod"))
       .to eq("amqps://svc:***@broker:5671/prod")
   end
+
+  it "reads a URL ending in a bare slash as the default vhost, as Go and Python do" do
+    expect(described_class.default_vhost("amqp://guest:guest@localhost:5672/"))
+      .to eq("amqp://guest:guest@localhost:5672")
+    expect(described_class.default_vhost("amqps://broker/?heartbeat=5"))
+      .to eq("amqps://broker?heartbeat=5")
+    expect(described_class.default_vhost("amqp://broker/%2F")).to eq("amqp://broker/%2F")
+    expect(described_class.default_vhost("amqp://broker/prod")).to eq("amqp://broker/prod")
+    expect(described_class.default_vhost("amqp://broker")).to eq("amqp://broker")
+  end
 end
 
 # One flag rather than two exception classes, so a caller who only wants to know

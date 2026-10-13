@@ -8,6 +8,23 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- Runs the AceMQ TCK v0.1.0. The driver is `spec/tck/driver.rb`, run by a `tck`
+  job in CI.
+
+### Fixed
+
+- **A message with neither a type nor a routing key is typed `message`.** One
+  published through a fanout exchange with an empty routing key carried
+  `x-acemq-type: ""`; Java, .NET, Go and Python write `message`, and so does
+  this library now, on the way out and when reading an envelope back.
+- **`amqp://host:5672/` connects to the default vhost.** Bunny reads the empty
+  path after a trailing slash as a vhost named "", which the broker refuses, so
+  the URL the Go and Python libraries document, and the TCK hands every driver,
+  failed here with `NOT_ALLOWED - vhost  not found`. A bare trailing slash is
+  now dropped; a vhost named in the path is left alone.
+
 ## [0.7.13] - 2026-10-12
 
 ### Fixed

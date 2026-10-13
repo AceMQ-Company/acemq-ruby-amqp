@@ -144,7 +144,8 @@ Anything missing takes its default, and **anything unreadable takes its default
 too**. A producer that wrote `x-acemq-attempt` as the string `"3"` has still
 sent a message, and refusing to deliver it would hand the application an outage
 rather than a message. `type` falls back to the routing key, which is what a
-message from a producer that never set one should be called.
+message from a producer that never set one should be called, and to `message`
+when the routing key is empty too, as it is through a fanout exchange.
 
 The consumer does this for you; `from_headers` is for a tool reading a
 dead-letter queue with `pull`, and for tests.

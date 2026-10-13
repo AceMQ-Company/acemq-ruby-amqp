@@ -94,6 +94,11 @@ RSpec.describe AceMQ::AMQP::Envelope do
       .to eq("order.placed.v2")
   end
 
+  it "types a message with no type and no routing key as message, as the other four do" do
+    expect(Envelope.new.to_headers("")[Headers::TYPE]).to eq("message")
+    expect(Envelope.from_headers({}, "").type).to eq("message")
+  end
+
   it "leaves an empty value out rather than writing it empty" do
     written = Envelope.new(id: "i").to_headers("k")
 

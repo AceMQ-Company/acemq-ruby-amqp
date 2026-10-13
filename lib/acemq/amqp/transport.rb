@@ -953,6 +953,7 @@ module AceMQ
                     credentials: nil, max_outstanding_publishes: PublishPermits::DEFAULT,
                     **options)
         load_driver!
+        url = default_vhost(url)
         security = Security.for_connection(url, security: security, credentials: credentials)
         # Built before the socket is opened: a ceiling of nought is a
         # configuration mistake, and finding it out after a connection has been
@@ -972,6 +973,22 @@ module AceMQ
         raise
       rescue StandardError => e
         raise TransportError, "cannot reach the broker at #{redact(url)}: #{e.message}"
+      end
+
+      # A URL whose path is a bare slash, with the slash taken off.
+      #
+      # +amqp://host:5672/+ is the URL the Go and Python libraries print in
+      # their documentation and connect to the default vhost with, and the one
+      # the TCK hands every driver. Bunny reads the empty path after that slash
+      # as a vhost named "", which the broker refuses with NOT_ALLOWED, so the
+      # same URL worked there and not here. Without the slash bunny uses "/",
+      # as they do; a vhost named in the path, +%2F+ included, is left alone.
+      #
+      # @api private
+      def self.default_vhost(url)
+        return url unless url.is_a?(String)
+
+        url.sub(%r{\A(amqps?://[^/?#]+)/(?=[?#]|\z)}i, '\1')
       end
 
       # Whether bunny will have one address to connect to, read the way bunny's
