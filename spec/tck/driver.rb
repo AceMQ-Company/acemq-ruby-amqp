@@ -20,9 +20,31 @@ require "acemq/amqp/patterns"
 module AceMQ
   module AMQP
     module TCK
-      OPS = %w[hello begin end publish consume handled schedule request].freeze
+      OPS = %w[hello begin end publish consume handled schedule request
+               declareStream readStream metrics].freeze
 
       class UnsupportedOp < StandardError; end
+
+      # The telemetry seam, recording every metric name with its labels.
+      class Recorder
+        def initialize
+          @samples = []
+          @lock = Mutex.new
+        end
+
+        def count(metric, _delta = 1, **labels) = record(metric, labels)
+        def observe(metric, _value, **labels) = record(metric, labels)
+        def gauge(metric, _value, **labels) = record(metric, labels)
+
+        def samples = @lock.synchronize { @samples.dup }
+
+        private
+
+        def record(metric, labels)
+          sample = { name: metric, tags: labels.to_h { |k, v| [k.to_s, v.to_s] } }
+          @lock.synchronize { @samples << sample }
+        end
+      end
 
       # Maps each TCK operation onto the public API.
       class Driver
@@ -32,6 +54,8 @@ module AceMQ
           @consumers = {}
           @counts = {}
           @redelivered = {}
+          @order = {}
+          @recorder = Recorder.new
           @scheduler = nil
           @requesters = {}
           @lock = Mutex.new
@@ -44,7 +68,10 @@ module AceMQ
         def begin(args)
           self.end({})
           origin = "#{args.fetch("clientName", "tck")}@#{Socket.gethostname}"
-          @connection = Connection.open(@url, origin: origin)
+          # Publisher confirms cannot be turned off in this library, so a
+          # case's confirms: false changes nothing here.
+          @recorder = Recorder.new
+          @connection = Connection.open(@url, origin: origin, telemetry: @recorder)
           {}
         end
 
@@ -57,6 +84,7 @@ module AceMQ
           @consumers.clear
           @counts.clear
           @redelivered.clear
+          @order.clear
           @connection&.close
           @connection = nil
           {}
@@ -75,8 +103,6 @@ module AceMQ
           policy = RetryPolicy.fixed(retry_args.fetch("maxAttempts", 3),
                                      retry_args.fetch("delayMs", 1000) / 1000.0)
           handle = args["handle"]
-          @counts[handle] = Hash.new(0)
-          @redelivered[handle] = Hash.new(0)
           handler = handler_for(handle, args["behaviour"] || {})
 
           mq.apply(Topology.new.queue(queue, dead_letter: true, retry_policy: policy))
@@ -88,8 +114,27 @@ module AceMQ
         def handled(args)
           handle = args["handle"]
           @lock.synchronize do
-            { counts: @counts.fetch(handle).dup, redelivered: @redelivered.fetch(handle).dup }
+            { counts: @counts.fetch(handle).dup, redelivered: @redelivered.fetch(handle).dup,
+              order: @order.fetch(handle).dup }
           end
+        end
+
+        def declare_stream(args)
+          Patterns.declare_stream(mq, args["queue"], max_age: args["maxAgeMs"] / 1000.0)
+          {}
+        end
+
+        def read_stream(args)
+          handle = args["handle"]
+          offset = args["offset"] == "first" ? Patterns::StreamOffset.first : Patterns::StreamOffset.next
+          @consumers[handle] = Patterns.read_stream(mq, args["queue"], offset: offset,
+                                                    &handler_for(handle, {}))
+          {}
+        end
+
+        def metrics(_args)
+          samples = @recorder.samples
+          { names: samples.map { |s| s[:name] }.uniq.sort, samples: samples }
         end
 
         def schedule(args)
@@ -117,14 +162,16 @@ module AceMQ
         # named in failFirst with an ordinary exception, which the consumer
         # turns into a retry.
         def handler_for(handle, behaviour)
-          counts = @counts[handle]
-          redelivered = @redelivered[handle]
+          counts = @counts[handle] = Hash.new(0)
+          redelivered = @redelivered[handle] = Hash.new(0)
+          order = @order[handle] = []
           fail_first = behaviour["failFirst"] || {}
           sleep_for = behaviour.fetch("sleepMs", 0) / 1000.0
           lambda do |message|
             ident = message.payload["id"].to_s
             seen = @lock.synchronize do
               redelivered[ident] += 1 if message.redelivered?
+              order << ident
               counts[ident] += 1
             end
             sleep(sleep_for) if sleep_for.positive?
@@ -145,22 +192,25 @@ module AceMQ
         end
       end
 
+      # Most specific first: PublishingPausedError is a PublishError.
+      KINDS = {
+        UnsupportedOp => "unsupported", Patterns::RequestTimedOut => "timeout",
+        Patterns::ResponderFailed => "responder", PublishingPausedError => "paused",
+        PublishError => "nacked", FatalError => "decode"
+      }.freeze
+
       def self.kind_of(failure)
-        case failure
-        when UnsupportedOp then "unsupported"
-        when Patterns::RequestTimedOut then "timeout"
-        when Patterns::ResponderFailed then "responder"
-        when PublishError then failure.unroutable? ? "unroutable" : "refused"
-        when FatalError then "decode"
-        else "other"
-        end
+        return "unroutable" if failure.is_a?(PublishError) && failure.unroutable?
+
+        KINDS.find { |type, _| failure.is_a?(type) }&.last || "other"
       end
 
       def self.answer(driver, request)
         op = request["op"].to_s
         raise UnsupportedOp, op unless OPS.include?(op)
 
-        { id: request["id"], ok: true, result: driver.public_send(op, request) }
+        method = op.gsub(/[A-Z]/) { "_#{_1.downcase}" }
+        { id: request["id"], ok: true, result: driver.public_send(method, request) }
       rescue StandardError => e
         { id: request["id"], ok: false,
           error: { kind: kind_of(e), type: e.class.name, message: e.message } }
