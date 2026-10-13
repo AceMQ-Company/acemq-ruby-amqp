@@ -51,10 +51,10 @@ module AceMQ
     #
     # == The tags
     #
-    # +exchange+, +queue+, +outcome+, +target+, +pipeline+ and +step+ are what
-    # this library attaches. The wider family vocabulary also has +routing.key+,
-    # +message.type+ and +transport+, and the first two of those are **not legal
-    # Prometheus label names**: a dot is not allowed in one, and a scrape
+    # +exchange+, +routing.key+, +message.type+, +queue+, +outcome+, +target+,
+    # +pipeline+ and +step+ are what this library attaches. The wider family
+    # vocabulary also has +transport+. +routing.key+ and +message.type+ are
+    # **not legal Prometheus label names**: a dot is not allowed in one, and a scrape
     # containing +routing.key="order.placed"+ is rejected whole rather than in
     # part. {Registry#to_prometheus} renders them as +routing_key+ and
     # +message_type+; an observer of your own that talks to Prometheus has to do
@@ -74,12 +74,18 @@ module AceMQ
     # delivering messages, and a library that let it become one would have made
     # observability a source of outages.
     module Telemetry
-      # Publishes, tagged with +exchange+ and +outcome+.
+      # Publishes, tagged with +exchange+, +routing.key+, +message.type+ and
+      # +outcome+ — the tags Java's +MetricNames+ puts on a publish.
       #
       # One counter rather than two: +outcome=confirmed+ is a message the broker
       # took, +outcome=failed+ one it would not, and the sum of the two is how
       # many times this process tried — a number that used to need adding up.
       PUBLISH_TOTAL = "acemq.publish.total"
+
+      # How long a publish took, in seconds, from the call to the broker's
+      # answer, tagged the same way as {PUBLISH_TOTAL}. Recorded for every
+      # outcome, so a slow +failed+ is told apart from a slow +confirmed+.
+      PUBLISH_DURATION = "acemq.publish.duration"
 
       # Deliveries handled, tagged with +queue+ and +outcome+.
       #
@@ -375,8 +381,20 @@ module AceMQ
         # Every timing, as {Timing}.
         def timings = @lock.synchronize { @timings.dup }
 
-        # One counter, for a test or an endpoint that wants a single number.
-        def [](metric, **labels) = @lock.synchronize { @counts[self.class.key(metric, labels)] }
+        # One counter, for a test or an endpoint that wants a single number:
+        # the sum of every series of +metric+ whose labels include the ones
+        # given. Naming fewer labels than were recorded adds the rest up, so a
+        # lookup written before a tag was added keeps reading the same total.
+        def [](metric, **labels)
+          wanted = labels.map { |name, value| "#{name}=#{value}" }
+          @lock.synchronize do
+            @counts.sum do |key, value|
+              name, rest = key.split("{", 2)
+              have = rest.to_s.delete_suffix("}").split(",")
+              name == metric.to_s && (wanted - have).empty? ? value : 0
+            end
+          end
+        end
 
         # The Prometheus text exposition format, as a string.
         #

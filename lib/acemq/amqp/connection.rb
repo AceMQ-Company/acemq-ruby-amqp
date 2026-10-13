@@ -317,6 +317,7 @@ module AceMQ
       #   when +mandatory+ and it reached no queue
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
                   reply_to: nil, mandatory: false, **fields)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if envelope && !fields.empty?
           raise ArgumentError,
                 "publish was given both an envelope and the fields to build one " \
@@ -331,7 +332,7 @@ module AceMQ
         context = PublishContext.new(exchange: exchange, routing_key: to,
                                      envelope: envelope, payload: payload,
                                      reply_to: reply_to, mandatory: mandatory)
-        send_intercepted(context, codec, persistent)
+        send_intercepted(context, codec, persistent, started)
       rescue StandardError => e
         # Counted before the interceptors are told, so a publish refused by an
         # interceptor is counted too. It did not reach the broker, which is the
@@ -342,8 +343,8 @@ module AceMQ
         # publish is a broker or a network, an unroutable one is a binding
         # nobody made, and an operator told +failed+ goes looking in the wrong
         # place. The span reads the same word off the same failure.
-        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1, exchange: exchange,
-                                                      outcome: Telemetry::Outcome.of_publish_failure(e))
+        record_publish(context, Telemetry::Outcome.of_publish_failure(e), started,
+                       exchange: exchange, to: to)
         @interceptors.on_publish_error(context, e) if context
         raise
       end
@@ -398,6 +399,7 @@ module AceMQ
       #   message declined unsent because the broker had blocked the connection
       def publish_all(payloads, to:, exchange: "", envelopes: nil, codec: nil, persistent: true,
                       reply_to: nil, mandatory: false, **fields)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         payloads = check_batch!(payloads, envelopes, fields)
         return [] if payloads.empty?
 
@@ -407,7 +409,7 @@ module AceMQ
           PublishContext.new(exchange: exchange, routing_key: to, envelope: envelope,
                              payload: payload, reply_to: reply_to, mandatory: mandatory)
         end
-        send_all_intercepted(contexts, codec, persistent)
+        send_all_intercepted(contexts, codec, persistent, started)
       end
 
       # Reads messages from a queue until the returned consumer is cancelled.
@@ -591,13 +593,32 @@ module AceMQ
       # could change one of them and not the others would be a seam with a hole
       # in it, and the hole would be found by whoever needed to redirect a
       # message rather than only stamp one.
-      def send_intercepted(context, codec, persistent)
+      def send_intercepted(context, codec, persistent, started)
         @interceptors.before_publish(context)
         @transport.publish(**message_for(context, codec, persistent))
-        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1,
-                         exchange: context.exchange, outcome: Telemetry::Outcome::CONFIRMED)
+        record_publish(context, Telemetry::Outcome::CONFIRMED, started)
         @interceptors.after_confirm(context)
         context.envelope
+      end
+
+      # Counts one publish and times it, with Java's tags: +exchange+,
+      # +routing.key+, +message.type+ and +outcome+, all read off the context
+      # because an interceptor may have redirected or retyped the message —
+      # or off the arguments, with an empty type, when the call failed before
+      # there was a context. The duration runs from the call to the confirm,
+      # in seconds, like every other duration this library observes.
+      def record_publish(context, outcome, started, exchange: nil, to: nil)
+        type = ""
+        if context
+          exchange = context.exchange
+          to = context.routing_key
+          type = context.envelope.type_on(to)
+        end
+        tags = { exchange: exchange, Telemetry::TAG_ROUTING_KEY => to.to_s,
+                 Telemetry::TAG_MESSAGE_TYPE => type, outcome: outcome }
+        @telemetry.count(Telemetry::PUBLISH_TOTAL, 1, **tags)
+        @telemetry.observe(Telemetry::PUBLISH_DURATION,
+                           Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, **tags)
       end
 
       # The message as the transport takes it, read off the context so that a
@@ -646,7 +667,7 @@ module AceMQ
       # rather than a reason to abandon the messages already prepared. The
       # confirms follow the same rule for the same reason: what the caller has
       # to act on is how many really went.
-      def send_all_intercepted(contexts, codec, persistent)
+      def send_all_intercepted(contexts, codec, persistent, started)
         failures = Array.new(contexts.size)
         outgoing = []
         positions = []
@@ -664,7 +685,7 @@ module AceMQ
         positions.zip(@transport.publish_all(outgoing)) do |index, result|
           failures[index] = result if result.is_a?(StandardError)
         end
-        report_batch(contexts, failures)
+        report_batch(contexts, failures, started)
       end
 
       # Tells every message's interceptors and counters how it went, in payload
@@ -673,7 +694,7 @@ module AceMQ
       # Counted and reported per message, exactly as a single publish is: a
       # batch is a way of sending a hundred messages in one round trip, not a
       # way of turning a hundred messages into one metric.
-      def report_batch(contexts, failures)
+      def report_batch(contexts, failures, started)
         contexts.each_with_index do |context, index|
           failure = failures[index]
           outcome = if failure
@@ -681,8 +702,7 @@ module AceMQ
                     else
                       Telemetry::Outcome::CONFIRMED
                     end
-          @telemetry.count(Telemetry::PUBLISH_TOTAL, 1, exchange: context.exchange,
-                                                        outcome: outcome)
+          record_publish(context, outcome, started)
           if failure
             @interceptors.on_publish_error(context, failure)
           else

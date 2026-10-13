@@ -1225,6 +1225,20 @@ RSpec.describe "against a real broker", :integration do
                      exchange: "", outcome: "unroutable"]).to eq(0)
     end
 
+    # Java's tags on a real confirm: routing.key and message.type on the
+    # counter, and the same series timed as acemq.publish.duration.
+    it "counts and times a confirmed publish under its routing key and type" do
+      mq.publish({ "order_id" => "A-5" }, to: queue)
+
+      telemetry = AceMQ::AMQP::Telemetry
+      tags = { :exchange => "", telemetry::TAG_ROUTING_KEY => queue,
+               telemetry::TAG_MESSAGE_TYPE => queue, :outcome => "confirmed" }
+      expect(metrics[telemetry::PUBLISH_TOTAL, **tags]).to eq(1)
+      timing = metrics.timings.fetch(telemetry::Registry.key(telemetry::PUBLISH_DURATION, tags))
+      expect(timing.count).to eq(1)
+      expect(timing.max).to be > 0
+    end
+
     it "leaves a publish that did not ask alone, which is what the default is for" do
       # Confirmed and silently dropped: the broker's own behaviour, unchanged
       # for every caller who did not ask. This is why `mandatory` is opt-in.

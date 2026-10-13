@@ -110,6 +110,16 @@ module AceMQ
         )
       end
 
+      # The type this envelope goes out with under a routing key: its own,
+      # else the key, else {DEFAULT_TYPE}. The one rule the header and the
+      # +message.type+ tag on a publish are both read off.
+      #
+      # @param routing_key [String]
+      # @return [String]
+      def type_on(routing_key = "")
+        [type, routing_key.to_s].find { |t| !t.empty? } || DEFAULT_TYPE
+      end
+
       # The AMQP headers for this envelope.
       #
       # @param routing_key [String] used when no type was given
@@ -117,7 +127,7 @@ module AceMQ
       def to_headers(routing_key = "")
         written = {
           Headers::ID => id,
-          Headers::TYPE => [type, routing_key.to_s].find { |t| !t.empty? } || DEFAULT_TYPE,
+          Headers::TYPE => type_on(routing_key),
           Headers::VERSION => version,
           Headers::CORRELATION => correlation_id.empty? ? id : correlation_id,
           Headers::ATTEMPT => attempt,

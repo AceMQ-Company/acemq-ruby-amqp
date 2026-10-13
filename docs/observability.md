@@ -19,7 +19,8 @@ written for one reads the same against another:
 
 | | |
 |---|---|
-| `acemq.publish.total` | by `exchange` and `outcome` — `confirmed`, `unroutable`, `failed` or `refused` |
+| `acemq.publish.total` | by `exchange`, `routing.key`, `message.type` and `outcome` — `confirmed`, `unroutable`, `failed` or `refused` |
+| `acemq.publish.duration` | seconds from the call to the broker's answer, tagged the same way as `acemq.publish.total` |
 | `acemq.consume.total` | by `queue` and `outcome` — what the consumer decided, exactly one series per delivery |
 | `acemq.consume.duration` | seconds, by `queue` and `outcome`; handler and interceptors together |
 | `acemq.consume.attempts` | by `queue`; which go each delivery was, sampled on the way **in** |
@@ -34,6 +35,11 @@ written for one reads the same against another:
 This is Java's `MetricNames` vocabulary, which is the family's. Read the
 [migration note](#the-metric-names-moved-onto-javas) if you have a dashboard
 written against the old Ruby names — every one of them changed.
+
+Since 0.7.14 every publish is timed as `acemq.publish.duration` and both publish
+metrics carry the `routing.key` and `message.type` tags, as Java's do.
+`Registry#[]` sums every series whose labels include the ones it is given, so a
+lookup naming only `exchange` and `outcome` reads the same total as before.
 
 `acemq.publish.total` counts a publish an interceptor refused as `failed` too. It
 did not reach the broker, which is what the metric is about; whether it was the
@@ -139,10 +145,10 @@ on Java's names.
 
 ### The tag names, and Prometheus
 
-`exchange`, `queue`, `outcome`, `target`, `pipeline` and `step` are what this
-library attaches. The wider family vocabulary also has `routing.key`,
-`message.type` and `transport`, and **the first two are not legal Prometheus
-label names** — a dot is not allowed in one, and a single bad line does not lose
+`exchange`, `routing.key`, `message.type`, `queue`, `outcome`, `target`,
+`pipeline` and `step` are what this library attaches. The wider family
+vocabulary also has `transport`. **`routing.key` and `message.type` are not
+legal Prometheus label names** — a dot is not allowed in one, and a single bad line does not lose
 one series, it makes the whole scrape unparseable and loses every metric the
 process publishes. [`to_prometheus`](#to_prometheus) renders them `routing_key`
 and `message_type`, which is what Go settled on. An observer of your own that
@@ -197,8 +203,8 @@ numbers themselves are what is wanted:
 metrics = Telemetry::Registry.new
 mq = Connection.open(url, telemetry: metrics)
 
-metrics[Telemetry::PUBLISH_TOTAL, exchange: "orders-events", outcome: "confirmed"]  # => 3
-metrics.counts                    # => { "acemq.publish.total{exchange=orders-events,outcome=confirmed}" => 3, … }
+metrics[Telemetry::PUBLISH_TOTAL, exchange: "orders-events", outcome: "confirmed"]  # => 3, every key summed
+metrics.counts                    # => { "acemq.publish.total{exchange=orders-events,message.type=order.placed,outcome=confirmed,routing.key=order.placed}" => 3, … }
 metrics.gauges
 metrics.timings["acemq.consume.duration{outcome=acked,queue=orders.new}"].to_s
 # => "12 in 0.481s (mean 0.0401s)"
@@ -227,7 +233,7 @@ puts metrics.to_prometheus
 
 ```
 # TYPE acemq_publish_total counter
-acemq_publish_total{exchange="orders-events",outcome="confirmed"} 3
+acemq_publish_total{exchange="orders-events",message_type="order.placed",outcome="confirmed",routing_key="order.placed"} 3
 # TYPE acemq_consume_duration summary
 acemq_consume_duration_count{outcome="acked",queue="orders.new"} 12
 acemq_consume_duration_sum{outcome="acked",queue="orders.new"} 0.481

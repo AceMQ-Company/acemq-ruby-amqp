@@ -52,6 +52,34 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       expect(metrics[Telemetry::PUBLISH_TOTAL, exchange: "orders-events", **confirmed]).to eq(1)
     end
 
+    # Java's MetricNames: a publish is counted and timed under exchange,
+    # routing.key, message.type and outcome (TCK TEL-001).
+    it "counts and times a publish with the reference tags" do
+      mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders-events")
+
+      tags = { :exchange => "orders-events", Telemetry::TAG_ROUTING_KEY => "order.placed",
+               Telemetry::TAG_MESSAGE_TYPE => "order.placed",
+               :outcome => Telemetry::Outcome::CONFIRMED }
+      key = Telemetry::Registry.key(Telemetry::PUBLISH_TOTAL, tags)
+      expect(metrics.counts).to eq(key => 1)
+      timing = metrics.timings.fetch(Telemetry::Registry.key(Telemetry::PUBLISH_DURATION, tags))
+      expect(timing.count).to eq(1)
+      expect(timing.min).to be >= 0
+    end
+
+    # TCK TEL-002: a failure carries the routing key too, and is timed.
+    it "tags a failed publish with its routing key and its own type" do
+      allow(transport).to receive(:publish).and_raise(AceMQ::AMQP::PublishError, "nacked")
+      expect { mq.publish({ "a" => 1 }, to: "orders.full", type: "order.v2") }
+        .to raise_error(AceMQ::AMQP::PublishError)
+
+      tags = { Telemetry::TAG_ROUTING_KEY => "orders.full",
+               Telemetry::TAG_MESSAGE_TYPE => "order.v2",
+               :outcome => Telemetry::Outcome::FAILED }
+      expect(metrics[Telemetry::PUBLISH_TOTAL, **tags]).to eq(1)
+      expect(metrics.timings.keys).to include(start_with(Telemetry::PUBLISH_DURATION))
+    end
+
     it "counts a publish the broker would not take, and one an interceptor refused" do
       # Both are messages that did not reach the broker, which is what the
       # metric is about; whether it was the broker or a policy that said no is
@@ -320,6 +348,19 @@ RSpec.describe AceMQ::AMQP::Telemetry do
       metrics.count("acemq.test", 1, exchange: "e", queue: "q")
 
       expect(metrics.counts).to eq({ "acemq.test{exchange=e,queue=q}" => 2 })
+    end
+
+    # A lookup written before a tag was added has to keep reading the total.
+    it "adds up every series whose labels include the ones asked for" do
+      metrics.count("acemq.test", 1, exchange: "e", "routing.key": "a", outcome: "x")
+      metrics.count("acemq.test", 2, exchange: "e", "routing.key": "b", outcome: "x")
+      metrics.count("acemq.test", 4, exchange: "e", "routing.key": "b", outcome: "y")
+      metrics.count("acemq.other", 8, exchange: "e", outcome: "x")
+
+      expect(metrics["acemq.test", exchange: "e", outcome: "x"]).to eq(3)
+      expect(metrics["acemq.test", "routing.key": "b"]).to eq(6)
+      expect(metrics["acemq.test"]).to eq(7)
+      expect(metrics["acemq.test", exchange: "nope"]).to eq(0)
     end
 
     it "renders the Prometheus text format, dots and all" do

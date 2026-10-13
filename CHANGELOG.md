@@ -8,10 +8,28 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.14] - 2026-10-13
+
 ### Added
 
 - Runs the AceMQ TCK v0.1.0. The driver is `spec/tck/driver.rb`, run by a `tck`
   job in CI.
+- **`acemq.publish.duration`**, `Telemetry::PUBLISH_DURATION`: how long a
+  publish took, in seconds, from the call to the broker's answer, for every
+  outcome. Java's `MetricNames.PUBLISH_DURATION`; TCK TEL-001.
+- **`routing.key` and `message.type` tags on `acemq.publish.total`** and on the
+  new duration, beside `exchange` and `outcome`, as Java tags them. The type is
+  the one written in `x-acemq-type`. TCK TEL-001 and TEL-002. Prometheus
+  renders them `routing_key` and `message_type`.
+- `Envelope#type_on(routing_key)`: the type an envelope goes out with under a
+  routing key.
+
+### Changed
+
+- **`Registry#[]` sums every series whose labels include the ones given.** It
+  read one exact key, so a lookup naming only `exchange` and `outcome` would
+  have read 0 once the publish metrics gained tags; it now reads the same total
+  as before.
 
 ### Fixed
 
