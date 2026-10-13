@@ -15,7 +15,7 @@ Then, in your `Gemfile`:
 
 ```ruby
 source "https://acemq.org/gems" do
-  gem "acemq-amqp", "~> 0.7", ">= 0.7.13"
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.14"
 end
 gem "bunny", ">= 2.23", "< 4"
 ```
@@ -23,7 +23,7 @@ gem "bunny", ">= 2.23", "< 4"
 The gem is not on rubygems.org. It is served from AceMQ's own static feed,
 <https://acemq.org/gems> — no account and no credential, and the `source` block
 is the whole of the setup; `bunny` still comes from rubygems.org. The current
-release is **0.7.13**. Outside Bundler, `gem install acemq-amqp --source
+release is **0.7.14**. Outside Bundler, `gem install acemq-amqp --source
 https://acemq.org/gems` does the same.
 
 The gem itself has **no runtime dependencies**. `bunny` is required lazily by
