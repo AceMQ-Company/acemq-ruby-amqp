@@ -8,6 +8,16 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Patterns.replay` with a filter returned before the declined messages were
+  back.** The pass nacked what the filter passed over and returned at once; a
+  nack has no reply, and RabbitMQ answers a depth query ahead of the queued
+  requeues, so `message_count` straight after a replay could read the source
+  queue short, sometimes zero. The replay now waits (bounded, 5 s) until the
+  queue's depth counts them again. Matched messages are still moved exactly
+  once, acknowledged only after the broker confirmed the new copy.
+
 ## [0.7.14] - 2026-10-13
 
 ### Added

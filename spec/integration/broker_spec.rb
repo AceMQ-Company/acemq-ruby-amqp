@@ -1002,6 +1002,26 @@ RSpec.describe "against a real broker", :integration do
       # The declined one went back rather than being lost.
       expect(wait_for { mq.message_count(dlq) == 1 }).to be(true)
     end
+
+    it "has every declined message back on the queue by the time it returns" do
+      # No wait_for here, on purpose. A nack has no reply in AMQP, so a replay
+      # that returned straight after nacking what it declined would be read, by
+      # a depth check on another channel, before the broker had them back: the
+      # count comes out short, often zero. The check is immediate, with enough
+      # declined messages that a lost race shows.
+      declined = 200
+      declined.times { |i| mq.publish({ "n" => i }, to: dlq, error: "no such customer") }
+      mq.publish({ "n" => "move" }, to: dlq, error: "connection timeout")
+      expect(wait_for { mq.message_count(dlq) == declined + 1 }).to be(true)
+
+      result = AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: queue) do |envelope, _|
+        envelope.error.include?("timeout")
+      end
+
+      expect([result.moved, result.skipped]).to eq([1, declined])
+      expect(mq.message_count(dlq)).to eq(declined)
+      expect(mq.message_count(queue)).to eq(1)
+    end
   end
 
   describe "a stream" do

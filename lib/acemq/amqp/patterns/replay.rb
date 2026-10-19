@@ -131,6 +131,11 @@ module AceMQ
       #
       # @api private
       class Replay
+        # How long a release waits for the declined messages to be counted back
+        # on the queue. Bounded, because a consumer draining the queue at the
+        # same time keeps the depth below the target and would hold it for ever.
+        REQUEUE_WAIT = 5.0
+
         def initialize(connection, from:, exchange:, routing_key:, limit:, deadline:, restart:,
                        filter:)
           # The raw publish, because a replayed message keeps the bytes and the
@@ -253,13 +258,42 @@ module AceMQ
         # Nothing to report if it cannot: the pass is over, and a message that
         # will not go back is one the broker returns itself when the connection
         # closes.
+        #
+        # And not returned until the broker has them back. A nack has no reply,
+        # and no round trip on the channel waits for it either: RabbitMQ answers
+        # a depth query (queue.declare passive, the management API) ahead of the
+        # requeues waiting in the queue's mailbox, by priority. So a depth check
+        # straight after a replay that only nacked reads the queue short — zero,
+        # sometimes, on a queue every declined message is still on. The depth is
+        # what is waited on, then: it is the thing the caller will look at.
         def release
+          return if @declined.empty?
+
+          before = depth
+          held = @declined.size
           @declined.each do |delivery|
             delivery.nack(requeue: true)
           rescue StandardError
             nil
           end
           @declined = []
+          await_depth(before + held) if before
+        end
+
+        def await_depth(target)
+          ends_at = monotonic + REQUEUE_WAIT
+          loop do
+            current = depth
+            break if current.nil? || current >= target || monotonic >= ends_at
+
+            sleep(0.01)
+          end
+        end
+
+        def depth
+          @transport.message_count(@from)
+        rescue StandardError
+          nil
         end
 
         def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
