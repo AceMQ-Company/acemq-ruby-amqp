@@ -18,6 +18,11 @@ While the version is `0.x` the public API may change in any release.
   queue's depth counts them again. Matched messages are still moved exactly
   once, acknowledged only after the broker confirmed the new copy.
 
+### Added
+
+- Runs the AceMQ TCK v0.3.0 (was v0.2.0), which adds REPLAY-001 to the
+  default run: 20 cases.
+
 ## [0.7.14] - 2026-10-13
 
 ### Added

@@ -342,6 +342,6 @@ jobs:
           ruby-version: '3.3'
           bundler-cache: true
 
-      - uses: AceMQ-Company/acemq-amqp-tck@v0.2.0
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.3.0
         with:
           driver: bundle exec ruby -Ilib spec/tck/driver.rb
