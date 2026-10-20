@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.15] - 2026-10-20
+
 ### Fixed
 
 - **`Patterns.replay` with a filter returned before the declined messages were
