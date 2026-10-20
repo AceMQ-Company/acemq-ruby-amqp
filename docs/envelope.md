@@ -109,6 +109,11 @@ version of another language's library are **not** handed back as yours.
 a namespace rather than as a list, so a field added to the contract next year
 does not start appearing in application code that predates it.
 
+They are not dropped either. Since 0.7.16 the envelope keeps them, unchanged, in
+`Envelope#extensions`, and every republish this library makes — a retry hop, a
+dead letter, a park, a replay — carries them on. Before that, each of those
+republishes lost them.
+
 That is also why the patterns' own headers are *not* in that namespace —
 `acemq-reply-to`, `acemq-routing-slip`, `acemq-replayed-from` and the rest are
 ordinary application headers, because a responder or a slip handler has to be

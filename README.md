@@ -241,7 +241,9 @@ ergonomics are native.
 Application headers are kept apart from these. A reserved name in your own
 headers raises rather than being dropped — silently discarding a header
 somebody set is worse than saying no — and unknown `x-acemq-` names from a
-newer version of another language's library are not handed back as yours.
+newer version of another language's library are not handed back as yours. They
+are kept in `Envelope#extensions` and carried unchanged by every retry hop, dead
+letter, park and replay.
 
 ### Retry
 
@@ -1036,7 +1038,9 @@ clock.
 
 Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
 and `acemq-replay-count`, so a consumer that needs to treat them differently
-can and one that does not is unaffected. A message is acknowledged only after
+can and one that does not is unaffected. `acemq-replayed-at` is ISO-8601 UTC to
+the millisecond, `2026-01-02T03:04:05.678Z`, and the copy has `x-acemq-error`
+cleared. A message is acknowledged only after
 the broker has confirmed the new copy: a crash in that gap replays it twice,
 which is the right way round for a dead-letter queue. The copy is published
 mandatory, so one that reaches no queue leaves the original where it was and

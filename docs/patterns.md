@@ -453,7 +453,8 @@ fix was for the bug, not for the clock.
 
 Each replayed message is stamped with `acemq-replayed-from`, `acemq-replayed-at`
 and `acemq-replay-count`, so a consumer that needs to treat them differently can
-and one that does not is unaffected. A message is acknowledged only after the
+and one that does not is unaffected. `acemq-replayed-at` is ISO-8601 UTC to the
+millisecond, `2026-01-02T03:04:05.678Z` (since 0.7.16; whole seconds before). A message is acknowledged only after the
 broker has confirmed the new copy: a crash in that gap replays it twice, which
 is the right way round for a dead-letter queue. The copy is published
 **mandatory**, so a destination nothing is bound to leaves the message where it
