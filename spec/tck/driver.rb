@@ -21,7 +21,7 @@ module AceMQ
   module AMQP
     module TCK
       OPS = %w[hello begin end publish consume handled schedule request
-               declareStream readStream metrics].freeze
+               declareStream readStream metrics replay].freeze
 
       class UnsupportedOp < StandardError; end
 
@@ -150,6 +150,17 @@ module AceMQ
             mq, to: key[1], exchange: key[0], timeout: args["timeoutMs"] / 1000.0
           )
           { reply: requester.call(args["body"]) }
+        end
+
+        # One filtered replay and nothing after it: the case reads the source
+        # queue the moment this answers.
+        def replay(args)
+          ids = args["ids"]
+          result = Patterns.replay(mq, from: args["from"], exchange: "",
+                                       routing_key: args["queue"]) do |_envelope, body|
+            ids.include?(JSON.parse(body)["id"])
+          end
+          { replayed: result.moved }
         end
 
         private
