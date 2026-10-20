@@ -280,12 +280,10 @@ or reaches no queue at all — a queue that was never declared is the usual reas
 for both — this counter goes up, labelled with the `queue` it came from and the
 `target` it could not reach.
 
-The message is rejected to the broker rather than left unsettled, so the delivery
-ends once instead of being redelivered until somebody notices. That makes this
-counter the only sign the path leaves, which is exactly why it is worth an alert:
-anything above zero means a topology was never applied, and it names the queue to
-declare. Go and Python reject and count the same way, so one alert reads the same
-against all three.
+The delivery is handed back to the broker, after a second, and set aside once the
+broker takes the copy, so nothing is lost meanwhile. This counter is the only sign
+the path leaves, which is exactly why it is worth an alert: anything above zero
+means a topology was never applied or a queue is full, and it names the queue.
 
 ## Tracing
 

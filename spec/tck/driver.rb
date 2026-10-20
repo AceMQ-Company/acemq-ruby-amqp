@@ -21,7 +21,7 @@ module AceMQ
   module AMQP
     module TCK
       OPS = %w[hello begin end publish consume handled schedule request
-               declareStream readStream metrics replay].freeze
+               declareStream readStream metrics replay pipeline].freeze
 
       class UnsupportedOp < StandardError; end
 
@@ -90,24 +90,50 @@ module AceMQ
           {}
         end
 
+        # mandatory absent is the library's default (mandatory); true and false
+        # are passed as given.
         def publish(args)
+          options = args.key?("mandatory") ? { mandatory: args["mandatory"] } : {}
+          fields = envelope_fields(args["envelope"] || {})
           envelope = mq.publish(args["body"], to: args["routingKey"],
                                               exchange: args.fetch("exchange", ""),
-                                              **envelope_fields(args["envelope"] || {}))
+                                              **options, **fields)
           { messageId: envelope.id }
         end
 
+        # retry absent is no retry policy at all: the consumer as the library
+        # builds it when the caller configures none.
         def consume(args)
           queue = args["queue"]
-          retry_args = args["retry"] || {}
-          policy = RetryPolicy.fixed(retry_args.fetch("maxAttempts", 3),
-                                     retry_args.fetch("delayMs", 1000) / 1000.0)
+          retry_args = args["retry"]
+          policy = retry_args && RetryPolicy.fixed(retry_args.fetch("maxAttempts", 3),
+                                                   retry_args.fetch("delayMs", 1000) / 1000.0)
           handle = args["handle"]
           handler = handler_for(handle, args["behaviour"] || {})
+          if args["idempotent"]
+            handler = Patterns.idempotent(Patterns::InMemoryIdempotencyStore.new, &handler)
+          end
 
           mq.apply(Topology.new.queue(queue, dead_letter: true, retry_policy: policy))
           @consumers[handle] = mq.consume(queue, retry_policy: policy,
                                                  prefetch: args.fetch("prefetch", 10), &handler)
+          {}
+        end
+
+        # The pipeline's own topology, and on each step's queue a consumer that
+        # follows the slip with the identity: count, and pass the body on.
+        def pipeline(args)
+          pipeline = Patterns::Pipeline.new(args["name"], args["steps"])
+          mq.apply(pipeline.topology)
+          counted = handler_for(args["handle"], {})
+          pipeline.steps.each do |step|
+            follow = pipeline.follow(mq) do |message|
+              counted.call(message)
+              message.payload
+            end
+            @consumers["#{args["handle"]}/#{step}"] =
+              mq.consume(pipeline.queue_for(step), &follow)
+          end
           {}
         end
 
@@ -127,8 +153,8 @@ module AceMQ
         def read_stream(args)
           handle = args["handle"]
           offset = args["offset"] == "first" ? Patterns::StreamOffset.first : Patterns::StreamOffset.next
-          @consumers[handle] = Patterns.read_stream(mq, args["queue"], offset: offset,
-                                                    &handler_for(handle, {}))
+          handler = handler_for(handle, args["behaviour"] || {})
+          @consumers[handle] = Patterns.read_stream(mq, args["queue"], offset: offset, &handler)
           {}
         end
 

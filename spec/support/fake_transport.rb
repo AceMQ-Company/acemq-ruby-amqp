@@ -140,11 +140,13 @@ class FakeDelivery
   attr_reader :acked, :nacked
 
   def self.build(body: "{}", headers: {}, routing_key: "orders.new",
-                 content_type: "application/json", redelivered: false, reply_to: nil)
+                 content_type: "application/json", redelivered: false, reply_to: nil,
+                 message_id: nil)
     recorder = new
     delivery = AceMQ::AMQP::Delivery.new(
       body: body, content_type: content_type, routing_key: routing_key,
-      message_id: headers["x-acemq-id"].to_s, headers: headers, redelivered: redelivered,
+      message_id: message_id || headers["x-acemq-id"].to_s, headers: headers,
+      redelivered: redelivered,
       reply_to: reply_to,
       on_ack: -> { recorder.record_ack },
       on_nack: ->(requeue) { recorder.record_nack(requeue) }

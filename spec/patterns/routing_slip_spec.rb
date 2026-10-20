@@ -372,6 +372,8 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
     end
 
     it "sends a message into the first step, in the declared form" do
+      # Applied, because a publish is mandatory by default.
+      mq.apply(pipeline.topology)
       pipeline.start(mq, { "order_id" => "A-1" })
 
       sent = transport.published.last

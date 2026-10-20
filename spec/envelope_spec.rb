@@ -125,6 +125,31 @@ RSpec.describe AceMQ::AMQP::Envelope do
     expect(envelope.age).to be_within(60).of(3600)
   end
 
+  # AMQP-IDEM-002: a message from a publisher outside the family carries a
+  # message_id and no envelope headers, and two copies of it are one message.
+  it "takes the AMQP message_id as its id when x-acemq-id is missing" do
+    expect(Envelope.from_headers({}, "orders", message_id: "d-2").id).to eq("d-2")
+    expect(Envelope.from_headers({ Headers::ID => "d-1" }, "orders", message_id: "other").id)
+      .to eq("d-1")
+    expect(Envelope.from_headers({}, "orders", message_id: "").id).not_to be_empty
+  end
+
+  # AMQP-ENV-014: an x-acemq- header written by a newer library survives.
+  it "carries an x-acemq- header it has no field for through every copy" do
+    envelope = Envelope.from_headers({ Headers::ID => "m1", "x-acemq-future" => "kept" })
+
+    expect(envelope.headers).not_to have_key("x-acemq-future")
+    expect(envelope.extensions).to eq("x-acemq-future" => "kept")
+    expect(envelope.with(attempt: 2, error: "boom").to_headers["x-acemq-future"]).to eq("kept")
+  end
+
+  it "reads and writes a first-seen time to the exact millisecond" do
+    # Through a Float, 1767323045678 came back as ...677.
+    envelope = Envelope.from_headers({ Headers::FIRST_SEEN => 1_767_323_045_678 })
+
+    expect(envelope.to_headers[Headers::FIRST_SEEN]).to eq(1_767_323_045_678)
+  end
+
   it "cannot be changed underneath a log line" do
     envelope = Envelope.new(id: "one")
     later = envelope.with(attempt: 2)

@@ -535,15 +535,15 @@ RSpec.describe AceMQ::AMQP::Consumer do
     end
   end
 
-  # Republishing to the dead-letter or parking queue can itself fail — a queue
-  # that was never declared is the usual reason. The message is rejected to the
-  # broker rather than left unsettled: an unsettled delivery is redelivered for
-  # ever, which is a queue that never drains and a handler that runs for ever,
-  # and from outside it looks exactly like a handler failing on the same message
-  # rather than like a dead-letter queue that is missing. This counter is the
-  # only thing that tells the two apart. Go and Python reject here too.
+  # AMQP-RETRY-007 and AMQP-PUB-002, TCK PARK-002: a dead letter or a park the
+  # broker will not take loses nothing. The delivery is handed back to the
+  # broker, after a pause, and set aside once the broker takes the copy. It
+  # used to be rejected without requeue, which dropped it, or dead-lettered it
+  # through the source queue's own arguments where it does not belong.
   describe "a message that cannot be set aside" do
-    it "counts acemq.messages.set.aside.failed and rejects the delivery" do
+    before { stub_const("AceMQ::AMQP::Consumer::SET_ASIDE_PAUSE", 0) }
+
+    it "counts acemq.messages.set.aside.failed and requeues the delivery" do
       metrics = AceMQ::AMQP::Telemetry::Registry.new
       transport.refuse!("orders.new.dlq")
       delivery, recorder = FakeDelivery.build(headers: headers_for)
@@ -553,14 +553,12 @@ RSpec.describe AceMQ::AMQP::Consumer do
 
       expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
                      queue: "orders.new", target: "orders.new.dlq"]).to eq(1)
-      expect(recorder.rejected?).to be(true)
+      expect(recorder.requeued?).to be(true)
+      expect(recorder.rejected?).to be(false)
       expect(recorder.acked?).to be(false)
-      # Not requeued, which is the whole difference. A requeue is the loop this
-      # used to have with extra steps.
-      expect(recorder.requeued?).to be(false)
     end
 
-    it "counts it for the parking queue too, and names which one it was" do
+    it "requeues a refused park too, and names which queue it was" do
       metrics = AceMQ::AMQP::Telemetry::Registry.new
       transport.refuse!("orders.new.parked")
       delivery, recorder = FakeDelivery.build(body: "{ not json", headers: headers_for)
@@ -569,8 +567,18 @@ RSpec.describe AceMQ::AMQP::Consumer do
 
       expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
                      queue: "orders.new", target: "orders.new.parked"]).to eq(1)
-      expect(recorder.rejected?).to be(true)
-      expect(recorder.requeued?).to be(false)
+      expect(recorder.requeued?).to be(true)
+      expect(recorder.rejected?).to be(false)
+    end
+
+    it "waits before handing it back, so a queue that stays full is not a hot loop" do
+      stub_const("AceMQ::AMQP::Consumer::SET_ASIDE_PAUSE", 0.2)
+      transport.refuse!("orders.new.parked")
+      delivery, = FakeDelivery.build(body: "{ not json", headers: headers_for)
+      subject = consumer { Ack.accept }
+      expect(subject).to receive(:sleep).with(0.2)
+
+      subject.handle(delivery)
     end
 
     # A dead-letter queue that is not on the broker is the case this counter
@@ -587,7 +595,7 @@ RSpec.describe AceMQ::AMQP::Consumer do
 
       expect(metrics[AceMQ::AMQP::Telemetry::SET_ASIDE_FAILED,
                      queue: "orders.new", target: "orders.new.dlq"]).to eq(1)
-      expect(recorder.rejected?).to be(true)
+      expect(recorder.requeued?).to be(true)
       expect(recorder.acked?).to be(false)
     end
   end
@@ -656,6 +664,75 @@ RSpec.describe AceMQ::AMQP::Consumer do
       expect(dead.headers["tenant"]).to eq("acme")
       expect(dead.body).to eq('{"id":"A-1"}')
       expect(dead.content_type).to eq("application/json")
+    end
+
+    # AMQP-ENV-014 and AMQP-RETRY-008, TCK RETRY-004: an x-acemq- header this
+    # library has no field for used to be dropped when the headers were
+    # rebuilt from the envelope.
+    it "keeps an x-acemq- header it does not know, and attempt 1 with no policy" do
+      delivery, = FakeDelivery.build(
+        body: '{"id":"m1"}',
+        headers: headers_for(id: "m1").merge("x-acemq-future" => "kept",
+                                             Headers::FIRST_SEEN => 1_767_323_045_678)
+      )
+      consumer { raise "boom" }.handle(delivery)
+
+      dead = transport.published_to("orders.new.dlq").first
+      expect(dead.headers["x-acemq-future"]).to eq("kept")
+      expect(dead.headers[Headers::ATTEMPT]).to eq(1)
+      expect(dead.headers[Headers::FIRST_SEEN]).to eq(1_767_323_045_678)
+      expect(dead.headers[Headers::ERROR]).to match(/boom/)
+    end
+  end
+
+  # AMQP-RETRY-006 and AMQP-ENV-014, TCK PARK-001.
+  describe "the message that goes to the parking queue" do
+    it "carries every header it arrived with, attempt and unknown x-acemq- ones included" do
+      arrived = headers_for(id: "bad-1", attempt: 2).merge(
+        Headers::VERSION => 2, Headers::CAUSATION => "cause-p1",
+        Headers::ORIGIN => "orders@host-7", Headers::FIRST_SEEN => 1_767_323_045_678,
+        "x-acemq-future" => "kept", "x-tenant" => "acme"
+      )
+      delivery, = FakeDelivery.build(body: "not json{", headers: arrived)
+      consumer(policy: AceMQ::AMQP::RetryPolicy.fixed(3, 0)) { Ack.accept }.handle(delivery)
+
+      parked = transport.published_to("orders.new.parked")
+      expect(parked.size).to eq(1)
+      expect(parked.first.headers.except(Headers::ERROR)).to eq(arrived)
+      expect(parked.first.headers[Headers::ERROR]).to match(/could not be decoded/)
+      expect(parked.first.message_id).to eq("bad-1")
+      expect(parked.first.body).to eq("not json{")
+    end
+  end
+
+  # AMQP-STREAM-004, TCK STREAM-003: what a stream reader is built on.
+  describe "a consumer that stops on failure" do
+    def stopping(&handler)
+      described_class.new(transport: transport, queue: "events", handler: handler,
+                          codec: AceMQ::AMQP::JSONCodec.new,
+                          retry_policy: AceMQ::AMQP::RetryPolicy.none, stop_on_failure: true)
+                     .start(prefetch: 10, concurrency: 1, tag: nil, arguments: {})
+    end
+
+    it "stops at the failed message, settles nothing, and copies it nowhere" do
+      reader = stopping { raise "projection broke" }
+      delivery, recorder = FakeDelivery.build(headers: headers_for, routing_key: "events")
+      reader.handle(delivery)
+
+      expect(recorder.settled?).to be(false)
+      expect(transport.published).to be_empty
+      expect(reader.running?).to be(false)
+      expect(reader.stopped_by).to match(/projection broke/)
+    end
+
+    it "acknowledges and carries on while the handler accepts" do
+      reader = stopping { Ack.accept }
+      delivery, recorder = FakeDelivery.build(headers: headers_for, routing_key: "events")
+      reader.handle(delivery)
+
+      expect(recorder.acked?).to be(true)
+      expect(reader.running?).to be(true)
+      expect(reader.stopped_by).to be_nil
     end
   end
 end

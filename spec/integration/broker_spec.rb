@@ -1259,10 +1259,16 @@ RSpec.describe "against a real broker", :integration do
       expect(timing.max).to be > 0
     end
 
-    it "leaves a publish that did not ask alone, which is what the default is for" do
-      # Confirmed and silently dropped: the broker's own behaviour, unchanged
-      # for every caller who did not ask. This is why `mandatory` is opt-in.
-      mq.publish({ "order_id" => "A-4" }, to: nowhere)
+    it "is mandatory by default, so a message with nowhere to go is an error" do
+      # AMQP-PUB-006: it used to be confirmed and silently dropped.
+      expect { mq.publish({ "order_id" => "A-6" }, to: nowhere) }
+        .to raise_error(AceMQ::AMQP::PublishError) { |error| expect(error.unroutable?).to be(true) }
+    end
+
+    it "leaves a publish that opted out alone" do
+      # Confirmed and silently dropped: the broker's own behaviour, for a caller
+      # who said so.
+      mq.publish({ "order_id" => "A-4" }, to: nowhere, mandatory: false)
 
       expect(metrics[AceMQ::AMQP::Telemetry::PUBLISH_TOTAL,
                      exchange: "", outcome: "confirmed"]).to eq(1)

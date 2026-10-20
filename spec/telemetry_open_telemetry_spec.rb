@@ -57,7 +57,7 @@ RSpec.describe AceMQ::AMQP::Telemetry::OpenTelemetry do
     before do
       tracing.install(mq)
       mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders",
-                                          type: "order.placed.v2")
+                                          type: "order.placed.v2", mandatory: false)
     end
 
     it "is a producer span named after its destination and the verb" do

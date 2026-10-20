@@ -149,12 +149,21 @@ RSpec.describe AceMQ::AMQP::Telemetry do
                      outcome: Telemetry::Outcome::CONFIRMED]).to eq(0)
     end
 
-    # The default, and it has to stay the default: turning it on for everybody
-    # would turn a message nobody happens to be listening for yet into an
-    # exception in code that has never seen one.
-    it "does not ask for a return unless the caller did, and confirms as before" do
+    # AMQP-PUB-006, TCK PUB-003: a user publish is mandatory unless the caller
+    # opts out. It used to be off by default, so a message nothing was bound
+    # for was confirmed and dropped.
+    it "asks for a return by default" do
       transport.unroutable!("order.placed")
-      mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders-events")
+
+      expect do
+        mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders-events")
+      end.to raise_error(AceMQ::AMQP::PublishError) { |e| expect(e.unroutable?).to be(true) }
+    end
+
+    it "does not ask for a return when the caller opts out, and confirms as before" do
+      transport.unroutable!("order.placed")
+      mq.publish({ "order_id" => "A-1" }, to: "order.placed", exchange: "orders-events",
+                                          mandatory: false)
 
       events = { exchange: "orders-events" }
       expect(transport.published.map(&:mandatory)).to eq([false])

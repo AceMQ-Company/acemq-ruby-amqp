@@ -435,10 +435,10 @@ means somebody sorts them by hand — which is what a handler had to cause befor
 
 The republish to `{queue}.dlq` or `{queue}.parked` is mandatory, so a queue
 nobody declared is heard rather than swallowed by the default exchange. When it
-fails, **the message is rejected to the broker** — settled once, not redelivered
-forever — and `acemq.messages.set.aside.failed` goes up, labelled with the queue
-that could not be reached. It is the only sign this path leaves and is worth an
-alert. Go and Python do the same.
+fails, **the message is handed back to the broker** — requeued after a second,
+never rejected into nothing — and `acemq.messages.set.aside.failed` goes up,
+labelled with the queue that could not be reached. It is the only sign this path
+leaves and is worth an alert. Java, Go and .NET do the same.
 
 Without a policy, `Connection` uses `RetryPolicy.none` — one delivery — so a
 retry against an unconfigured connection dead-letters immediately. That is a
@@ -1327,9 +1327,13 @@ read the same stream independently and a new one can start from the beginning.
 Positions: `first`, `next` (the default), `last`, `at(offset)`, `since(time)`.
 
 **Acknowledging does not remove the message** — it advances this consumer's
-position. Rejecting does not dead-letter it either, because there is nothing to
-remove it from. Nothing is lost, and nothing is retried for you, which is why
-`read_stream` uses `RetryPolicy.none` whatever the connection carries.
+position. **A handler that fails stops the reader** at that message: nothing
+after it is handled and no copy of it is written anywhere, so a reader restarted
+at the same offset after the fix sees it again. `Consumer#running?` turns false
+and `Consumer#stopped_by` says why. `on_failure: :dead_letter` copies the failed
+message to `{stream}.dlq` and carries on instead. Nothing is ever retried for
+you, which is why `read_stream` uses `RetryPolicy.none` whatever the connection
+carries.
 
 **A reader carries on where it was after a lost connection.** When the
 connection recovers, the subscription restarts from the oldest entry still

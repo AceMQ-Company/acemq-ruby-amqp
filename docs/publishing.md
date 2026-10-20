@@ -236,11 +236,12 @@ that was never declared. The publish is confirmed and the message is dropped in
 the same breath. It is the quietest failure AMQP has — the publisher succeeded,
 the consumer is still waiting, and nothing anywhere says why.
 
-`mandatory: true` asks the broker to hand the message back instead:
+Every `publish` is mandatory by default, which asks the broker to hand the
+message back instead:
 
 ```ruby
 begin
-  mq.publish(event, to: "order.placed", exchange: "orders-events", mandatory: true)
+  mq.publish(event, to: "order.placed", exchange: "orders-events")
 rescue AceMQ::AMQP::PublishError => e
   raise unless e.unroutable?
 
@@ -255,12 +256,12 @@ that the message did not arrive still rescues one thing. Go and Python split the
 same failure the same way; Java has it as `PublishOptions.allowUnroutable()`,
 which is the same choice made the other way up.
 
-**It is off by default**, and per publish. Turning it on for everybody would turn
-a message nobody happens to be listening for *yet* into an exception in code that
-has never seen one, which is a fair description of most first deployments. It
-also costs a round trip only when a message really is unroutable: the return
-frame arrives ahead of the confirm the publish was already waiting for, so a
-message that routes normally pays nothing.
+**It is on by default** (AMQP-PUB-006; it used to be off), and per publish. A message nobody is listening for *yet* is now an
+exception the publisher sees rather than a loss nobody does. Pass
+`mandatory: false` to opt out for a publish whose message may legitimately go
+nowhere. It costs a round trip only when a message really is unroutable: the
+return frame arrives ahead of the confirm the publish was already waiting for, so
+a message that routes normally pays nothing.
 
 An unroutable publish counts `acemq.publish.total{outcome="unroutable"}` rather
 than `outcome="failed"`, and marks the publish span `unroutable`, which **is** an
@@ -275,7 +276,6 @@ the next step, the scheduler's hops and final delivery, and `replay`. Each of
 those keeps the original — retried, handed back or left in place — when the
 broker had nowhere to put the copy, rather than acknowledging it into nothing. See
 [when a message cannot be set aside](reliability.md#when-a-message-cannot-be-set-aside-at-all).
-Your own `publish` keeps its default.
 
 The one exception is a responder's reply. It is not mandatory: a reply queue
 that has gone means the caller has gone, and retrying the request would only

@@ -37,7 +37,8 @@ module AceMQ
       DEFAULT_TYPE = "message"
 
       attr_reader :id, :type, :version, :correlation_id, :causation_id,
-                  :attempt, :first_seen, :origin, :error, :claim, :headers, :route
+                  :attempt, :first_seen, :origin, :error, :claim, :headers, :route,
+                  :extensions
 
       # @param id [String] the message identifier
       # @param type [String] the logical type
@@ -55,11 +56,16 @@ module AceMQ
       #   every hop: an envelope has to hold them because they are reserved
       #   names and so cannot go in +headers+, and it does not have to know what
       #   they mean. {Patterns::RoutingSlip} is what reads and writes them.
+      # @param extensions [Hash] the +x-acemq-+ headers this library has no
+      #   field for, as a newer version or another language's library wrote
+      #   them. Carried unchanged through every retry, dead letter, park and
+      #   replay, so a header added to the family later is not lost the first
+      #   time a Ruby consumer republishes the message.
       # @raise [ArgumentError] if a reserved name is in +headers+
       def initialize(id: SecureRandom.uuid, type: "", version: 1,
                      correlation_id: nil, causation_id: "", attempt: 1,
                      first_seen: Time.now, origin: "", error: "", claim: "",
-                     headers: {}, route: {})
+                     headers: {}, route: {}, extensions: {})
         self.class.refuse_reserved_names(headers)
 
         @id = id
@@ -74,6 +80,7 @@ module AceMQ
         @claim = claim
         @headers = headers.freeze
         @route = route.freeze
+        @extensions = extensions.freeze
         freeze
       end
 
@@ -84,16 +91,22 @@ module AceMQ
       # a string is still a message, and refusing to deliver it would hand the
       # application an outage rather than a message.
       #
+      # A message without +x-acemq-id+ — one a publisher outside this family
+      # sent — takes its AMQP +message_id+ as its id when it has one, the
+      # property every AceMQ library sets equal to +x-acemq-id+. Two copies of
+      # such a message are then one message, to an idempotent consumer and to
+      # whoever reads a dead letter; a fresh id per delivery would make them
+      # two. Only with neither is an id made up.
+      #
       # @param raw [Hash, nil] the delivery's headers
       # @param routing_key [String] what it arrived on
+      # @param message_id [String, nil] the delivery's AMQP +message_id+
       # @return [Envelope]
-      def self.from_headers(raw, routing_key = "")
+      def self.from_headers(raw, routing_key = "", message_id: nil)
         raw = (raw || {}).transform_keys(&:to_s)
         application = raw.reject { |name, _| Headers.reserved?(name) }
 
-        id = text(raw[Headers::ID])
-        id = SecureRandom.uuid if id.empty?
-
+        id = id_of(raw, message_id)
         new(
           id: id,
           type: presence(text(raw[Headers::TYPE]), presence(routing_key, DEFAULT_TYPE)),
@@ -106,7 +119,8 @@ module AceMQ
           error: text(raw[Headers::ERROR]),
           claim: text(raw[Headers::CLAIM]),
           headers: application,
-          route: raw.slice(*Headers::ROUTE_HEADERS)
+          route: raw.slice(*Headers::ROUTE_HEADERS),
+          extensions: raw.select { |name, _| Headers.extension?(name) }
         )
       end
 
@@ -141,7 +155,7 @@ module AceMQ
           written[name] = value unless value.nil? || value.empty?
         end
 
-        written.merge(route).merge(headers)
+        written.merge(extensions).merge(route).merge(headers)
       end
 
       # A copy with fields changed.
@@ -161,7 +175,8 @@ module AceMQ
           error: changes.fetch(:error, error),
           claim: changes.fetch(:claim, claim),
           headers: changes.fetch(:headers, headers),
-          route: changes.fetch(:route, route)
+          route: changes.fetch(:route, route),
+          extensions: changes.fetch(:extensions, extensions)
         )
       end
 
@@ -196,13 +211,16 @@ module AceMQ
       end
 
       # @api private
+      # Exact, not through a Float: 1767323045678 read back as
+      # +Time.at(1767323045.678)+ writes 1767323045677, and a first-seen time
+      # that moves a millisecond on every hop is not the time it was first seen.
       def self.millis(time)
-        (time.to_f * 1000).to_i
+        (time.to_r * 1000).floor
       end
 
       # @api private
       def self.from_millis(value)
-        Time.at(value / 1000.0)
+        Time.at(Rational(value, 1000))
       end
 
       # A header as a string. Some clients put strings on the wire as bytes,
@@ -227,12 +245,19 @@ module AceMQ
         fallback
       end
 
+      # +x-acemq-id+, else the AMQP +message_id+, else a fresh one.
+      #
+      # @api private
+      def self.id_of(raw, message_id)
+        [text(raw[Headers::ID]), text(message_id)].find { |id| !id.empty? } || SecureRandom.uuid
+      end
+
       # @api private
       def self.presence(value, fallback)
         value.nil? || value.empty? ? fallback : value
       end
 
-      private_class_method :presence
+      private_class_method :presence, :id_of
     end
   end
 end

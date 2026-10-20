@@ -257,6 +257,9 @@ module AceMQ
         # Put back because another consumer holds a live idempotency claim on
         # it, with the attempt unchanged: not a retry, never a dead letter.
         IN_PROGRESS = "in_progress"
+        # Left unsettled by a consumer that stops on failure, such as a stream
+        # reader, which stopped at this message.
+        STOPPED = "stopped"
 
         # A request that got its answer, and one that ran out of patience.
         ANSWERED = "answered"
@@ -272,8 +275,8 @@ module AceMQ
 
         # Every word above, for a test that wants to check a tag is one of them.
         ALL = [CONFIRMED, UNROUTABLE, FAILED, REFUSED, ACKED, RETRIED, DEAD_LETTERED,
-               REJECTED, PARKED, IN_PROGRESS, ANSWERED, TIMED_OUT, PUBLISHED, COMPLETED,
-               ENDED_EARLY].freeze
+               REJECTED, PARKED, IN_PROGRESS, STOPPED, ANSWERED, TIMED_OUT, PUBLISHED,
+               COMPLETED, ENDED_EARLY].freeze
 
         # Which word a publish that raised should be counted and traced under.
         #

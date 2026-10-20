@@ -92,6 +92,16 @@ module AceMQ
       def self.reserved?(name)
         name.to_s.start_with?(PREFIX)
       end
+
+      # Whether a header is AceMQ's and not one this library knows: written by
+      # a newer version, or by another language's library. Such a header is
+      # carried unchanged by every republish this library makes, never dropped.
+      #
+      # @param name [String] a header name
+      # @return [Boolean]
+      def self.extension?(name)
+        reserved?(name) && !RESERVED.include?(name.to_s)
+      end
     end
   end
 end

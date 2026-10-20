@@ -145,17 +145,23 @@ module AceMQ
       # advance this consumer's position, so restarting from +next+ carries on
       # rather than re-reading.
       #
-      # Rejecting does not dead-letter it either, because there is nothing to
-      # remove it from. A message that cannot be handled has to be dealt with by
-      # the handler — logged, copied to another queue, counted — and the stream
-      # moves on regardless. That is the trade a stream makes: nothing is lost,
-      # and nothing is retried for you.
+      # == A handler that fails stops the reader
       #
-      # Which is why the retry policy here defaults to {RetryPolicy.none}
-      # whatever the connection carries. A policy that republished a failed
-      # message onto a stream would append a second copy to it rather than
-      # redelivering the first, and a projection reading that stream would then
-      # see the message twice.
+      # By default (AMQP-STREAM-004) a handler that raises, or answers anything
+      # but {Ack.accept}, stops the reader at that message: the subscription is
+      # cancelled, nothing after the message is handled, and no copy of it is
+      # written anywhere — not +{stream}.dlq+, not +{stream}.parked+, not the
+      # stream. The stream is the record, so a reader restarted at the same
+      # offset after the fix sees the message again; a projection with a gap
+      # in it is invisible once it exists, a stopped reader is not.
+      # {Consumer#running?} is then false and {Consumer#stopped_by} says why.
+      #
+      # +on_failure: :dead_letter+ is the opt-out, and was the default before
+      # this release: the retry policy is {RetryPolicy.none} whatever the
+      # connection carries, so a failed message is copied to +{stream}.dlq+
+      # with +x-acemq-error+ and the reader carries on past it. To skip a
+      # failure instead, rescue it in the handler and accept. Never a retry: a
+      # republish onto a stream appends a second copy for every reader.
       #
       # @param connection [Connection]
       # @param stream [String]
@@ -163,18 +169,29 @@ module AceMQ
       # @param prefetch [Integer] required by RabbitMQ for a stream
       # @param name [String, nil] identifies this consumer to the broker, which
       #   is what makes server-side offset tracking possible
+      # @param on_failure [Symbol] +:stop+ (the default) or +:dead_letter+
       # @return [Consumer]
       def self.read_stream(connection, stream, offset: StreamOffset.next,
-                           prefetch: DEFAULT_STREAM_PREFETCH, name: nil, **options, &handler)
+                           prefetch: DEFAULT_STREAM_PREFETCH, name: nil, on_failure: :stop,
+                           **options, &handler)
         raise ArgumentError, "read_stream needs a block to handle messages" unless handler
+        unless ON_FAILURE.include?(on_failure)
+          raise ArgumentError,
+                "read_stream on_failure: must be one of #{ON_FAILURE.inspect}, " \
+                "not #{on_failure.inspect}"
+        end
 
         connection.consume(
           stream, prefetch: prefetch, tag: name,
                   retry_policy: options.delete(:retry_policy) || RetryPolicy.none,
                   arguments: { "x-stream-offset" => offset.to_argument },
+                  stop_on_failure: on_failure == :stop,
                   **options, &refusing_put_back(stream, handler)
         )
       end
+
+      # What {read_stream} does with a message its handler fails on.
+      ON_FAILURE = %i[stop dead_letter].freeze
 
       # A stream cannot put a message back: republishing appends a second copy
       # to the log for every reader. So {Ack.in_progress} -- what

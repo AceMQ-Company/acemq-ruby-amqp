@@ -47,7 +47,8 @@ module AceMQ
       # The queue a message was replayed out of.
       REPLAYED_FROM_HEADER = "acemq-replayed-from"
 
-      # When it was replayed, as RFC 3339.
+      # When it was replayed: ISO-8601 UTC to the millisecond,
+      # +2026-01-02T03:04:05.678Z+, the form every AceMQ library writes.
       REPLAYED_AT_HEADER = "acemq-replayed-at"
 
       # How many times it has been replayed.
@@ -179,7 +180,8 @@ module AceMQ
         private
 
         def consider(delivery)
-          envelope = Envelope.from_headers(delivery.headers, delivery.routing_key)
+          envelope = Envelope.from_headers(delivery.headers, delivery.routing_key,
+                                           message_id: delivery.message_id)
           unless @filter.nil? || @filter.call(envelope, delivery.body)
             @result.skipped += 1
             return @declined << delivery
@@ -221,7 +223,7 @@ module AceMQ
         def stamped(envelope, routing_key)
           going_back(envelope).to_headers(routing_key).merge(
             REPLAYED_FROM_HEADER => @from,
-            REPLAYED_AT_HEADER => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            REPLAYED_AT_HEADER => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.%LZ"),
             REPLAY_COUNT_HEADER => replay_count(envelope) + 1
           )
         end

@@ -492,7 +492,8 @@ module AceMQ
           # timeout on the requester's side. See docs/request-reply.md.
           connection.publish(response, to: reply_to,
                                        correlation_id: request.envelope.correlation_id,
-                                       causation_id: request.envelope.id, headers: headers)
+                                       causation_id: request.envelope.id, headers: headers,
+                                       mandatory: false)
         rescue StandardError
           # A send that never happened must not be counted as an answer, which
           # is the one failure incrementing early would otherwise introduce.

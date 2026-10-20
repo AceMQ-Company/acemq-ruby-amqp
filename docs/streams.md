@@ -248,15 +248,14 @@ library is built on moving one:
 | On a queue | On a stream |
 |---|---|
 | The [retry ladder](reliability.md#where-the-delay-is-waited) | **Does not apply.** Nothing can be moved to a rung and back |
-| `{queue}.dlq` | **None.** A failed message stays where it is |
+| `{queue}.dlq` | **None** by default: a failed message stays where it is and the reader stops |
 | `{queue}.parked` | **None**, for the same reason |
 | Requeue | **Nothing to put back.** Acknowledging only advances a position |
 | Selective reject | **No.** Positions move forward; they do not skip holes |
 | Destructive read | **No.** Every other consumer still sees what you consumed |
 
-So a failing handler has exactly two honest outcomes, and the handler has to pick
-one. There is no `skip_failures` flag here as there is in Java — what you do
-instead is decide in your own code:
+So a failing handler stops the reader unless you decide otherwise. There is no
+`skip_failures` flag here as there is in Java — to skip, decide in your own code:
 
 ```ruby
 Patterns.read_stream(mq, "orders.log", name: "projection-1") do |message|
@@ -270,23 +269,19 @@ rescue StandardError => e
 end
 ```
 
-Accepting is skipping. The other outcome is to leave a copy somewhere: raising,
-or returning `Ack.retry`, runs into `RetryPolicy.none`, which has no attempts
-left, so the message is given up on and republished to `orders.log.dlq` with
-`x-acemq-error` saying why — see [giving up](reliability.md#giving-up). The
-consumer does **not** stop; it advances past the message and carries on. If
-nothing declared `orders.log.dlq`, the mandatory republish is returned by the
-broker and the delivery is rejected instead, which on a stream means the copy is
-simply not made; see
-[when a message cannot be set aside](reliability.md#when-a-message-cannot-be-set-aside-at-all).
+Accepting is skipping. Raising, or answering anything but `Ack.accept`, **stops
+the reader** at that message (AMQP-STREAM-004), which is the default: the
+subscription is cancelled, nothing after the message is handled, and no copy of
+it is written anywhere — not `orders.log.dlq`, not `orders.log.parked`, not the
+stream. `Consumer#running?` turns false and `Consumer#stopped_by` says why. The
+message is still in the stream, so a reader restarted at the same offset sees it
+again after the fix; a projection with a gap in it is invisible once it exists, a
+stopped reader is not.
 
-There is no "stop on the first failure" mode here, and it cannot be had by
-cancelling the consumer from inside its own handler — `Consumer#cancel` waits for
-in-flight handlers, and the handler doing the cancelling is one of them. Stopping
-means recording the offset, setting a flag, and cancelling from the thread that
-started the consumer. Which is worth doing for a projection: the message is still
-in the stream, and a consumer restarted at the same offset sees it again after
-the fix.
+`on_failure: :dead_letter` is the other outcome, and was the default before this
+release: the failure runs into `RetryPolicy.none`, which has no attempts left, so
+the message is republished to `orders.log.dlq` with `x-acemq-error` saying why —
+see [giving up](reliability.md#giving-up) — and the reader advances past it.
 
 **However you skip, nothing else records the gap.** No dead-letter queue holds a
 copy unless you arranged one, and no counter moves on its own. The two lines in

@@ -215,6 +215,33 @@ RSpec.describe "replaying a dead-letter queue" do
     expect(transport.message_count(dlq)).to eq(2)
   end
 
+  # AMQP-ENV-013, AMQP-REPLAY-003 and AMQP-ENV-014, as TCK REPLAY-002 checks
+  # them: the time to the millisecond with a Z, attempt one, no error, and every
+  # other header as it arrived — an x-acemq- one this library has no field for
+  # included.
+  it "stamps the time to the millisecond and keeps a header it does not know" do
+    transport.publish(exchange: "", routing_key: dlq, body: '{"id":"r1"}',
+                      content_type: "application/json", message_id: "r1",
+                      headers: { "x-acemq-id" => "r1", "x-acemq-attempt" => 3,
+                                 "x-acemq-first-seen" => 1_767_323_045_678,
+                                 "x-acemq-error" => "handler failed", "acemq-replay-count" => 1,
+                                 "x-acemq-future" => "kept", "x-tenant" => "acme" })
+
+    AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "orders.new")
+
+    replayed = transport.published_to("orders.new").first
+    headers = replayed.headers
+    expect(headers[AceMQ::AMQP::Patterns::REPLAYED_AT_HEADER])
+      .to match(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/)
+    expect(headers[AceMQ::AMQP::Patterns::REPLAY_COUNT_HEADER]).to eq(2)
+    expect(headers[AceMQ::AMQP::Headers::ATTEMPT]).to eq(1)
+    expect(headers).not_to have_key(AceMQ::AMQP::Headers::ERROR)
+    expect(headers["x-acemq-future"]).to eq("kept")
+    expect(headers["x-tenant"]).to eq("acme")
+    expect(headers[AceMQ::AMQP::Headers::FIRST_SEEN]).to eq(1_767_323_045_678)
+    expect(replayed.message_id).to eq("r1")
+  end
+
   it "refuses a replay with no queue to read from" do
     expect { AceMQ::AMQP::Patterns.replay(mq, from: "") }
       .to raise_error(ArgumentError, /needs a queue to read from/)

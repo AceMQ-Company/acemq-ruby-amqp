@@ -138,7 +138,9 @@ RSpec.describe "streams" do
     end
 
     it "refuses to put a message back, which would append a second copy" do
-      AceMQ::AMQP::Patterns.read_stream(mq, "events") { AceMQ::AMQP::Ack.in_progress(0) }
+      AceMQ::AMQP::Patterns.read_stream(mq, "events", on_failure: :dead_letter) do
+        AceMQ::AMQP::Ack.in_progress(0)
+      end
       mq.publish({ "n" => 1 }, to: "events")
 
       expect(transport.published_to("events").size).to eq(1)
@@ -155,6 +157,43 @@ RSpec.describe "streams" do
       mq.publish({ "n" => 1 }, to: "events")
 
       expect(seen).to eq([{ "n" => 1 }])
+    end
+
+    # AMQP-STREAM-003 and AMQP-STREAM-004, TCK STREAM-003. It used to
+    # dead-letter the message to {stream}.dlq and carry on past it.
+    it "stops at a failed message by default, handles nothing after it, copies it nowhere" do
+      seen = []
+      reader = AceMQ::AMQP::Patterns.read_stream(mq, "events") do |message|
+        seen << message.payload["n"]
+        raise "projection broke" if message.payload["n"] == 2
+
+        AceMQ::AMQP::Ack.accept
+      end
+      [1, 2, 3].each { |n| mq.publish({ "n" => n }, to: "events") }
+
+      expect(seen).to eq([1, 2])
+      expect(reader.running?).to be(false)
+      expect(reader.stopped_by).to match(/projection broke/)
+      expect(transport.published.map(&:routing_key)).to eq(%w[events events events])
+    end
+
+    it "dead-letters and carries on when asked to" do
+      seen = []
+      AceMQ::AMQP::Patterns.read_stream(mq, "events", on_failure: :dead_letter) do |message|
+        seen << message.payload["n"]
+        raise "projection broke" if message.payload["n"] == 2
+
+        AceMQ::AMQP::Ack.accept
+      end
+      [1, 2, 3].each { |n| mq.publish({ "n" => n }, to: "events") }
+
+      expect(seen).to eq([1, 2, 3])
+      expect(transport.published_to("events.dlq").size).to eq(1)
+    end
+
+    it "refuses an on_failure it does not know" do
+      expect { AceMQ::AMQP::Patterns.read_stream(mq, "events", on_failure: :skip) { nil } }
+        .to raise_error(ArgumentError, /on_failure/)
     end
 
     it "needs a block to handle messages" do

@@ -8,6 +8,53 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Changed
+
+- **A publish is mandatory by default** (AMQP-PUB-006, TCK PUB-003).
+  `Connection#publish` and `#publish_all` now default to `mandatory: true`, so a
+  message the broker can route nowhere raises a `PublishError` whose
+  `unroutable?` is true instead of being confirmed and silently dropped. Pass
+  `mandatory: false` to opt out. This includes `Patterns::Requester`: a request
+  to a destination with nothing bound now raises at once instead of timing out.
+  A responder's reply stays non-mandatory.
+- **A failing stream handler stops the reader** (AMQP-STREAM-004, TCK
+  STREAM-003). `Patterns.read_stream` takes `on_failure:`, `:stop` by default:
+  the subscription is cancelled at the failed message, nothing after it is
+  handled, and no copy is written to `{stream}.dlq`, `{stream}.parked` or the
+  stream. `Consumer#running?` turns false and the new `Consumer#stopped_by`
+  says why. `on_failure: :dead_letter` keeps the old behaviour (copy to
+  `{stream}.dlq` and carry on). Underneath, `Connection#consume` takes
+  `stop_on_failure:`, and the settlement is counted with the new outcome
+  `stopped`.
+- **A dead letter or park the broker refuses is requeued, not rejected**
+  (AMQP-RETRY-007, AMQP-PUB-002, TCK PARK-002). The delivery is held for
+  `Consumer::SET_ASIDE_PAUSE` (1 s) and then handed back to the broker, so it
+  is set aside once the broker takes the copy. It used to be nacked without
+  requeue, which dropped the message or dead-lettered it through the source
+  queue's own arguments. `acemq.messages.set.aside.failed` still counts it.
+
+### Fixed
+
+- **An `x-acemq-` header this library has no field for was dropped** by every
+  republish it makes: retry hops, dead letters, parks and replays (AMQP-ENV-014,
+  TCK PARK-001, RETRY-004, REPLAY-002). The envelope now carries such headers
+  unchanged, as `Envelope#extensions`.
+- **An idempotent consumer handled both copies of a message without
+  `x-acemq-id`** (AMQP-IDEM-002, TCK IDEM-001). A delivery with no
+  `x-acemq-id` now takes its AMQP `message_id` as its envelope id, so
+  `Patterns.idempotent` keys it by that; a fresh id is made up only when both
+  are missing. `Envelope.from_headers` takes `message_id:`.
+- **`acemq-replayed-at` had whole seconds**; it is now ISO-8601 UTC to the
+  millisecond, `2026-01-02T03:04:05.678Z` (AMQP-ENV-013, TCK REPLAY-002).
+- **`x-acemq-first-seen` could move a millisecond on a republish**: it was read
+  through a Float (`1767323045678` came back as `1767323045677`). Now exact.
+
+### Added
+
+- The TCK driver implements the `pipeline` op, `publish.mandatory`, `consume`
+  without `retry` (no retry policy), `consume.idempotent` and
+  `readStream.behaviour`, and passes the nine pending cases.
+
 ## [0.7.15] - 2026-10-20
 
 ### Fixed

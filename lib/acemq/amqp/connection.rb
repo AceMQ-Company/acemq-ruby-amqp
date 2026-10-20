@@ -299,15 +299,13 @@ module AceMQ
       #   {Patterns::Requester} writes it alongside the +acemq-reply-to+ header
       #   so that a responder in any of the five libraries can answer.
       # @param mandatory [Boolean] whether a message that reaches no queue at
-      #   all is an error rather than a silence. False by default, which is what
-      #   the broker does on its own and what Go and Python default to: a
-      #   publish to an exchange with no matching binding is confirmed and
-      #   dropped, and nothing anywhere says so. Pass +true+ and the broker
-      #   hands the message back instead, which raises a {PublishError} whose
-      #   {PublishError#unroutable?} is true, counts
-      #   +acemq.publish.total{outcome="unroutable"}+, and marks the publish
-      #   span +unroutable+. It costs a round trip only when a message really
-      #   did go nowhere.
+      #   all is an error rather than a silence. True by default
+      #   (AMQP-PUB-006): the broker hands an unroutable message back, which
+      #   raises a {PublishError} whose {PublishError#unroutable?} is true,
+      #   counts +acemq.publish.total{outcome="unroutable"}+, and marks the
+      #   publish span +unroutable+. It costs a round trip only when a message
+      #   really did go nowhere. Pass +false+ to opt out and have the broker
+      #   confirm and drop a message with nowhere to go, saying nothing.
       # @param fields [Hash] envelope fields, when no envelope is given
       # @return [Envelope] what was actually put on the wire, which is what the
       #   interceptors left rather than what was handed in
@@ -316,7 +314,7 @@ module AceMQ
       # @raise [PublishError] when the broker would not take the message, or
       #   when +mandatory+ and it reached no queue
       def publish(payload, to:, exchange: "", envelope: nil, codec: nil, persistent: true,
-                  reply_to: nil, mandatory: false, **fields)
+                  reply_to: nil, mandatory: true, **fields)
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if envelope && !fields.empty?
           raise ArgumentError,
@@ -388,7 +386,8 @@ module AceMQ
       #   per payload when it is not given, which is what {#publish} does for a
       #   single message
       # @param mandatory [Boolean] whether a message that reaches no queue at
-      #   all is an error rather than a silence, per message
+      #   all is an error rather than a silence, per message. True by default,
+      #   as for {#publish}
       # @param fields [Hash] envelope fields, when no envelopes are given
       # @return [Array<Envelope>] what actually went on the wire, in the order
       #   the payloads were given — whatever order the broker confirmed them in
@@ -398,7 +397,7 @@ module AceMQ
       #   broker answered. A {PublishingPausedError} when every failure was a
       #   message declined unsent because the broker had blocked the connection
       def publish_all(payloads, to:, exchange: "", envelopes: nil, codec: nil, persistent: true,
-                      reply_to: nil, mandatory: false, **fields)
+                      reply_to: nil, mandatory: true, **fields)
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         payloads = check_batch!(payloads, envelopes, fields)
         return [] if payloads.empty?
@@ -436,10 +435,15 @@ module AceMQ
       #   +{queue}.parked+. Only for a handler that accepts everything, as the
       #   request-reply reply consumer does: a message given up on then has
       #   nowhere to land and is dropped. @api private
+      # @param stop_on_failure [Boolean] true stops the consumer at the first
+      #   delivery its handler does not accept, instead of retrying or
+      #   setting it aside: that delivery is left unsettled, nothing after it is
+      #   handled, and no copy of it is written anywhere. What a stream reader
+      #   does by default (AMQP-STREAM-004); see {Patterns.read_stream}
       # @return [Consumer]
       def consume(queue, codec: nil, retry_policy: nil, prefetch: nil, concurrency: 1,
                   tag: nil, arguments: {}, retry_threshold: nil, dead_letters: true,
-                  &handler)
+                  stop_on_failure: false, &handler)
         unless handler
           raise ArgumentError,
                 "consume(#{queue.inspect}) needs a block to handle messages"
@@ -450,7 +454,7 @@ module AceMQ
           codec: codec.nil? ? @codec : Codec.check!(codec),
           retry_policy: retry_policy || @retry_policy,
           retry_threshold: retry_threshold || @retry_threshold,
-          interceptors: @interceptors, telemetry: @telemetry
+          interceptors: @interceptors, telemetry: @telemetry, stop_on_failure: stop_on_failure
         )
         consumer.start(prefetch: prefetch || @prefetch, concurrency: concurrency, tag: tag,
                        arguments: arguments, dead_letters: dead_letters)
@@ -774,12 +778,23 @@ module AceMQ
                        Settlement::DEAD_LETTERED => Telemetry::DEAD_LETTERED_TOTAL,
                        Settlement::PARKED => Telemetry::DEAD_LETTERED_TOTAL }.freeze
 
+      # Seconds a delivery whose dead letter or park the broker refused is held
+      # before it is requeued. See {#set_aside}.
+      SET_ASIDE_PAUSE = 1.0
+
       attr_reader :queue, :retry_policy, :codec, :ladder
+
+      # Why a consumer started with +stop_on_failure+ stopped itself, or nil
+      # while it has not.
+      #
+      # @return [String, nil]
+      attr_reader :stopped_by
 
       def initialize(transport:, queue:, handler:, codec:, retry_policy:,
                      retry_threshold: RetryLadder::DEFAULT_THRESHOLD,
-                     interceptors: Interceptors.new, telemetry: nil)
+                     interceptors: Interceptors.new, telemetry: nil, stop_on_failure: false)
         @transport = transport
+        @stop_on_failure = stop_on_failure
         @queue = queue
         @handler = handler
         @codec = codec
@@ -801,7 +816,10 @@ module AceMQ
       # on it, stops delivery without anything in this process being told. A
       # flag set in {#cancel} would say "running" for a consumer that had been
       # deaf for an hour.
-      def running? = !!@subscription&.open?
+      #
+      # False too once a consumer started with +stop_on_failure+ has stopped
+      # itself, although its channel is open until it is cancelled.
+      def running? = !@stopped && !!@subscription&.open?
 
       # @api private
       def start(prefetch:, concurrency:, tag:, arguments:, dead_letters: true)
@@ -850,6 +868,9 @@ module AceMQ
         # policy has been asked. An interceptor left to infer it from the ack
         # reports the message as retried and the delay as nothing.
         context.settlement = decide(context.envelope, ack)
+        if halts?(context.settlement)
+          context.settlement = Settlement.stopped(describe(ack.error))
+        end
         observe(context.settlement, took)
         # After the handler and before the delivery is settled, so an
         # interceptor can still see how it went and still undo whatever it set
@@ -947,7 +968,10 @@ module AceMQ
       # it and calls it attempt one. A policy of five attempts then retries for
       # ever, and the count is lost across a restart as well.
       def envelope_for(delivery)
-        Envelope.from_headers(delivery.headers, delivery.routing_key)
+        # Asked rather than assumed: a delivery from a transport of somebody
+        # else's may not carry the property at all.
+        message_id = delivery.message_id if delivery.respond_to?(:message_id)
+        Envelope.from_headers(delivery.headers, delivery.routing_key, message_id: message_id)
       end
 
       # A codec that chooses by content type needs to be told it; a plain one
@@ -1065,9 +1089,17 @@ module AceMQ
         Settlement.dead_lettered("#{gave_up(envelope)}: #{describe(ack.error)}")
       end
 
+      # Whether this settlement stops a consumer that stops on failure. Anything
+      # it would otherwise retry, put back, dead-letter or park does.
+      def halts?(settlement)
+        @stop_on_failure && !settlement.acked?
+      end
+
       def settle(delivery, envelope, settlement)
         if settlement.acked?
           delivery.ack
+        elsif settlement.stopped?
+          halt(settlement.reason)
         elsif settlement.parked?
           park(delivery, envelope, settlement.reason)
         elsif settlement.dead_letters?
@@ -1125,6 +1157,17 @@ module AceMQ
         there = @transport.queue_exists?(rung)
         @lock.synchronize { @rungs_seen[rung] = true } if there
         there
+      end
+
+      # Stops delivery from inside a handler, leaving this delivery unsettled.
+      #
+      # Only {#stop}: basic.cancel, and deliveries bunny already holds are not
+      # started. Not {#cancel}, which waits for in-flight handlers — this one
+      # among them. The channel, and with it the unsettled delivery, is released
+      # when the consumer is cancelled or its connection closed.
+      def halt(reason)
+        @stopped_by = reason
+        stop
       end
 
       # A short delay, waited by this process.
@@ -1249,7 +1292,7 @@ module AceMQ
       # Sends the message to its parking queue: the body would not decode, or a
       # handler said it cannot be read.
       def park(delivery, envelope, reason)
-        envelope ||= Envelope.from_headers(delivery.headers, delivery.routing_key)
+        envelope ||= envelope_for(delivery)
         set_aside(@parked_queue, delivery, envelope, reason)
       end
 
@@ -1262,16 +1305,17 @@ module AceMQ
       # queue nobody declared is confirmed, acknowledged and gone. Go and Python
       # both publish this one mandatory for the same reason.
       #
-      # **A message that cannot be moved is rejected to the broker**, not
-      # requeued and not left unsettled. This library used to let the
-      # {PublishError} escape {#handle} instead, which settled nothing and let
-      # the broker redeliver — nothing was lost, but the message came back for
-      # ever, the handler ran for ever, and from outside it looked exactly like a
-      # handler failing on the same message rather than like a queue that is
-      # missing. A rejection is bounded and visible: it is settled once, and
-      # whatever dead-lettering the queue itself was declared with is the last
-      # thing between this message and nothing. Go and Python do the same, and
-      # this is now the whole family's answer.
+      # **A message that cannot be moved is handed back to the broker**
+      # (AMQP-RETRY-007, AMQP-PUB-002): requeued, never rejected without
+      # requeue. This library used to reject it, which dropped the message, or
+      # dead-lettered it through whatever the source queue was declared with —
+      # somewhere it does not belong, without +x-acemq-error+. Requeued, it is
+      # set aside once the broker takes the copy, and nothing is lost on the way.
+      # Java, Go and .NET do the same.
+      #
+      # The requeue waits {SET_ASIDE_PAUSE} first, holding the delivery, so a
+      # queue that stays missing or full costs one attempt a second rather than
+      # a loop as fast as the broker can confirm.
       #
       # +acemq.messages.set.aside.failed+ is what says which of the two happened,
       # tagged with the queue that could not be reached. It is the same counter
@@ -1281,7 +1325,10 @@ module AceMQ
         republish(target, delivery, envelope.with(error: reason))
       rescue StandardError
         @telemetry.count(Telemetry::SET_ASIDE_FAILED, 1, queue: @queue, target: target)
-        delivery.nack(requeue: false)
+        sleep(SET_ASIDE_PAUSE)
+        # Not handed back when the drain gave up on this handler meanwhile: the
+        # channel is gone and the broker has the message already. See {#cancel}.
+        hand_back(delivery) unless @released
       else
         # Only once the copy is safely elsewhere. Acknowledging first would drop
         # the message on a broker that then refused the copy — and +else+ rather

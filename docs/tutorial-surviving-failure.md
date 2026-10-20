@@ -444,9 +444,9 @@ the same reason.
 The last two are [the two worth an
 alert](observability.md#the-two-worth-an-alert), because they are failures of
 your *topology* rather than of your handlers, and nothing else shows them. When
-`set.aside.failed` moves, the message is rejected to the broker rather than left
-unsettled, which means the delivery ends once instead of being redelivered until
-somebody notices — so this counter is genuinely the only sign that path leaves.
+`set.aside.failed` moves, the message is handed back to the broker and tried
+again a second later, so nothing is lost — and this counter is genuinely the only
+sign that path leaves.
 
 ## Step 11 — The failure that is not yours
 

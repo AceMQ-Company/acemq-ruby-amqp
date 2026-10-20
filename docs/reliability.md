@@ -346,10 +346,11 @@ them means somebody sorts them by hand.
 ### When a message cannot be set aside at all
 
 Republishing to `{queue}.dlq` or `{queue}.parked` can itself fail, and a queue
-that was never declared is the usual reason. **The message is rejected to the
-broker**, without a requeue, so the delivery is settled once and does not come
-back. Whatever dead-lettering the queue itself was declared with is then the last
-thing between the message and nothing.
+that was never declared, or one at its length limit, is the usual reason. **The
+message is handed back to the broker** (AMQP-RETRY-007): held for a second, then
+requeued, so it is set aside once the broker takes the copy and nothing is lost
+meanwhile. The second is what keeps a queue that stays missing from becoming a
+loop as fast as the broker can confirm.
 
 The republish is mandatory, which is what makes the failure visible at all: the
 default exchange drops what it cannot route without a word, so a set-aside into a
@@ -361,14 +362,11 @@ the broker to hand it back is the only way to hear about it.
 the only sign this path leaves, and it names the queue somebody has to go and
 declare.
 
-This used to leave the delivery unsettled instead — nothing was acknowledged, and
-the broker redelivered the message when the channel closed. Nothing was lost, but
-nothing drained either: an unbounded redelivery loop on a message that cannot be
-set aside is a queue that never empties and a handler that runs forever, and from
-outside it looked exactly like a handler failing forever on the same message. A
-rejection is bounded and visible. Go and Python have always rejected here, and
-all three now do the same thing and raise the same counter, so an alert written
-once reads the same against every one of them.
+Until this release the delivery was rejected without a requeue instead, which
+dropped the message, or dead-lettered it through whatever the source queue was
+declared with, somewhere it does not belong and without `x-acemq-error`. Java, Go
+and .NET requeue here too, and the counter is the same in every language, so an
+alert written once reads the same against every one of them.
 
 For this to work, a codec has to raise `DecodeError` rather than its own
 exception class — see [codecs](serialization.md#writing-your-own).

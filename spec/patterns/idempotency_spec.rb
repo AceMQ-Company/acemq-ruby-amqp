@@ -239,5 +239,29 @@ RSpec.describe AceMQ::AMQP::Patterns do
       consumer.handle(second)
       expect(transport.published_to("orders.new.dlq").size).to eq(1)
     end
+
+    # AMQP-IDEM-002, TCK IDEM-001: a publisher outside the family sends a
+    # message_id and no envelope headers. Keyed by a fresh id per delivery, both
+    # copies used to be handled.
+    it "keys a message without x-acemq-id by its message_id, so a copy is not handled" do
+      transport = FakeTransport.new
+      calls = 0
+      handler = Patterns.idempotent(Patterns::InMemoryIdempotencyStore.new) do
+        calls += 1
+        AceMQ::AMQP::Ack.accept
+      end
+      consumer = AceMQ::AMQP::Consumer.new(
+        transport: transport, queue: "orders.new", handler: handler,
+        codec: AceMQ::AMQP::JSONCodec.new, retry_policy: AceMQ::AMQP::RetryPolicy.none
+      )
+
+      2.times do
+        delivery, recorder = FakeDelivery.build(body: '{"id":"d-2"}', headers: {},
+                                                message_id: "d-2")
+        consumer.handle(delivery)
+        expect(recorder.acked?).to be(true)
+      end
+      expect(calls).to eq(1)
+    end
   end
 end
