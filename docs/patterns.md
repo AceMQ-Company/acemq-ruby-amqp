@@ -430,7 +430,9 @@ pass rather than returned one at a time. Returning one immediately does not
 work: the broker puts it back at the head of the queue, so the next read hands
 over the same message and everything behind it is never seen. The broker still
 has the held ones, so a tool that dies half way through returns them rather than
-losing them.
+losing them. The replay returns only once the declined messages are back on the
+queue (it waits up to five seconds for the depth to count them), so a
+`message_count` read straight after it is right, on a quorum queue too.
 
 **A replayed message goes back on attempt one**, with `x-acemq-error` cleared.
 Anything else does nothing that can be seen from outside: a message

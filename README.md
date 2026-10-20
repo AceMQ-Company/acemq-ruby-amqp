@@ -24,7 +24,7 @@ produces pin that rather than leaving it to be discovered in production.
 > [development certificates that cannot reach
 > production](#development-certificates-and-why-they-cannot-reach-production).
 > So are [encrypted bodies](#encrypted-bodies) and an
-> [OpenTelemetry adapter](#tracing). The current release is **0.7.14**,
+> [OpenTelemetry adapter](#tracing). The current release is **0.7.15**,
 > published to AceMQ's own gem feed at <https://acemq.org/gems> rather than to
 > rubygems.org.
 
@@ -76,7 +76,7 @@ is not there. Add it to your own Gemfile to use the transport:
 
 ```ruby
 source "https://acemq.org/gems" do
-  gem "acemq-amqp", "~> 0.7", ">= 0.7.14"
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.15"
 end
 gem "bunny", ">= 2.23", "< 4"
 ```
@@ -1019,7 +1019,9 @@ pass rather than returned one at a time. Returning one immediately does not
 work: the broker puts it back at the head of the queue, so the next read hands
 over the same message and everything behind it is never seen. The broker still
 has the held ones, so a tool that dies half way through returns them rather than
-losing them.
+losing them. The replay returns only once the declined messages are back on the
+queue (it waits up to five seconds for the depth to count them), so a
+`message_count` read straight after it is right, on a quorum queue too.
 
 **A replayed message goes back on attempt one**, with `x-acemq-error` cleared.
 Anything else does nothing that can be seen from outside: a message
