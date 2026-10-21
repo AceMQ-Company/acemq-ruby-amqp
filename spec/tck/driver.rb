@@ -121,12 +121,15 @@ module AceMQ
         end
 
         # The pipeline's own topology, and on each step's queue a consumer that
-        # follows the slip with the identity: count, and pass the body on.
+        # follows the slip with the identity: count, and pass the body on. A
+        # step named in behaviour raises inside the follow block, and no retry
+        # policy is set anywhere.
         def pipeline(args)
           pipeline = Patterns::Pipeline.new(args["name"], args["steps"])
           mq.apply(pipeline.topology)
-          counted = handler_for(args["handle"], {})
+          behaviour = args["behaviour"] || {}
           pipeline.steps.each do |step|
+            counted = handler_for(args["handle"], behaviour.fetch(step, {}))
             follow = pipeline.follow(mq) do |message|
               counted.call(message)
               message.payload
@@ -198,10 +201,19 @@ module AceMQ
         # Counts the delivery, sleeps, and fails the first n deliveries of an id
         # named in failFirst with an ordinary exception, which the consumer
         # turns into a retry.
+        #
+        # The counts are per handle, shared by every handler under it (a
+        # pipeline's steps); failFirst counts this handler's own deliveries.
         def handler_for(handle, behaviour)
-          counts = @counts[handle] = Hash.new(0)
-          redelivered = @redelivered[handle] = Hash.new(0)
-          order = @order[handle] = []
+          unless @counts.key?(handle)
+            @counts[handle] = Hash.new(0)
+            @redelivered[handle] = Hash.new(0)
+            @order[handle] = []
+          end
+          counts = @counts[handle]
+          redelivered = @redelivered[handle]
+          order = @order[handle]
+          mine = Hash.new(0)
           fail_first = behaviour["failFirst"] || {}
           sleep_for = behaviour.fetch("sleepMs", 0) / 1000.0
           lambda do |message|
@@ -210,6 +222,7 @@ module AceMQ
               redelivered[ident] += 1 if message.redelivered?
               order << ident
               counts[ident] += 1
+              mine[ident] += 1
             end
             sleep(sleep_for) if sleep_for.positive?
             if seen <= fail_first.fetch(ident, 0)

@@ -130,8 +130,14 @@ RSpec.describe "the scheduler against a real broker", :integration do
         delivery.ack
 
         expect(scheduler.scheduled).to eq(1)
-        expect(scheduler.delivered).to eq(1)
-        expect(scheduler.hops).to be >= 4
+        # Counted once the publish is confirmed, which can be a moment after the
+        # message is already on the target queue and pulled.
+        expect(wait_for(seconds: 5) { scheduler.delivered == 1 }).to be(true)
+        # At least two, not four: each pass through the one-second rung is
+        # late by however long the broker and this process took, the lateness
+        # adds up, and a run on a loaded machine reaches the last second after
+        # three hops rather than four.
+        expect(scheduler.hops).to be >= 2
       ensure
         scheduler.close
       end
@@ -153,7 +159,7 @@ RSpec.describe "the scheduler against a real broker", :integration do
         delivery = wait_for { mq.pull(arrivals) }
         expect(delivery&.body).to eq('{"invoice":"A-9"}')
         delivery.ack
-        expect(scheduler.delivered).to eq(1)
+        expect(wait_for(seconds: 5) { scheduler.delivered == 1 }).to be(true)
       ensure
         scheduler.close
       end

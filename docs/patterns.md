@@ -624,6 +624,14 @@ headers instead of a JSON document, and a route that reads in a management
 console without anybody decoding anything, at the price of a route that is the
 same for every message and has to be declared at both ends.
 
+**A step that fails with no retry policy is attempted once** (AMQP-SLIP-004).
+An exception from the `follow` block reaches the consumer like any handler's,
+and with no `retry_policy:` on the consumer or the connection it is
+dead-lettered to `pipeline.step.dlq` after that one attempt, carrying every
+header it arrived with (an `x-acemq-` header this library does not know
+included) plus `x-acemq-error`. Nothing is published to the next step. Pass a
+`retry_policy:` to `mq.consume` when a step should be retried.
+
 **The naming is Java's, exactly**: the exchange is the pipeline's name and is
 direct, the routing key is the step name, and the queue behind a step is
 `pipeline.step`. A Ruby consumer that got any of those wrong would be listening

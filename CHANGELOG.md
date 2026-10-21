@@ -8,6 +8,26 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **The TCK driver's `pipeline` op takes `behaviour`** (TCK SLIP-003,
+  AMQP-SLIP-004): a step named in it raises inside its `follow` block for the
+  first `n` deliveries of an id. No library change: a declared pipeline's step
+  that fails with no retry policy was already attempted once and dead-lettered
+  to `pipeline.step.dlq` with every header kept, and an integration spec now
+  holds it to that.
+
+### Fixed
+
+- **Three integration specs that failed on a loaded machine.** The
+  idempotency-store spec read `confirmed?` once, right after the claim row
+  appeared, but the confirm is written after the handler returns; it now waits
+  for it. The scheduler specs read `delivered` right after pulling the
+  message, but it is counted once the publish is confirmed; they now wait for
+  it. The 5-second schedule expected at least four hops, which holds only while
+  every pass through the 1-second rung is under about 0.33 s late; it now
+  expects at least two. Test-only; the library is unchanged.
+
 ## [0.7.16] - 2026-10-20
 
 ### Changed

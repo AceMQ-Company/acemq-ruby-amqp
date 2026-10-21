@@ -770,11 +770,18 @@ RSpec.describe "against a real broker", :integration do
       # The same message three times, as a redelivery storm delivers it.
       2.times { mq.publish({ "order_id" => "A-1" }, to: queue, envelope: sent) }
 
-      expect(wait_for { handled.size == 1 && store.size == 1 }).to be(true)
       # Deduplication was always right, because every delivery arrived with the
       # same encoding. What was wrong was asking the store anything from
-      # anywhere else — here, with the id the publish handed back.
-      expect(store.confirmed?(sent.id)).to be(true)
+      # anywhere else — here, with the id the publish handed back. Waited for
+      # rather than asked once: the claim row is there before the handler runs
+      # and the confirm is written after it returns, so handled.size == 1 and
+      # store.size == 1 can both be true a moment before confirmed? is.
+      expect(wait_for { store.confirmed?(sent.id) }).to be(true)
+      # All three copies settled, so a second run of the handler would have
+      # shown by now.
+      expect(wait_for { mq.message_count(queue).zero? }).to be(true)
+      expect(handled.size).to eq(1)
+      expect(store.size).to eq(1)
       expect(db.execute("SELECT typeof(message_id) FROM acemq_idempotency").flatten)
         .to eq(["text"])
     end
@@ -1547,6 +1554,55 @@ RSpec.describe "against a real broker", :integration do
         expect(seen.transform_values(&:size))
           .to eq("bad" => 2, "ok-1" => 1, "ok-2" => 1, "ok-3" => 1, "ok-4" => 1, "after" => 1)
       end
+    end
+  end
+
+  # AMQP-SLIP-004: a step whose own handler fails, with no retry policy
+  # anywhere, is attempted once and dead-lettered to {pipeline}.{step}.dlq
+  # with every header it arrived with -- one this library does not know
+  # included -- and nothing goes on to the next step.
+  describe "a declared pipeline with a failing step and no retry policy" do
+    let(:pipeline) { AceMQ::AMQP::Patterns::Pipeline.new("#{PREFIX}slip", %w[a b c]) }
+    let(:queues) { pipeline.steps.map { |step| pipeline.queue_for(step) } }
+
+    before do
+      scrub(*queues)
+      mq.apply(pipeline.topology)
+    end
+
+    after do
+      scrub(*queues)
+      mq.transport.delete_exchange(pipeline.exchange)
+    end
+
+    it "dead-letters after one attempt, keeping every header, and publishes nothing on" do
+      calls = 0
+      %w[b c].each do |step|
+        mq.consume(pipeline.queue_for(step), &pipeline.follow(mq) do |message|
+          if step == "b"
+            calls += 1
+            raise "step b is down"
+          end
+
+          message.payload
+        end)
+      end
+      headers = { "x-acemq-id" => "m1", "x-acemq-attempt" => 1, "x-acemq-route" => "a,b,c",
+                  "x-acemq-route-position" => 1, "x-acemq-future" => "kept",
+                  "x-tenant" => "acme" }
+      channel = mq.transport.session.create_channel
+      channel.exchange(pipeline.exchange, type: :direct, passive: true)
+             .publish('{"id":"m1"}', routing_key: "b", content_type: "application/json",
+                                     message_id: "m1", headers: headers)
+      channel.close
+
+      properties, = take_one(AceMQ::AMQP::Naming.dead_letter_queue(pipeline.queue_for("b")))
+      expect(properties).not_to be_nil
+      expect(properties[:headers]).to include(headers)
+      expect(properties[:headers]["x-acemq-error"]).to match(/step b is down/)
+      sleep(2)
+      expect(calls).to eq(1)
+      expect(mq.message_count(pipeline.queue_for("c"))).to eq(0)
     end
   end
 end
