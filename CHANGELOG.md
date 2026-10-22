@@ -8,6 +8,25 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **The TCK driver has the ops `claimCheck`, `outbox` and `consumeGroup`**
+  (TCK M7 cases CLAIM-001/002, OUTBOX-001/002, CONSUME-001), through the
+  library's own `ClaimCheckCodec` over `FilesystemClaimCheckStore`,
+  `Patterns.record` into an `InMemoryOutboxStore` with an `OutboxRelay`, and
+  `ConsumerGroup`. No library change was needed for them.
+
+### Fixed
+
+- **A routing-slip or pipeline hop keeps the headers it does not own**
+  (AMQP-SLIP-005, TCK SLIP-004/005). `Patterns.follow_slip` and
+  `Pipeline#follow` now hand the next step the incoming message's application
+  headers (a tenant, a `traceparent`) and every `x-acemq-` header this library
+  has no field for, in both the JSON-slip and the `x-acemq-route` form; only
+  the slip itself is rewritten. Up to 0.7.17 a hop sent only the correlation
+  and the causation, so those headers were lost at the first step. See
+  `docs/patterns.md`, "Reading either, writing one".
+
 ## [0.7.17] - 2026-10-21
 
 ### Added

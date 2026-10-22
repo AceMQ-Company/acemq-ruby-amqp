@@ -21,7 +21,8 @@ module AceMQ
   module AMQP
     module TCK
       OPS = %w[hello begin end publish consume handled schedule request
-               declareStream readStream metrics replay pipeline].freeze
+               declareStream readStream metrics replay pipeline
+               claimCheck outbox consumeGroup].freeze
 
       class UnsupportedOp < StandardError; end
 
@@ -58,6 +59,8 @@ module AceMQ
           @recorder = Recorder.new
           @scheduler = nil
           @requesters = {}
+          @groups = []
+          @relay = nil
           @lock = Mutex.new
         end
 
@@ -71,7 +74,45 @@ module AceMQ
           # Publisher confirms cannot be turned off in this library, so a
           # case's confirms: false changes nothing here.
           @recorder = Recorder.new
+          @origin = origin
           @connection = Connection.open(@url, origin: origin, telemetry: @recorder)
+          {}
+        end
+
+        # The same connection again, with the claim-check codec over the
+        # filesystem store wrapping the JSON codec. The next begin puts the
+        # plain one back.
+        def claim_check(args)
+          @connection&.close
+          store = Patterns::FilesystemClaimCheckStore.new(args["directory"])
+          codec = Patterns::ClaimCheckCodec.wrapping(JSONCodec.new, store,
+                                                     threshold: args["thresholdBytes"])
+          @connection = Connection.open(@url, origin: @origin, telemetry: @recorder,
+                                              codec: codec)
+          {}
+        end
+
+        # Answers once the record is in the store; the relay, started on first
+        # use with its defaults, publishes it.
+        def outbox(args)
+          unless @relay
+            @store = Patterns::InMemoryOutboxStore.new
+            @relay = Patterns::OutboxRelay.new(mq, @store)
+            @relay.start
+          end
+          record = Patterns.record(mq, args["body"], to: args["routingKey"],
+                                                     exchange: args.fetch("exchange", ""),
+                                                     **envelope_fields(args["envelope"] || {}))
+          @store.add(record)
+          { id: record.id }
+        end
+
+        def consume_group(args)
+          queue = args["queue"]
+          handler = handler_for(args["handle"], args["behaviour"] || {})
+          mq.apply(Topology.new.queue(queue, dead_letter: true, retry_policy: nil))
+          options = { size: args["size"], prefetch: args.fetch("prefetch", 10) }
+          @groups << Patterns::ConsumerGroup.new(mq, queue, **options, &handler)
           {}
         end
 
@@ -80,6 +121,10 @@ module AceMQ
           @requesters.clear
           @scheduler&.close
           @scheduler = nil
+          @relay&.close
+          @relay = nil
+          @groups.each(&:close)
+          @groups.clear
           @consumers.each_value(&:cancel)
           @consumers.clear
           @counts.clear
