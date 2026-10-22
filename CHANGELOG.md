@@ -16,6 +16,8 @@ While the version is `0.x` the public API may change in any release.
   that fails with no retry policy was already attempted once and dead-lettered
   to `pipeline.step.dlq` with every header kept, and an integration spec now
   holds it to that.
+- Runs the AceMQ TCK v0.3.2 (was v0.3.1), which adds SLIP-003 to the
+  default run: 30 cases.
 
 ### Fixed
 
