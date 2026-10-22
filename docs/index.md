@@ -150,7 +150,7 @@ if you would rather.
 ```ruby
 # Gemfile
 source "https://acemq.org/gems" do
-  gem "acemq-amqp", "~> 0.7", ">= 0.7.16"
+  gem "acemq-amqp", "~> 0.7", ">= 0.7.17"
 end
 gem "bunny", ">= 2.23", "< 4"   # for the transport
 ```
@@ -171,7 +171,7 @@ gem "opentelemetry-api", "~> 1.8" # Telemetry::OpenTelemetry
 
 The gem is not on rubygems.org. Releases go to AceMQ's own feed at
 <https://acemq.org/gems>, which is what the `source` block above names; the
-current one is 0.7.16. The [releasing section of the
+current one is 0.7.17. The [releasing section of the
 README](https://github.com/AceMQ-Company/acemq-ruby-amqp#releasing) says why.
 
 ## Where to go next
@@ -208,4 +208,4 @@ connect, publish, consume, retry, dead-letter — are implemented and tested,
 against the shared fixtures and against a real broker, and so are the patterns
 above them. TLS and credentials are in, including a private certificate
 authority and mutual TLS. The API may change before 1.0. The current release is
-**0.7.16**, from the gem feed at <https://acemq.org/gems>.
+**0.7.17**, from the gem feed at <https://acemq.org/gems>.
