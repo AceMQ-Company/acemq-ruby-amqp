@@ -660,6 +660,14 @@ untouched, and the next Java step reads it without knowing a Ruby service was
 ever involved. The run identifier survives a dead-letter and a replay too, so
 one run can be followed across both.
 
+**A hop rewrites the slip and nothing else it does not own** (AMQP-SLIP-005,
+since 0.7.18). The message handed to the next step keeps the incoming
+message's application headers — a tenant, a W3C `traceparent` — and any
+`x-acemq-` header this library has no field for, in either form. The
+correlation carries on and the causation is the incoming message's id. Up to
+0.7.17 a hop sent only the correlation and the causation, so those headers
+stopped at the first step.
+
 Ask for a shape explicitly with `write:`:
 
 ```ruby

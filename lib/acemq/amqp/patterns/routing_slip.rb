@@ -477,9 +477,16 @@ module AceMQ
           # next stop nothing is bound to is confirmed and dropped by the broker,
           # and this step would accept a message that is now nowhere. Only here:
           # {RoutingSlip#start} is the caller's own publish and keeps its default.
+          #
+          # The hop carries what it does not own (AMQP-SLIP-005): the
+          # application's headers and any x-acemq- header this library has no
+          # field for. Only the slip itself is rewritten, so the incoming slip
+          # header is dropped here and written afresh by send_to.
+          incoming = message.envelope
           send_to(connection, advanced.next_step, advanced, payload,
-                  { correlation_id: message.envelope.correlation_id,
-                    causation_id: message.envelope.id, mandatory: true })
+                  { correlation_id: incoming.correlation_id, causation_id: incoming.id,
+                    headers: incoming.headers.except(SLIP_HEADER),
+                    extensions: incoming.extensions, mandatory: true })
         rescue StandardError => e
           return Ack.retry("#{at} is done for message #{message.id} but the next step " \
                            "did not go out: #{e.message}")

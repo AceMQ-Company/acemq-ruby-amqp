@@ -1604,5 +1604,27 @@ RSpec.describe "against a real broker", :integration do
       expect(calls).to eq(1)
       expect(mq.message_count(pipeline.queue_for("c"))).to eq(0)
     end
+
+    # AMQP-SLIP-005: the hop to the next step rewrites the route and keeps
+    # every header it does not own.
+    it "hands the next step the application's headers and unknown x-acemq- headers" do
+      mq.consume(pipeline.queue_for("a"), &pipeline.follow(mq, &:payload))
+      extra = { "x-tenant" => "acme", "x-acemq-future" => "kept",
+                "traceparent" => "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" }
+      headers = { "x-acemq-id" => "m2", "x-acemq-attempt" => 1, "x-acemq-route" => "a,b,c",
+                  "x-acemq-route-position" => 0, "x-acemq-route-id" => "run-9" }.merge(extra)
+      channel = mq.transport.session.create_channel
+      channel.exchange(pipeline.exchange, type: :direct, passive: true)
+             .publish('{"id":"m2"}', routing_key: "a", content_type: "application/json",
+                                     message_id: "m2", headers: headers)
+      channel.close
+
+      properties, = take_one(pipeline.queue_for("b"))
+      expect(properties).not_to be_nil
+      expect(properties[:headers]).to include(extra)
+      expect(properties[:headers]).to include("x-acemq-route-position" => 1,
+                                              "x-acemq-route-id" => "run-9",
+                                              "x-acemq-causation" => "m2")
+    end
   end
 end

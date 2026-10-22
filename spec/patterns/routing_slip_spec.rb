@@ -160,6 +160,24 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
         .to eq(transport.published_to("validate").first.headers[AceMQ::AMQP::Headers::ID])
     end
 
+    it "carries the application's headers and unknown x-acemq- headers to the next stop" do
+      message = AceMQ::AMQP::Message.new(
+        payload: {}, routing_key: "validate", content_type: "application/json",
+        redelivered: false, body: "{}",
+        envelope: AceMQ::AMQP::Envelope.from_headers(
+          { AceMQ::AMQP::Patterns::SLIP_HEADER => itinerary.to_header,
+            "x-tenant" => "acme", "x-acemq-future" => "kept" }, "validate"
+        )
+      )
+      AceMQ::AMQP::Patterns.follow_slip(mq, &:payload).call(message)
+
+      headers = transport.published_to("charge").first.headers
+      expect(headers).to include("x-tenant" => "acme", "x-acemq-future" => "kept")
+      # One slip, the advanced one: the incoming header is not carried as well.
+      expect(described_class.from(AceMQ::AMQP::Envelope.from_headers(headers)).next_step.name)
+        .to eq("charge")
+    end
+
     it "publishes nothing more once the last step is done" do
       handler = AceMQ::AMQP::Patterns.follow_slip(mq, &:payload)
       last = described_class.new.step("", "ship", name: "ship")
@@ -253,11 +271,12 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
     # Exactly what a Java Pipeline puts on the wire, built from headers rather
     # than from this library's own writer — a test that produced the message
     # with the code under test could not fail when the reader is wrong.
-    def from_java(route: "validate,charge,ship", position: 1, run: "run-7", key: "charge")
+    def from_java(route: "validate,charge,ship", position: 1, run: "run-7", key: "charge",
+                  extra: {})
       raw = { AceMQ::AMQP::Headers::ID => "J-1",
               AceMQ::AMQP::Headers::ROUTE => route,
               AceMQ::AMQP::Headers::ROUTE_POSITION => position,
-              AceMQ::AMQP::Headers::ROUTE_ID => run }
+              AceMQ::AMQP::Headers::ROUTE_ID => run }.merge(extra)
       AceMQ::AMQP::Message.new(
         payload: { "order_id" => "A-1" }, routing_key: key, content_type: "application/json",
         redelivered: false, body: "{}",
@@ -294,6 +313,19 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
       # The whole point of the identifier: it is the same at every hop, so one
       # run can be followed across a dead-letter and a replay.
       expect(headers[AceMQ::AMQP::Headers::ROUTE_ID]).to eq("run-7")
+    end
+
+    # AMQP-SLIP-005: a hop rewrites only the route. The application's own
+    # headers and an x-acemq- header this library has no field for go on
+    # unchanged, as they do through a retry or a dead letter.
+    it "carries the application's headers and unknown x-acemq- headers on" do
+      extra = { "x-tenant" => "acme", "traceparent" => "00-abc-def-01",
+                "x-acemq-future" => "kept" }
+      pipeline.follow(mq, &:payload).call(from_java(extra: extra))
+
+      headers = transport.published.last.headers
+      expect(headers).to include(extra)
+      expect(headers[AceMQ::AMQP::Headers::CAUSATION]).to eq("J-1")
     end
 
     it "hands it on in the shape it arrived in, and writes no JSON slip" do
