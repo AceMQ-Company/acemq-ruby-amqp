@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.19] - 2026-10-22
+
 ### Fixed
 
 - **A routing-slip or pipeline hop keeps the run's `x-acemq-first-seen`**
