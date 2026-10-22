@@ -6,7 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
-## [Unreleased]  ## [0.7.17] - 2026-10-21
+## [Unreleased]
+
+## [0.7.17] - 2026-10-21
 
 ### Added
 
