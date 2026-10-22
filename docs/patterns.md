@@ -698,8 +698,10 @@ acemq.pipeline.run.duration{pipeline="orders"}
 ```
 
 The duration is the age of the envelope rather than the time in the last step,
-so it is the whole run: the envelope was created when the message entered and
-carried through every hop. A bare JSON slip reports neither — it is an itinerary
+so it is the whole run: every hop carries the incoming `x-acemq-first-seen` on
+unchanged (AMQP-SLIP-006), in both forms, so the age at the last step is
+measured from when the message entered the run. Before 0.7.19 each hop stamped
+its own first-seen, and the duration covered only the last hop. A bare JSON slip reports neither — it is an itinerary
 assembled per message rather than a thing with an identity, so there is no
 pipeline name to tag with, and a metric tagged with an empty one is worse than
 no metric. See [observability](observability.md#the-metrics).

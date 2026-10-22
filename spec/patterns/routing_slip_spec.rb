@@ -178,6 +178,23 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
         .to eq("charge")
     end
 
+    # AMQP-SLIP-006: the run's first-seen goes on unchanged, so the run
+    # duration measured at the end covers every hop.
+    it "keeps the run's first-seen at the next stop" do
+      message = AceMQ::AMQP::Message.new(
+        payload: {}, routing_key: "validate", content_type: "application/json",
+        redelivered: false, body: "{}",
+        envelope: AceMQ::AMQP::Envelope.from_headers(
+          { AceMQ::AMQP::Patterns::SLIP_HEADER => itinerary.to_header,
+            AceMQ::AMQP::Headers::FIRST_SEEN => 1_761_134_400_000 }, "validate"
+        )
+      )
+      AceMQ::AMQP::Patterns.follow_slip(mq, &:payload).call(message)
+
+      expect(transport.published_to("charge").first.headers[AceMQ::AMQP::Headers::FIRST_SEEN])
+        .to eq(1_761_134_400_000)
+    end
+
     it "publishes nothing more once the last step is done" do
       handler = AceMQ::AMQP::Patterns.follow_slip(mq, &:payload)
       last = described_class.new.step("", "ship", name: "ship")
@@ -326,6 +343,15 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
       headers = transport.published.last.headers
       expect(headers).to include(extra)
       expect(headers[AceMQ::AMQP::Headers::CAUSATION]).to eq("J-1")
+    end
+
+    # AMQP-SLIP-006, the route form.
+    it "keeps the run's first-seen" do
+      pipeline.follow(mq, &:payload)
+              .call(from_java(extra: { AceMQ::AMQP::Headers::FIRST_SEEN => 1_761_134_400_000 }))
+
+      expect(transport.published.last.headers[AceMQ::AMQP::Headers::FIRST_SEEN])
+        .to eq(1_761_134_400_000)
     end
 
     it "hands it on in the shape it arrived in, and writes no JSON slip" do

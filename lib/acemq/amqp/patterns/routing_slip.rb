@@ -482,9 +482,14 @@ module AceMQ
           # application's headers and any x-acemq- header this library has no
           # field for. Only the slip itself is rewritten, so the incoming slip
           # header is dropped here and written afresh by send_to.
+          #
+          # The first-seen time is carried too (AMQP-SLIP-006): it is when the
+          # run started, and acemq.pipeline.run.duration is measured from it.
+          # A hop that stamped its own would report only the last hop.
           incoming = message.envelope
           send_to(connection, advanced.next_step, advanced, payload,
                   { correlation_id: incoming.correlation_id, causation_id: incoming.id,
+                    first_seen: incoming.first_seen,
                     headers: incoming.headers.except(SLIP_HEADER),
                     extensions: incoming.extensions, mandatory: true })
         rescue StandardError => e

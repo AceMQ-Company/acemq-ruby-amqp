@@ -8,6 +8,16 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A routing-slip or pipeline hop keeps the run's `x-acemq-first-seen`**
+  (AMQP-SLIP-006, TCK SLIP-006/SLIP-007). `Patterns.follow_slip` and
+  `Pipeline#follow` built the next hop's envelope with a new first-seen, so
+  `acemq.pipeline.run.duration` measured only the last hop, not the whole run
+  as documented. Behaviour change: the next stop now sees the first-seen of the
+  message that started the run, in both the JSON slip and the `x-acemq-route`
+  form, and any age-based retry limit at a later step counts from there too.
+
 ## [0.7.18] - 2026-10-22
 
 ### Added
