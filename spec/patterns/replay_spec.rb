@@ -242,6 +242,34 @@ RSpec.describe "replaying a dead-letter queue" do
     expect(replayed.message_id).to eq("r1")
   end
 
+  # I5: the end-of-pass wait for passed-over messages is the caller's to set.
+  # A queue that never reads back full (another consumer draining it) is
+  # stood in for by a depth that stays at zero.
+  describe "the wait for passed-over messages" do
+    def replay_skipping_one(**options)
+      dead_letter(1)
+      allow(transport).to receive(:message_count).and_call_original
+      allow(transport).to receive(:message_count).with(dlq).and_return(0)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "orders.new",
+                                       **options) { false }
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    end
+
+    it "runs out after the time it is given" do
+      expect(replay_skipping_one(requeue_wait: 0.2)).to be_between(0.2, 2.0)
+    end
+
+    it "is skipped altogether at zero" do
+      expect(replay_skipping_one(requeue_wait: 0)).to be < 0.2
+    end
+
+    it "refuses a negative wait" do
+      expect { AceMQ::AMQP::Patterns.replay(mq, from: dlq, routing_key: "x", requeue_wait: -1) }
+        .to raise_error(ArgumentError, /requeue_wait/)
+    end
+  end
+
   it "refuses a replay with no queue to read from" do
     expect { AceMQ::AMQP::Patterns.replay(mq, from: "") }
       .to raise_error(ArgumentError, /needs a queue to read from/)

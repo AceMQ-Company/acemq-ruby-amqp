@@ -92,16 +92,22 @@ module AceMQ
       # @param deadline [Numeric] stop after this many seconds; zero for none
       # @param restart [Boolean] give each message a fresh set of attempts,
       #   clearing +x-acemq-attempt+ back to 1 and +x-acemq-error+ with it
+      # @param requeue_wait [Numeric] how many seconds, at the end, to wait for
+      #   the messages the block passed over to be counted back on the queue.
+      #   They are held unacknowledged for the whole pass, and a consumer
+      #   reading the same queue keeps the depth short of the target, so the
+      #   wait can run out; the messages are back either way. Zero does not
+      #   wait at all.
       # @return [ReplayResult]
       # @raise [ReplayFailed] when the broker refused part-way
       def self.replay(connection, from:, exchange: "", routing_key: nil, limit: 0,
-                      deadline: 0, restart: true, &filter)
+                      deadline: 0, restart: true, requeue_wait: Replay::REQUEUE_WAIT, &filter)
         raise ArgumentError, "a replay needs a queue to read from" if from.to_s.empty?
 
         refuse_a_loop(from, exchange, routing_key)
         Replay.new(connection, from: from, exchange: exchange, routing_key: routing_key,
                                limit: limit, deadline: deadline, restart: restart,
-                               filter: filter).run
+                               requeue_wait: requeue_wait, filter: filter).run
       end
 
       # Refuses a replay that would put every message back where it found it.
@@ -132,13 +138,13 @@ module AceMQ
       #
       # @api private
       class Replay
-        # How long a release waits for the declined messages to be counted back
-        # on the queue. Bounded, because a consumer draining the queue at the
+        # How long a release waits, by default, for the declined messages to be
+        # counted back on the queue. Bounded, because a consumer draining the queue at the
         # same time keeps the depth below the target and would hold it for ever.
         REQUEUE_WAIT = 5.0
 
         def initialize(connection, from:, exchange:, routing_key:, limit:, deadline:, restart:,
-                       filter:)
+                       filter:, requeue_wait: REQUEUE_WAIT)
           # The raw publish, because a replayed message keeps the bytes and the
           # envelope it already had; re-encoding it would be inventing a new
           # message with an old one's identity.
@@ -149,6 +155,9 @@ module AceMQ
           @limit = limit.to_i
           @deadline = deadline.to_f
           @restart = restart
+          @requeue_wait = Float(requeue_wait)
+          raise ArgumentError, "requeue_wait cannot be negative" if @requeue_wait.negative?
+
           @filter = filter
           @result = ReplayResult.new(moved: 0, skipped: 0, reason: :drained)
           # Messages the filter declines are held unacknowledged, not returned
@@ -279,11 +288,11 @@ module AceMQ
             nil
           end
           @declined = []
-          await_depth(before + held) if before
+          await_depth(before + held) if before && @requeue_wait.positive?
         end
 
         def await_depth(target)
-          ends_at = monotonic + REQUEUE_WAIT
+          ends_at = monotonic + @requeue_wait
           loop do
             current = depth
             break if current.nil? || current >= target || monotonic >= ends_at

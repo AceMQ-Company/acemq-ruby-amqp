@@ -160,6 +160,19 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
         .to eq(transport.published_to("validate").first.headers[AceMQ::AMQP::Headers::ID])
     end
 
+    # AMQP-SLIP-007: a hop is a new message caused by the one handled, so it
+    # has an id of its own rather than the handled message's.
+    it "gives each hop an id of its own" do
+      mq.consume("validate", &AceMQ::AMQP::Patterns.follow_slip(mq, &:payload))
+      itinerary.start(mq, { "order_id" => "A-1" })
+
+      handled = transport.published_to("validate").first.headers[AceMQ::AMQP::Headers::ID]
+      hop = transport.published_to("charge").first.headers
+      expect(hop[AceMQ::AMQP::Headers::ID]).not_to be_empty
+      expect(hop[AceMQ::AMQP::Headers::ID]).not_to eq(handled)
+      expect(hop[AceMQ::AMQP::Headers::CAUSATION]).to eq(handled)
+    end
+
     it "carries the application's headers and unknown x-acemq- headers to the next stop" do
       message = AceMQ::AMQP::Message.new(
         payload: {}, routing_key: "validate", content_type: "application/json",
@@ -319,6 +332,19 @@ RSpec.describe AceMQ::AMQP::Patterns::RoutingSlip do
 
       sent = transport.published.last
       expect([sent.exchange, sent.routing_key]).to eq(%w[orders ship])
+    end
+
+    # AMQP-SLIP-007, the route form: a new id, caused by the handled one,
+    # correlation unchanged.
+    it "publishes the hop as a new message caused by the one handled" do
+      pipeline.follow(mq, &:payload)
+              .call(from_java(extra: { AceMQ::AMQP::Headers::CORRELATION => "corr-1" }))
+
+      headers = transport.published.last.headers
+      expect(headers[AceMQ::AMQP::Headers::ID]).not_to be_empty
+      expect(headers[AceMQ::AMQP::Headers::ID]).not_to eq("J-1")
+      expect(headers[AceMQ::AMQP::Headers::CAUSATION]).to eq("J-1")
+      expect(headers[AceMQ::AMQP::Headers::CORRELATION]).to eq("corr-1")
     end
 
     it "advances the position and keeps the run identifier" do

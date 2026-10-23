@@ -1025,6 +1025,24 @@ losing them. The replay returns only once the declined messages are back on the
 queue (it waits up to five seconds for the depth to count them), so a
 `message_count` read straight after it is right, on a quorum queue too.
 
+The trade-off, and the knob for it. Holding the declined messages means a large
+filtered pass keeps that many deliveries unacknowledged on one channel until it
+ends. And the final wait is only as good as the depth it reads: a consumer
+reading the same queue at the same time keeps the count short of the target, so
+the wait runs out and the replay returns with some of them still on their way
+back. Nothing is lost either way, the broker has them. `requeue_wait:` sets the
+wait in seconds (default `5.0`); `0` returns as soon as they are released, for
+a tool that does not read the depth afterwards.
+
+```ruby
+Patterns.replay(mq, from: "orders.new.dlq", exchange: "orders-events",
+                requeue_wait: 30) { |envelope, _| envelope.error.include?("timeout") }
+```
+
+Java, .NET and Python hold the declined messages the same way. Go republishes
+them to the back of the queue instead, so it holds nothing, but the declined
+messages come out of a Go replay in a different order from the one they went in.
+
 **A replayed message goes back on attempt one**, with `x-acemq-error` cleared.
 Anything else does nothing that can be seen from outside: a message
 dead-lettered on the last attempt of a five-attempt policy arrives back on

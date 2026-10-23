@@ -8,6 +8,27 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`Patterns.replay` takes `requeue_wait:`** (seconds, default `5.0`, the
+  wait it always had): how long the end of a filtered pass waits for the
+  messages the block passed over to be counted back on the queue. `0` skips the
+  wait; a negative value is refused. The trade-off is now documented: declined
+  messages are held unacknowledged for the whole pass, and a consumer reading
+  the same queue can make the wait run out (nothing is lost; Go republishes
+  instead and reorders).
+- Tests pin AMQP-SLIP-007 (TCK SLIP-008/SLIP-009, pending): a pipeline or
+  routing-slip hop, in both the JSON slip and the `x-acemq-route` form, is
+  published with a new `x-acemq-id`, `x-acemq-causation` set to the handled
+  message's id, and the correlation unchanged. No library change: Ruby already
+  did this.
+
+### Documentation
+
+- `reliability.md`: a set-aside (`.dlq` or `Ack.park`) the broker refuses for
+  longer than about twenty seconds ends in `{queue}.dlq` through the quorum
+  queue's delivery limit, never lost, and why that is kept.
+
 ## [0.7.19] - 2026-10-22
 
 ### Fixed

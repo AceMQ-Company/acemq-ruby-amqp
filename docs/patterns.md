@@ -434,6 +434,24 @@ losing them. The replay returns only once the declined messages are back on the
 queue (it waits up to five seconds for the depth to count them), so a
 `message_count` read straight after it is right, on a quorum queue too.
 
+The trade-off, and the knob for it. Holding the declined messages means a large
+filtered pass keeps that many deliveries unacknowledged on one channel until it
+ends. And the final wait is only as good as the depth it reads: a consumer
+reading the same queue at the same time keeps the count short of the target, so
+the wait runs out and the replay returns with some of them still on their way
+back. Nothing is lost either way, the broker has them. `requeue_wait:` sets the
+wait in seconds (default `5.0`); `0` returns as soon as they are released, for
+a tool that does not read the depth afterwards.
+
+```ruby
+Patterns.replay(mq, from: "orders.new.dlq", exchange: "orders-events",
+                requeue_wait: 30) { |envelope, _| envelope.error.include?("timeout") }
+```
+
+Java, .NET and Python hold the declined messages the same way. Go republishes
+them to the back of the queue instead, so it holds nothing, but the declined
+messages come out of a Go replay in a different order from the one they went in.
+
 **A replayed message goes back on attempt one**, with `x-acemq-error` cleared.
 Anything else does nothing that can be seen from outside: a message
 dead-lettered on the last attempt of a five-attempt policy arrives back on
@@ -667,6 +685,12 @@ message's application headers — a tenant, a W3C `traceparent` — and any
 correlation carries on and the causation is the incoming message's id. Up to
 0.7.17 a hop sent only the correlation and the causation, so those headers
 stopped at the first step.
+
+**A hop is a new message, caused by the one handled** (AMQP-SLIP-007). It is
+published with an `x-acemq-id` of its own, `x-acemq-causation` set to the
+handled message's id, and the correlation unchanged, in both forms. So each hop
+is idempotent on its own id, and the causation chain reads step by step. Ruby
+has always done this; the TCK now requires it of every library.
 
 Ask for a shape explicitly with `write:`:
 
@@ -943,7 +967,8 @@ end)
 Returning `nil` publishes nothing and accepts the message, which is how a step
 says "this one does not continue" without inventing an empty message for the
 next service to work out how to ignore. The correlation goes forward and the
-causation records what produced what. The next message is published
+causation records what produced what: the next message has an `x-acemq-id` of
+its own, and its `x-acemq-causation` is the input's id (AMQP-SLIP-007). The next message is published
 **mandatory** and the input is accepted only once it is out, so one nothing is
 bound to receive retries the input rather than being dropped by the broker.
 

@@ -178,6 +178,8 @@ RSpec.describe "chaining handlers" do
       expect(sent.headers[AceMQ::AMQP::Headers::CORRELATION])
         .to eq(incoming.envelope.correlation_id)
       expect(sent.headers[AceMQ::AMQP::Headers::CAUSATION]).to eq("msg-1")
+      # A new message, not the handled one sent on (AMQP-SLIP-007).
+      expect(sent.headers[AceMQ::AMQP::Headers::ID]).not_to eq("msg-1")
     end
 
     it "publishes nothing for a step that says this one does not continue" do

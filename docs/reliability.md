@@ -357,6 +357,19 @@ default exchange drops what it cannot route without a word, so a set-aside into 
 queue nobody declared would otherwise be confirmed, acknowledged and gone. Asking
 the broker to hand it back is the only way to hear about it.
 
+**A set-aside the broker keeps refusing still ends in `{queue}.dlq`, not
+nowhere.** Each hand-back is a requeue, and a quorum queue counts requeues
+against its delivery limit (20 by default since RabbitMQ 4.0). So a message
+whose `{queue}.parked` or `{queue}.dlq` copy is refused for longer than about
+twenty seconds (the one-second pause times twenty deliveries) is dead-lettered
+by the broker itself, through the `x-dead-letter-exchange` this library declared
+on the queue, into `{queue}.dlq`. That holds for an `Ack.park` too: a park
+refused that long ends in `.dlq`, not `.parked`, and arrives with the broker's
+`x-death` but without this library's `x-acemq-error`. It is kept on purpose: the
+alternative is a message that loops for as long as the queue stays missing. A
+classic queue has no delivery limit, so there the message is offered again once
+a second until the set-aside works.
+
 `acemq.messages.set.aside.failed` is counted when this happens, labelled with the
 `queue` and the `target` that could not be reached. It is worth an alert: it is
 the only sign this path leaves, and it names the queue somebody has to go and
